@@ -1242,7 +1242,7 @@ func TestPathCoveredByAnyWatchRootCreationDoesNotTreatShallowAncestorAsRecursive
 		"recursive roots cover nested missing roots")
 }
 
-func TestStartFileWatcherKeepsRecursivePendingRootPollingWhenLifecycleCovered(t *testing.T) {
+func TestStartFileWatcherSuppressesPendingPollingWhenLifecycleIsOwned(t *testing.T) {
 	root := t.TempDir()
 	pending := watchRoot{
 		path:               filepath.Join(root, "state", "sessions"),
@@ -1253,11 +1253,22 @@ func TestStartFileWatcherKeepsRecursivePendingRootPollingWhenLifecycleCovered(t 
 
 	got := accountRegisteredWatchRoots(
 		[]string{root}, []watchRoot{pending},
-		[]agentsync.RecursiveWatchResult{{Watched: 1}},
+		[]agentsync.RecursiveWatchResult{{
+			Watched:                   1,
+			MissingRootLifecycleOwned: true,
+		}},
 	)
 
-	assert.Equal(t, []string{root}, got,
-		"missing roots retain polling until native activation is reconciled")
+	assert.Empty(t, got,
+		"native lifecycle ownership replaces the startup polling obligation")
+	assert.Empty(t, watchPollingObligations(
+		[]watchRoot{pending},
+		[]agentsync.RecursiveWatchResult{{
+			Watched:                   1,
+			MissingRootLifecycleOwned: true,
+		}},
+		got,
+	), "owned missing roots must not schedule authoritative polling")
 }
 
 func TestStartupReconciliationHandlerCheckpointsBeforeOpeningDispatch(t *testing.T) {
@@ -1435,11 +1446,46 @@ func TestStartFileWatcherKeepsPollingForIndependentReasonAfterPendingCoverage(t 
 
 	got := accountRegisteredWatchRoots(
 		[]string{root}, roots,
-		[]agentsync.RecursiveWatchResult{{Watched: 1}, {Watched: 1}},
+		[]agentsync.RecursiveWatchResult{{
+			Watched:                   1,
+			MissingRootLifecycleOwned: true,
+		}, {Watched: 1}},
 	)
 
 	assert.Equal(t, []string{root}, got,
 		"covering a missing root must not erase an independent polling reason")
+}
+
+func TestWatchPollingObligationsMissingRootLifecycleCardinality(t *testing.T) {
+	for _, rootCount := range []int{1, 128} {
+		t.Run(fmt.Sprintf("roots=%d", rootCount), func(t *testing.T) {
+			base := t.TempDir()
+			roots := make([]watchRoot, 0, rootCount)
+			owned := make([]agentsync.RecursiveWatchResult, 0, rootCount)
+			portable := make([]agentsync.RecursiveWatchResult, 0, rootCount)
+			unwatched := make([]string, 0, rootCount)
+			for i := range rootCount {
+				syncDir := filepath.Join(base, fmt.Sprintf("agent-%03d", i))
+				roots = append(roots, watchRoot{
+					path:               filepath.Join(syncDir, "sessions"),
+					recursive:          true,
+					scopes:             []watchScope{{agent: parser.AgentClaude, syncDir: syncDir}},
+					pendingPollingDirs: []string{syncDir},
+				})
+				owned = append(owned, agentsync.RecursiveWatchResult{
+					Watched:                   1,
+					MissingRootLifecycleOwned: true,
+				})
+				portable = append(portable, agentsync.RecursiveWatchResult{})
+				unwatched = append(unwatched, syncDir)
+			}
+
+			assert.Empty(t, watchPollingObligations(roots, owned, nil),
+				"native lifecycle work must remain independent of configured archive cardinality")
+			assert.Len(t, watchPollingObligations(roots, portable, unwatched), rootCount,
+				"portable backends retain one obligation per uncovered missing root")
+		})
+	}
 }
 
 func TestWatchPollingObligationsKeepPendingAndPersistentReasonsIndependent(t *testing.T) {

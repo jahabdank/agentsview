@@ -1230,14 +1230,19 @@ func watchPollingObligations(
 		}
 	}
 	for i, root := range roots {
-		add(root.path, root.pendingPollingDirs...)
+		var result sync.RecursiveWatchResult
+		if i < len(results) {
+			result = results[i]
+		}
+		if !result.MissingRootLifecycleOwned {
+			add(root.path, root.pendingPollingDirs...)
+		}
 		for _, dir := range root.persistentPollingDirs {
 			add("persistent:"+filepath.Clean(dir), dir)
 		}
 		if i >= len(results) {
 			continue
 		}
-		result := results[i]
 		if result.Unwatched > 0 || result.BudgetExhausted ||
 			result.ResourceExhausted || result.Err != nil {
 			add(root.path, root.syncDirs()...)
@@ -1265,41 +1270,31 @@ func accountRegisteredWatchRoots(
 	roots []watchRoot,
 	results []sync.RecursiveWatchResult,
 ) []string {
-	explicitReasons := false
 	persistent := make(map[string]bool)
 	for _, root := range roots {
-		if len(root.pendingPollingDirs) > 0 || len(root.persistentPollingDirs) > 0 {
-			explicitReasons = true
-		}
 		for _, dir := range root.persistentPollingDirs {
 			persistent[dir] = true
 		}
 	}
-	if explicitReasons {
-		// Lifecycle coverage observes creation of missing roots, but native
-		// recursive coverage is not authoritative until the activation handoff
-		// reconciles successfully. Keep the configured poll owner until the
-		// backend reports that activation as restored.
-		return unwatchedDirs
-	}
 	covered := make(map[string]bool)
+	seen := make(map[string]bool)
 	for i, root := range roots {
 		if root.exists {
 			continue
 		}
-		result := results[i]
 		pollingDirs := root.pendingPollingDirs
-		if !explicitReasons {
+		if len(pollingDirs) == 0 {
 			// Preserve the helper's historical behavior for callers that construct
 			// watch roots directly without collection metadata.
 			pollingDirs = root.syncDirs()
 		}
+		owned := i < len(results) && results[i].MissingRootLifecycleOwned
 		for _, dir := range pollingDirs {
-			if _, seen := covered[dir]; !seen {
-				covered[dir] = true
-			}
-			if result.Err != nil || result.Watched == 0 {
-				covered[dir] = false
+			if !seen[dir] {
+				seen[dir] = true
+				covered[dir] = owned
+			} else {
+				covered[dir] = covered[dir] && owned
 			}
 		}
 	}
@@ -1619,9 +1614,9 @@ func collectProviderWatchRoots(
 	if !planned {
 		return false, providerPollingReasons{}
 	}
-	// Native ancestor coverage can observe creation, but it cannot become the
-	// authoritative owner of the missing target until activation reconciliation
-	// succeeds. Keep each missing target's polling obligation until that handoff.
+	// Portable backends need polling for missing targets. Lifecycle-aware
+	// backends can claim each target after acquiring bounded ancestor coverage;
+	// their activation gate reconciles the target before opening native dispatch.
 	polling.missingRoots = append(polling.missingRoots, missingRoots...)
 	return true, polling
 }

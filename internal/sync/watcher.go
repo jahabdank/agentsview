@@ -16,12 +16,16 @@ import (
 )
 
 type RecursiveWatchResult struct {
-	Watched             int
-	Unwatched           int
-	Err                 error
-	BudgetExhausted     bool
-	ResourceExhausted   bool
-	ResourceExhaustedAt string
+	Watched   int
+	Unwatched int
+	Err       error
+	// MissingRootLifecycleOwned reports that the backend has durable native
+	// coverage for a root that did not exist at registration time. Callers do
+	// not need a periodic polling obligation while this ownership is active.
+	MissingRootLifecycleOwned bool
+	BudgetExhausted           bool
+	ResourceExhausted         bool
+	ResourceExhaustedAt       string
 }
 
 const (

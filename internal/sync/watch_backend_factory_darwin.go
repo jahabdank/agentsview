@@ -344,7 +344,10 @@ func (b *darwinWatchBackend) RegisterRoots(
 			continue
 		}
 		state.ancestor = ancestor
-		results[i].Watched = 1
+		results[i] = RecursiveWatchResult{
+			Watched:                   1,
+			MissingRootLifecycleOwned: true,
+		}
 	}
 	if streamCreationFailed {
 		b.prepareStartupFallbackLocked(roots, results)

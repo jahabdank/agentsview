@@ -697,7 +697,11 @@ func TestDarwinWatcherHybridRegistrationUsesShallowAndPendingCoverage(t *testing
 	}, 10)
 
 	require.Len(t, results, 3)
-	assert.Equal(t, []RecursiveWatchResult{{Watched: 1}, {Watched: 1}, {Watched: 1}}, results)
+	assert.Equal(t, []RecursiveWatchResult{
+		{Watched: 1},
+		{Watched: 1, MissingRootLifecycleOwned: true},
+		{Watched: 1, MissingRootLifecycleOwned: true},
+	}, results)
 	assert.Equal(t, []string{
 		"shallow-add:" + shallow,
 		"shallow-add:" + ancestor,
@@ -735,7 +739,9 @@ func TestDarwinWatcherPendingRootRetriesWithoutNativeKqueueDelivery(t *testing.T
 		Path: root, Recursive: true,
 		Scopes: []WatchScope{{Agent: "agent-a", SyncDir: ancestor}},
 	}}, 10)
-	require.Equal(t, []RecursiveWatchResult{{Watched: 1}}, results)
+	require.Equal(t, []RecursiveWatchResult{{
+		Watched: 1, MissingRootLifecycleOwned: true,
+	}}, results)
 	watcher.Start()
 
 	requireReceiveWithin(t, missingChecked, time.Second)
@@ -958,7 +964,9 @@ func TestDarwinWatcherMissingRootRealCreationDeletionRecreation(t *testing.T) {
 		Path: root, Recursive: true,
 		Scopes: []WatchScope{{Agent: "agent-a", SyncDir: ancestor}},
 	}}, 10)
-	require.Equal(t, RecursiveWatchResult{Watched: 1}, results[0])
+	require.Equal(t, RecursiveWatchResult{
+		Watched: 1, MissingRootLifecycleOwned: true,
+	}, results[0])
 	watcher.Start()
 
 	require.NoError(t, os.Mkdir(intermediate, 0o700))
@@ -1083,7 +1091,10 @@ func TestDarwinWatcherHybridTransitionDoesNotSuppressOtherShallowRootEvent(t *te
 		{Path: shallow, Scopes: []WatchScope{{Agent: "agent-a", SyncDir: shallow}}},
 		{Path: pending, Recursive: true, Scopes: []WatchScope{{Agent: "agent-b", SyncDir: shallow}}},
 	}, 10)
-	require.Equal(t, []RecursiveWatchResult{{Watched: 1}, {Watched: 1}}, results)
+	require.Equal(t, []RecursiveWatchResult{
+		{Watched: 1},
+		{Watched: 1, MissingRootLifecycleOwned: true},
+	}, results)
 	require.NoError(t, os.Mkdir(pending, 0o700))
 
 	event, dispatch := backend.handleKqueueEvent(backendEvent{
@@ -1162,7 +1173,9 @@ func TestDarwinWatcherCollectingGateWaitsForSuccessfulReconciliation(t *testing.
 		Path: root, Recursive: true,
 		Scopes: []WatchScope{{Agent: "agent-a", SyncDir: ancestor}},
 	}}, 10)
-	require.Equal(t, RecursiveWatchResult{Watched: 1}, results[0])
+	require.Equal(t, RecursiveWatchResult{
+		Watched: 1, MissingRootLifecycleOwned: true,
+	}, results[0])
 	watcher.Start()
 	require.NoError(t, os.Mkdir(root, 0o700))
 	backend.handleKqueueEvent(backendEvent{
@@ -1308,7 +1321,9 @@ func TestDarwinWatcherRuntimeStreamAcquisitionFailureFallsBack(t *testing.T) {
 				Path: root, Recursive: true,
 				Scopes: []WatchScope{{Agent: "agent-a", SyncDir: ancestor}},
 			}}, 10)
-			require.Equal(t, RecursiveWatchResult{Watched: 1}, results[0])
+			require.Equal(t, RecursiveWatchResult{
+				Watched: 1, MissingRootLifecycleOwned: true,
+			}, results[0])
 			require.NoError(t, watcher.Start())
 			require.NoError(t, os.Mkdir(root, 0o700))
 			backend.signalLifecycle()
@@ -1518,7 +1533,10 @@ func TestDarwinWatcherFallbackTransfersMissingRootPollingBeforeRecovery(t *testi
 			Scopes: []WatchScope{{SyncDir: missing}},
 		},
 	}, 10)
-	require.Equal(t, []RecursiveWatchResult{{Watched: 1}, {Watched: 1}}, results)
+	require.Equal(t, []RecursiveWatchResult{
+		{Watched: 1},
+		{Watched: 1, MissingRootLifecycleOwned: true},
+	}, results)
 	require.NoError(t, watcher.Start())
 
 	backend.requestFallback(darwinFallbackNativeDrop)
@@ -1619,7 +1637,10 @@ func TestDarwinWatcherStartupFallbackRetainsMissingShallowRootLifecycle(t *testi
 			Scopes: []WatchScope{{SyncDir: missingShallow}},
 		},
 	}, 10)
-	assert.Equal(t, []RecursiveWatchResult{{Watched: 1}, {Watched: 1}}, results)
+	assert.Equal(t, []RecursiveWatchResult{
+		{Watched: 1},
+		{Watched: 1, MissingRootLifecycleOwned: true},
+	}, results)
 	assert.Equal(t, 1, backend.shallow[parent],
 		"startup fallback must retain the missing shallow root's ancestor watch")
 	require.NoError(t, watcher.Start())
@@ -2043,7 +2064,9 @@ func TestDarwinWatcherLifecycleFailureFallsBackToPolling(t *testing.T) {
 		Path: root, Recursive: true,
 		Scopes: []WatchScope{{Agent: "agent-a", SyncDir: ancestor}},
 	}}, 10)
-	require.Equal(t, RecursiveWatchResult{Watched: 1}, results[0])
+	require.Equal(t, RecursiveWatchResult{
+		Watched: 1, MissingRootLifecycleOwned: true,
+	}, results[0])
 	watcher.Start()
 	require.NoError(t, os.Mkdir(intermediate, 0o700))
 	backend.signalLifecycle()
@@ -2088,7 +2111,9 @@ func TestDarwinWatcherShallowLifecycleFailureFallbackPollsScope(t *testing.T) {
 		Path:   root,
 		Scopes: []WatchScope{{Agent: "agent-a", SyncDir: ancestor}},
 	}}, 10)
-	require.Equal(t, RecursiveWatchResult{Watched: 1}, results[0])
+	require.Equal(t, RecursiveWatchResult{
+		Watched: 1, MissingRootLifecycleOwned: true,
+	}, results[0])
 	watcher.Start()
 	require.NoError(t, os.Mkdir(intermediate, 0o700))
 	backend.signalLifecycle()
@@ -2127,7 +2152,9 @@ func TestDarwinWatcherMissingRecursiveSymlinkStaysPolled(t *testing.T) {
 		Path: root, Recursive: true,
 		Scopes: []WatchScope{{Agent: "agent-a", SyncDir: ancestor}},
 	}}, 10)
-	require.Equal(t, RecursiveWatchResult{Watched: 1}, results[0])
+	require.Equal(t, RecursiveWatchResult{
+		Watched: 1, MissingRootLifecycleOwned: true,
+	}, results[0])
 	var firstRootInspection atomic.Bool
 	symlinkResult := make(chan error, 1)
 	backend.lstat = func(path string) (os.FileInfo, error) {
@@ -2181,7 +2208,9 @@ func TestDarwinWatcherMissingShallowSymlinkActivatesAndRestoresCoverage(t *testi
 		Path:   root,
 		Scopes: []WatchScope{{Agent: "agent-a", SyncDir: ancestor}},
 	}}, 10)
-	require.Equal(t, RecursiveWatchResult{Watched: 1}, results[0])
+	require.Equal(t, RecursiveWatchResult{
+		Watched: 1, MissingRootLifecycleOwned: true,
+	}, results[0])
 	require.NoError(t, watcher.Start())
 	require.NoError(t, os.Symlink(target, root))
 	backend.signalLifecycle()
