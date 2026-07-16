@@ -38,18 +38,25 @@ type pollingObligation struct {
 }
 
 type sharedUnwatchedPollCoordinator struct {
-	ctx        context.Context
-	engine     unwatchedPollSyncer
-	ticks      <-chan time.Time
-	stopTicker func()
-	doWork     func(func())
+	ctx          context.Context
+	workerCtx    context.Context
+	workerCancel context.CancelFunc
+	engine       unwatchedPollSyncer
+	ticks        <-chan time.Time
+	stopTicker   func()
+	doWork       func(func())
 	// onRootsOwned is a test observer invoked after installation and before ack.
 	onRootsOwned func([]string)
 	add          chan unwatchedPollAdd
-	wake         chan struct{}
-	stop         chan struct{}
-	done         chan struct{}
-	stopOnce     sync.Once
+	// pollWake coalesces ticks and explicit wakes while the serialized worker runs.
+	pollWake chan struct{}
+	pollDone chan struct{}
+	pollMu   sync.Mutex
+	// pollRoots is the latest complete snapshot owned by the coordinator loop.
+	pollRoots []string
+	stop      chan struct{}
+	done      chan struct{}
+	stopOnce  sync.Once
 }
 
 func newUnwatchedPollCoordinator(
@@ -71,14 +78,18 @@ func newUnwatchedPollCoordinatorWithTicks(
 	doWork func(func()),
 	onRootsOwned func([]string),
 ) *sharedUnwatchedPollCoordinator {
+	workerCtx, workerCancel := context.WithCancel(ctx)
 	coordinator := &sharedUnwatchedPollCoordinator{
 		ctx:          ctx,
+		workerCtx:    workerCtx,
+		workerCancel: workerCancel,
 		engine:       engine,
 		ticks:        ticks,
 		stopTicker:   stopTicker,
 		doWork:       doWork,
 		add:          make(chan unwatchedPollAdd),
-		wake:         make(chan struct{}, 1),
+		pollWake:     make(chan struct{}, 1),
+		pollDone:     make(chan struct{}),
 		stop:         make(chan struct{}),
 		done:         make(chan struct{}),
 		onRootsOwned: onRootsOwned,
@@ -134,20 +145,22 @@ func (c *sharedUnwatchedPollCoordinator) Wake() {
 		return
 	default:
 	}
-	select {
-	case c.wake <- struct{}{}:
-	default:
-	}
+	c.requestPoll()
 }
 
 func (c *sharedUnwatchedPollCoordinator) Stop() {
-	c.stopOnce.Do(func() { close(c.stop) })
+	c.stopOnce.Do(func() {
+		c.workerCancel()
+		close(c.stop)
+	})
 	<-c.done
 }
 
 func (c *sharedUnwatchedPollCoordinator) run() {
 	defer close(c.done)
 	defer c.stopTicker()
+	go c.runPollWorker()
+	defer func() { <-c.pollDone }()
 	obligations := make(map[string][]string)
 	for {
 		select {
@@ -163,27 +176,65 @@ func (c *sharedUnwatchedPollCoordinator) run() {
 					[]string(nil), request.obligation.Roots...,
 				)
 			}
+			roots := unwatchedPollObligationRoots(obligations)
+			c.setPollRoots(roots)
 			if c.onRootsOwned != nil {
-				c.onRootsOwned(unwatchedPollObligationRoots(obligations))
+				c.onRootsOwned(roots)
 			}
 			close(request.done)
 		case <-c.ticks:
-			c.poll(obligations)
-		case <-c.wake:
-			c.poll(obligations)
+			c.requestPoll()
 		}
 	}
 }
 
-func (c *sharedUnwatchedPollCoordinator) poll(owned map[string][]string) {
-	roots := unwatchedPollObligationRoots(owned)
-	if len(roots) == 0 {
-		return
+func (c *sharedUnwatchedPollCoordinator) setPollRoots(roots []string) {
+	c.pollMu.Lock()
+	c.pollRoots = append(c.pollRoots[:0], roots...)
+	c.pollMu.Unlock()
+}
+
+func (c *sharedUnwatchedPollCoordinator) currentPollRoots() []string {
+	c.pollMu.Lock()
+	defer c.pollMu.Unlock()
+	return append([]string(nil), c.pollRoots...)
+}
+
+func (c *sharedUnwatchedPollCoordinator) requestPoll() {
+	select {
+	case c.pollWake <- struct{}{}:
+	default:
 	}
-	log.Printf("polling %d unwatched root(s)", len(roots))
-	c.doWork(func() {
-		pollUnwatchedRootsOnce(c.ctx, c.engine, roots)
-	})
+}
+
+func (c *sharedUnwatchedPollCoordinator) runPollWorker() {
+	defer close(c.pollDone)
+	for {
+		select {
+		case <-c.workerCtx.Done():
+			return
+		default:
+		}
+		select {
+		case <-c.workerCtx.Done():
+			return
+		case <-c.pollWake:
+			if c.workerCtx.Err() != nil {
+				return
+			}
+			roots := c.currentPollRoots()
+			if len(roots) == 0 {
+				continue
+			}
+			log.Printf("polling %d unwatched root(s)", len(roots))
+			c.doWork(func() {
+				if c.workerCtx.Err() != nil {
+					return
+				}
+				pollUnwatchedRootsOnce(c.workerCtx, c.engine, roots)
+			})
+		}
+	}
 }
 
 func unwatchedPollObligationRoots(obligations map[string][]string) []string {

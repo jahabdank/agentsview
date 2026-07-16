@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"math"
 	"os"
 	"path/filepath"
@@ -22,6 +23,49 @@ func testFSNotifyBackend(t *testing.T) *fsnotifyBackend {
 	require.NoError(t, err)
 	t.Cleanup(backend.Stop)
 	return backend
+}
+
+func TestFSNotifyBackendOverflowRequestsLostEventRecovery(t *testing.T) {
+	backend := testFSNotifyBackend(t)
+	errorInput := make(chan error, 1)
+	backend.errorInput = errorInput
+	require.NoError(t, backend.Start())
+	errorInput <- fsnotify.ErrEventOverflow
+
+	pending := newPendingWatchBatch(8, 1_000)
+	event := requireReceiveWithin(t, backend.Events(), time.Second)
+	pending.AddBackendEvent(event)
+	batch, ok := pending.Take()
+
+	require.True(t, ok)
+	assert.Equal(t, WatchBatch{FullSync: true, LostEvents: true}, batch)
+}
+
+func TestFSNotifyBackendOrdinaryErrorRemainsAnError(t *testing.T) {
+	backend := testFSNotifyBackend(t)
+	errorInput := make(chan error, 1)
+	backend.errorInput = errorInput
+	require.NoError(t, backend.Start())
+	sentinel := errors.New("ordinary fsnotify failure")
+	errorInput <- sentinel
+
+	select {
+	case event := <-backend.Events():
+		assert.Fail(t, "ordinary error emitted a watch event", "event: %+v", event)
+	case err := <-backend.Errors():
+		require.ErrorIs(t, err, sentinel)
+	case <-time.After(time.Second):
+		require.FailNow(t, "fsnotify backend did not emit ordinary error")
+	}
+	assert.Never(t, func() bool {
+		select {
+		case <-backend.Events():
+			return true
+		default:
+			return false
+		}
+	}, 50*time.Millisecond, time.Millisecond,
+		"ordinary errors must not request lost-event recovery")
 }
 
 func TestFSNotifyBackendRemoveShallowRootClearsOwnership(t *testing.T) {

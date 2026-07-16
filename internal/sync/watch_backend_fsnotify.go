@@ -17,6 +17,7 @@ import (
 
 type fsnotifyBackend struct {
 	watcher           *fsnotify.Watcher
+	errorInput        <-chan error
 	watchOps          fsnotifyWatchOps
 	events            chan backendEvent
 	errors            chan error
@@ -59,6 +60,7 @@ func newFSNotifyBackend(excludes []string) (*fsnotifyBackend, error) {
 	}
 	return &fsnotifyBackend{
 		watcher:         watcher,
+		errorInput:      watcher.Errors,
 		watchOps:        watcher,
 		events:          make(chan backendEvent),
 		errors:          make(chan error, 1),
@@ -260,9 +262,17 @@ func (b *fsnotifyBackend) loop() {
 			case <-b.stop:
 				return
 			}
-		case err, ok := <-b.watcher.Errors:
+		case err, ok := <-b.errorInput:
 			if !ok {
 				return
+			}
+			if errors.Is(err, fsnotify.ErrEventOverflow) {
+				select {
+				case b.events <- backendEvent{Op: backendOpFullSync}:
+				case <-b.stop:
+					return
+				}
+				continue
 			}
 			select {
 			case b.errors <- err:

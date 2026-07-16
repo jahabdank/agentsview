@@ -19,6 +19,67 @@ type recordingUnwatchedPollSyncer struct {
 	reconcileErr error
 }
 
+type blockingUnwatchedPollSyncer struct {
+	mu        sync.Mutex
+	started   chan []string
+	release   chan struct{}
+	calls     [][]string
+	active    int
+	maxActive int
+}
+
+type cancelBlockingUnwatchedPollSyncer struct {
+	mu       sync.Mutex
+	started  chan struct{}
+	canceled chan struct{}
+	calls    int
+}
+
+func (s *cancelBlockingUnwatchedPollSyncer) ReconcileWatchRoots(
+	ctx context.Context, _ []string, _ bool,
+) error {
+	s.mu.Lock()
+	s.calls++
+	s.mu.Unlock()
+	s.started <- struct{}{}
+	<-ctx.Done()
+	s.canceled <- struct{}{}
+	return ctx.Err()
+}
+
+func (s *cancelBlockingUnwatchedPollSyncer) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+func (s *blockingUnwatchedPollSyncer) ReconcileWatchRoots(
+	_ context.Context, roots []string, _ bool,
+) error {
+	owned := append([]string(nil), roots...)
+	s.mu.Lock()
+	s.calls = append(s.calls, owned)
+	s.active++
+	s.maxActive = max(s.maxActive, s.active)
+	s.mu.Unlock()
+	s.started <- owned
+	<-s.release
+	s.mu.Lock()
+	s.active--
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *blockingUnwatchedPollSyncer) snapshot() ([][]string, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	calls := make([][]string, len(s.calls))
+	for i := range s.calls {
+		calls[i] = append([]string(nil), s.calls[i]...)
+	}
+	return calls, s.maxActive
+}
+
 func (s *recordingUnwatchedPollSyncer) ReconcileWatchRoots(
 	_ context.Context, roots []string, full bool,
 ) error {
@@ -90,6 +151,130 @@ func TestUnwatchedPollTickUsesRootsAddedAfterStart(t *testing.T) {
 	assert.Equal(t, [][]string{{"/initial", "/runtime"}}, syncer.snapshot())
 	assert.Equal(t, []bool{false}, syncer.full,
 		"unwatched polling must reconcile the owned scopes authoritatively")
+}
+
+func TestUnwatchedPollObligationUpdatesRemainResponsiveDuringReconciliation(
+	t *testing.T,
+) {
+	ticks := make(chan time.Time)
+	syncer := &blockingUnwatchedPollSyncer{
+		started: make(chan []string, 4),
+		release: make(chan struct{}),
+	}
+	coordinator := newUnwatchedPollCoordinatorWithTicks(
+		context.Background(), syncer, ticks, func() {}, func(run func()) { run() }, nil,
+	)
+	t.Cleanup(func() {
+		select {
+		case <-syncer.release:
+		default:
+			close(syncer.release)
+		}
+		coordinator.Stop()
+	})
+	require.NoError(t, coordinator.AddObligation(pollingObligation{
+		Key: "initial", Roots: []string{"/initial"},
+	}))
+
+	coordinator.Wake()
+	assert.Equal(t, []string{"/initial"},
+		requireReceivePollRoots(t, syncer.started, time.Second))
+
+	addResult := make(chan error, 1)
+	go func() {
+		addResult <- coordinator.AddObligation(pollingObligation{
+			Key: "replacement", Roots: []string{"/replacement"},
+		})
+	}()
+	require.NoError(t, requireReceivePollResult(t, addResult, time.Second),
+		"watcher polling callbacks must not wait for reconciliation")
+	removeResult := make(chan error, 1)
+	go func() {
+		removeResult <- coordinator.RemoveObligation("initial")
+	}()
+	require.NoError(t, requireReceivePollResult(t, removeResult, time.Second),
+		"watcher polling removals must not wait for reconciliation")
+	coordinator.Wake()
+	coordinator.Wake()
+
+	close(syncer.release)
+	assert.Equal(t, []string{"/replacement"},
+		requireReceivePollRoots(t, syncer.started, time.Second))
+	calls, maxActive := syncer.snapshot()
+	assert.Equal(t, [][]string{{"/initial"}, {"/replacement"}}, calls)
+	assert.Equal(t, 1, maxActive, "poll reconciliations must remain serialized")
+}
+
+func TestUnwatchedPollStopCancelsAndJoinsActiveReconciliation(t *testing.T) {
+	parentCtx, cancelParent := context.WithCancel(context.Background())
+	syncer := &cancelBlockingUnwatchedPollSyncer{
+		started:  make(chan struct{}, 2),
+		canceled: make(chan struct{}, 2),
+	}
+	coordinator := newUnwatchedPollCoordinatorWithTicks(
+		parentCtx, syncer, make(chan time.Time), func() {},
+		func(run func()) { run() }, nil,
+	)
+	t.Cleanup(func() {
+		cancelParent()
+		coordinator.Stop()
+	})
+	require.NoError(t, coordinator.AddRoots([]string{"/owned"}))
+	coordinator.Wake()
+	requirePollWithin(t, syncer.started, time.Second)
+	coordinator.Wake()
+
+	stopDone := make(chan struct{})
+	go func() {
+		coordinator.Stop()
+		close(stopDone)
+	}()
+	requirePollWithin(t, stopDone, time.Second)
+	requirePollWithin(t, syncer.canceled, time.Second)
+	assert.Equal(t, 1, syncer.callCount(),
+		"shutdown must discard the wake queued during reconciliation")
+
+	coordinator.Wake()
+	assert.Never(t, func() bool { return syncer.callCount() > 1 },
+		100*time.Millisecond, 10*time.Millisecond,
+		"shutdown must not start another queued reconciliation")
+}
+
+func TestUnwatchedPollParentCancellationCancelsJoinsAndRejectsUpdates(
+	t *testing.T,
+) {
+	parentCtx, cancelParent := context.WithCancel(context.Background())
+	syncer := &cancelBlockingUnwatchedPollSyncer{
+		started:  make(chan struct{}, 1),
+		canceled: make(chan struct{}, 1),
+	}
+	coordinator := newUnwatchedPollCoordinatorWithTicks(
+		parentCtx, syncer, make(chan time.Time), func() {},
+		func(run func()) { run() }, nil,
+	)
+	t.Cleanup(func() {
+		cancelParent()
+		coordinator.Stop()
+	})
+	require.NoError(t, coordinator.AddRoots([]string{"/owned"}))
+	coordinator.Wake()
+	requirePollWithin(t, syncer.started, time.Second)
+
+	cancelParent()
+	requirePollWithin(t, syncer.canceled, time.Second)
+	select {
+	case <-coordinator.done:
+	case <-time.After(time.Second):
+		require.FailNow(t, "parent cancellation did not join the poll worker")
+	}
+
+	lateUpdate := make(chan error, 1)
+	go func() {
+		lateUpdate <- coordinator.AddRoots([]string{"/late"})
+	}()
+	assert.ErrorIs(t, requireReceivePollResult(t, lateUpdate, time.Second),
+		errUnwatchedPollStopped)
+	assert.Equal(t, 1, syncer.callCount())
 }
 
 func TestUnwatchedPollRemoveRootsStopsReconciliationAfterNativeRecovery(t *testing.T) {

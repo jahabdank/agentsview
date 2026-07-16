@@ -718,6 +718,7 @@ func (e *Engine) Machine() string {
 
 type syncJob struct {
 	processResult
+	agent          parser.AgentType
 	path           string
 	retentionLease *parseRetentionLease
 }
@@ -807,11 +808,6 @@ func (e *Engine) SyncPathsContext(ctx context.Context, paths []string) error {
 	e.persistSkipCache()
 	complete := ctx.Err() == nil && !stats.Aborted && stats.Failed == 0 &&
 		stats.providerFailures == 0
-	if complete {
-		if err := e.baselineDiscoveredFiles(ctx, files, true); err != nil {
-			return fmt.Errorf("watcher source baseline: %w", err)
-		}
-	}
 	if complete && len(missingPaths) > 0 {
 		var err error
 		tombstoned, err = e.tombstoneMissingWatchSourcesLocked(ctx, missingPaths, nil)
@@ -2923,42 +2919,6 @@ func (e *Engine) baselineReconciliationCandidates(
 	return nil
 }
 
-func (e *Engine) baselineDiscoveredFiles(
-	ctx context.Context, files []parser.DiscoveredFile, requirePresent bool,
-) error {
-	sources := make([]db.SessionSourcePath, 0, reconciliationPageSize)
-	flush := func() error {
-		if err := e.db.BaselineActiveSessionSourcePaths(
-			ctx, e.machine, sources,
-		); err != nil {
-			return err
-		}
-		sources = sources[:0]
-		return nil
-	}
-	for _, file := range files {
-		if requirePresent {
-			if _, err := e.lstatSource(
-				validatedProviderSourceStatPath(file.Path),
-			); err != nil {
-				continue
-			}
-		}
-		sources = append(sources, db.SessionSourcePath{
-			Agent: string(file.Agent), FilePath: e.effectiveSourcePath(file.Path),
-		})
-		if len(sources) == reconciliationPageSize {
-			if err := flush(); err != nil {
-				return fmt.Errorf("baseline discovered source page: %w", err)
-			}
-		}
-	}
-	if err := flush(); err != nil {
-		return fmt.Errorf("baseline discovered source page: %w", err)
-	}
-	return nil
-}
-
 func (e *Engine) streamReconciliationCandidates(
 	ctx context.Context, scope *rootSyncScope, spool reconciliationSpoolStore,
 ) (
@@ -4031,14 +3991,6 @@ func (e *Engine) syncAllLocked(
 			return stats
 		}
 	}
-	if !stats.Aborted && ctx.Err() == nil &&
-		stats.Failed == 0 && providerFailures == 0 {
-		if err := e.baselineDiscoveredFiles(ctx, all, false); err != nil {
-			stats.RecordFailed()
-			log.Printf("full-sync source baseline: %v", err)
-		}
-	}
-
 	// Link subagent child sessions to their parents after all DB-backed
 	// agent writes (including provider-authoritative Forge, Piebald, and ZCode).
 	// LinkSubagentSessions is idempotent — its WHERE filter and partial index
@@ -4970,8 +4922,8 @@ func shelleyDBCompositeMtime(dbPath string) (int64, error) {
 // current, reproducing the legacy *PendingSessionIDs behavior.
 func (e *Engine) syncProviderDBBacked(
 	ctx context.Context, agent parser.AgentType, scope *rootSyncScope,
-	flush func([]pendingWrite),
-) (int, error) {
+	flush func([]pendingWrite) bool,
+) (int, int, error) {
 	roots := make([]string, 0, len(e.agentDirs[agent]))
 	for _, dir := range e.agentDirs[agent] {
 		if dir == "" || !scope.includes(dir) {
@@ -4980,11 +4932,11 @@ func (e *Engine) syncProviderDBBacked(
 		roots = append(roots, dir)
 	}
 	if len(roots) == 0 {
-		return 0, nil
+		return 0, 0, nil
 	}
 	factory, ok := e.providerFactories[agent]
 	if !ok || factory == nil {
-		return 0, nil
+		return 0, 0, nil
 	}
 	provider := factory.NewProvider(parser.ProviderConfig{
 		Roots:   roots,
@@ -4992,7 +4944,7 @@ func (e *Engine) syncProviderDBBacked(
 	})
 	discoverer, ok := provider.(parser.StreamingDiscoverer)
 	if !ok || provider.Capabilities().Source.StreamingDiscovery != parser.CapabilitySupported {
-		return 0, fmt.Errorf("sync %s: provider lacks streaming discovery", agent)
+		return 0, 0, fmt.Errorf("sync %s: provider lacks streaming discovery", agent)
 	}
 	baselines := make([]db.SessionSourcePath, 0, reconciliationPageSize)
 	flushBaselines := func() error {
@@ -5021,19 +4973,17 @@ func (e *Engine) syncProviderDBBacked(
 		return nil
 	}
 
-	discovered := 0
-	err := discoverer.DiscoverEach(ctx, func(source parser.SourceRef) (retErr error) {
+	discovered, sourceFailures := 0, 0
+	err := discoverer.DiscoverEach(ctx, func(source parser.SourceRef) error {
 		discovered++
-		defer func() {
-			retErr = errors.Join(retErr, queueBaseline(source))
-		}()
 		fingerprint, err := provider.Fingerprint(ctx, source)
 		if err != nil {
 			log.Printf("sync %s fingerprint: %v", agent, err)
+			sourceFailures++
 			return nil
 		}
 		if e.providerDBBackedSourceFresh(source, fingerprint) {
-			return nil
+			return queueBaseline(source)
 		}
 		outcome, err := provider.Parse(ctx, parser.ParseRequest{
 			Source:      source,
@@ -5042,7 +4992,12 @@ func (e *Engine) syncProviderDBBacked(
 		})
 		if err != nil {
 			log.Printf("sync %s parse: %v", agent, err)
+			sourceFailures++
 			return nil
+		}
+		complete := providerOutcomeAllowsCleanSkipCache(outcome)
+		if !complete {
+			sourceFailures++
 		}
 		pending := make([]pendingWrite, 0, len(outcome.Results))
 		for _, result := range outcome.Results {
@@ -5050,22 +5005,28 @@ func (e *Engine) syncProviderDBBacked(
 				sess:        result.Result.Session,
 				msgs:        result.Result.Messages,
 				usageEvents: result.Result.UsageEvents,
+				needsRetry:  !complete,
 			})
 		}
-		if len(pending) > 0 {
-			flush(pending)
+		if len(pending) > 0 && !flush(pending) {
+			complete = false
+		}
+		if complete {
+			if err := queueBaseline(source); err != nil {
+				return err
+			}
 		}
 		return ctx.Err()
 	})
 	if err != nil {
 		log.Printf("sync %s: %v", agent, err)
-		return discovered, err
+		return discovered, sourceFailures, err
 	}
 	if err := flushBaselines(); err != nil {
 		log.Printf("sync %s: %v", agent, err)
-		return discovered, err
+		return discovered, sourceFailures, err
 	}
-	return discovered, nil
+	return discovered, sourceFailures, nil
 }
 
 // providerDBBackedSourceFresh reports whether a DB-backed provider source is
@@ -5125,28 +5086,44 @@ func (e *Engine) syncProviderDBBackedAgent(
 	resolveWorktreeProject := e.loadWorktreeProjectResolver()
 	var pendingCount, indexedMessages, written int
 	var writeDuration time.Duration
-	flush := func(pending []pendingWrite) {
+	flush := func(pending []pendingWrite) bool {
+		complete := true
 		pendingCount += len(pending)
 		for _, pw := range pending {
 			indexedMessages += len(pw.msgs)
 		}
 		tWrite := time.Now()
 		if writeMode == syncWriteBulk {
-			writeBatch := e.writeBatch
+			var outcome writeBatchOutcome
 			if e.writeBatchOverride != nil {
-				writeBatch = e.writeBatchOverride
+				batchWritten, batchMessages, failedWrites, cwdFiltered :=
+					e.writeBatchOverride(pending, writeMode, true)
+				outcome = writeBatchOutcome{
+					writtenSessions: batchWritten,
+					writtenMessages: batchMessages,
+					failedSessions:  failedWrites,
+					cwdFiltered:     cwdFiltered,
+				}
+				complete = failedWrites == 0 && cwdFiltered == 0 &&
+					batchWritten == len(pending)
+			} else {
+				outcome = e.writeBatchWithOutcome(pending, writeMode, true)
+				for _, wasWritten := range outcome.written {
+					if !wasWritten {
+						complete = false
+						break
+					}
+				}
 			}
-			batchWritten, _, failedWrites, cwdFiltered := writeBatch(
-				pending, writeMode, true,
-			)
-			written += batchWritten
-			for range failedWrites {
+			written += outcome.writtenSessions
+			for range outcome.failedSessions {
 				stats.RecordFailed()
 			}
-			stats.cwdFilteredSessions += cwdFiltered
+			stats.cwdFilteredSessions += outcome.cwdFiltered
 		} else {
 			for _, pw := range pending {
 				if ctx.Err() != nil {
+					complete = false
 					break
 				}
 				var err error
@@ -5160,14 +5137,23 @@ func (e *Engine) syncProviderDBBackedAgent(
 					written++
 				case isIntentionalSessionSkip(err), errors.Is(err, errSessionPreserved):
 					// Intentional skip, not a failure.
+					complete = false
 				default:
+					complete = false
 					stats.RecordFailed()
 				}
 			}
 		}
 		writeDuration += time.Since(tWrite)
+		return complete
 	}
-	discovered, discoveryErr := e.syncProviderDBBacked(ctx, agent, scope, flush)
+	discovered, sourceFailures, discoveryErr := e.syncProviderDBBacked(
+		ctx, agent, scope, flush,
+	)
+	stats.providerFailures += sourceFailures
+	for range sourceFailures {
+		stats.RecordFailed()
+	}
 	if discoveryErr != nil {
 		stats.providerFailures++
 		stats.RecordFailed()
@@ -5223,13 +5209,15 @@ func (e *Engine) startWorkers(
 						processResult: processResult{
 							err: ctx.Err(),
 						},
-						path: file.Path,
+						agent: file.Agent,
+						path:  file.Path,
 					})
 					continue
 				}
 				result, lease := e.processFileWithRetention(ctx, file)
 				emitResult(syncJob{
 					processResult:  result,
+					agent:          file.Agent,
 					path:           file.Path,
 					retentionLease: lease,
 				})
@@ -5289,35 +5277,92 @@ func (e *Engine) collectAndBatch(
 
 	var pending []pendingWrite
 	var pendingLeases []*parseRetentionLease
+	baselineSources := make([]db.SessionSourcePath, 0, reconciliationPageSize)
+	baselineSeen := make(map[db.SessionSourcePath]struct{}, reconciliationPageSize)
 	runtimeMetrics := reconciliationRuntimeMetricsFor(ctx)
+	flushBaselineSources := func() {
+		if len(baselineSources) == 0 {
+			return
+		}
+		if err := e.db.BaselineActiveSessionSourcePaths(
+			ctx, e.machine, baselineSources,
+		); err != nil {
+			log.Printf("baseline successful non-write sources: %v", err)
+			stats.RecordFailed()
+			e.poisonSQLiteContainerPass()
+		}
+		baselineSources = baselineSources[:0]
+		clear(baselineSeen)
+	}
+	baselineSuccessfulSource := func(job syncJob) {
+		// Forced reconciliation baselines its complete candidate page after all
+		// writes succeed. Keep that path authoritative so non-write results do not
+		// add a second baseline pass inside the same bounded page.
+		if runtimeMetrics != nil {
+			return
+		}
+		source := db.SessionSourcePath{
+			Agent: string(job.agent), FilePath: e.effectiveSourcePath(job.path),
+		}
+		if source.Agent == "" || source.FilePath == "" {
+			return
+		}
+		if _, duplicate := baselineSeen[source]; duplicate {
+			return
+		}
+		baselineSeen[source] = struct{}{}
+		baselineSources = append(baselineSources, source)
+		if len(baselineSources) == reconciliationPageSize {
+			flushBaselineSources()
+		}
+	}
 	flushPending := func() {
 		if len(pending) == 0 {
 			return
 		}
 		func() {
 			defer releaseParseRetentionLeases(pendingLeases)
-			writeBatch := e.writeBatch
+			var outcome writeBatchOutcome
 			if e.writeBatchOverride != nil {
-				writeBatch = e.writeBatchOverride
+				writtenSessions, writtenMessages, failedSessions, cwdFiltered :=
+					e.writeBatchOverride(pending, writeMode, false)
+				outcome = writeBatchOutcome{
+					writtenSessions: writtenSessions,
+					writtenMessages: writtenMessages,
+					failedSessions:  failedSessions,
+					cwdFiltered:     cwdFiltered,
+					written:         make([]bool, len(pending)),
+				}
+				if failedSessions == 0 && cwdFiltered == 0 &&
+					writtenSessions == len(pending) {
+					for i := range outcome.written {
+						outcome.written[i] = true
+					}
+				}
+			} else {
+				outcome = e.writeBatchWithOutcome(pending, writeMode, false)
 			}
-			writtenSessions, writtenMessages, failedWrites, cwdFiltered :=
-				writeBatch(pending, writeMode, false)
-			if err := e.baselinePendingWriteSources(ctx, pending); err != nil {
-				log.Printf("baseline parsed session sources: %v", err)
-				failedWrites++
+			if runtimeMetrics == nil {
+				if err := e.baselinePendingWriteSources(
+					ctx, pending, outcome.written,
+				); err != nil {
+					log.Printf("baseline parsed session sources: %v", err)
+					outcome.failedSessions++
+				}
 			}
-			stats.RecordSynced(writtenSessions)
-			for range failedWrites {
+			stats.RecordSynced(outcome.writtenSessions)
+			for range outcome.failedSessions {
 				stats.RecordFailed()
 			}
-			if failedWrites > 0 {
+			if outcome.failedSessions > 0 {
 				e.poisonSQLiteContainerPass()
 			}
 			e.promoteOpenCodeStorageTrustAfterWrite(
-				pending, writtenSessions, failedWrites, cwdFiltered,
+				pending, outcome.writtenSessions, outcome.failedSessions,
+				outcome.cwdFiltered,
 			)
-			stats.cwdFilteredSessions += cwdFiltered
-			progress.MessagesIndexed += writtenMessages
+			stats.cwdFilteredSessions += outcome.cwdFiltered
+			progress.MessagesIndexed += outcome.writtenMessages
 			stats.messagesIndexed = progress.MessagesIndexed
 		}()
 		pending = pending[:0]
@@ -5368,19 +5413,22 @@ func (e *Engine) collectAndBatch(
 			r.releaseRetention()
 			continue
 		}
+		for range r.providerFailureCount {
+			stats.RecordFailed()
+		}
 		if r.skip {
 			if r.cacheSkip && r.mtime != 0 && !r.noCacheSkip {
 				e.cacheSkip(r.skipCacheKey(), r.mtime)
 			}
 			stats.RecordSkip()
 			e.noteSQLiteContainerResult(r.path, true)
+			if r.providerFailureCount == 0 {
+				baselineSuccessfulSource(r)
+			}
 			progress.SessionsDone++
 			e.reportProgress(onProgress, progress)
 			r.releaseRetention()
 			continue
-		}
-		for range r.providerFailureCount {
-			stats.RecordFailed()
 		}
 		excludedSessionIDs := e.applyIDPrefixToSessionIDs(
 			r.excludedSessionIDs,
@@ -5419,6 +5467,9 @@ func (e *Engine) collectAndBatch(
 				e.cacheSkip(r.skipCacheKey(), r.mtime, r.sourceFingerprint)
 			}
 			e.noteSQLiteContainerResult(r.path, true)
+			if r.providerFailureCount == 0 {
+				baselineSuccessfulSource(r)
+			}
 			progress.SessionsDone++
 			e.reportProgress(onProgress, progress)
 			r.releaseRetention()
@@ -5463,6 +5514,9 @@ func (e *Engine) collectAndBatch(
 				continue
 			}
 			stats.RecordSynced(1)
+			if r.providerFailureCount == 0 {
+				baselineSuccessfulSource(r)
+			}
 			progress.MessagesIndexed += len(
 				r.incremental.msgs,
 			)
@@ -5470,12 +5524,15 @@ func (e *Engine) collectAndBatch(
 			r.releaseRetention()
 		} else {
 			for _, pr := range allowed {
+				needsRetry := r.providerFailureCount > 0 ||
+					r.needsRetryForSession(pr.Session.ID)
 				pending = append(pending, pendingWrite{
 					sess:              pr.Session,
 					msgs:              pr.Messages,
 					usageEvents:       pr.UsageEvents,
-					needsRetry:        r.needsRetryForSession(pr.Session.ID),
+					needsRetry:        needsRetry,
 					forceReplace:      r.forceReplace,
+					baselineEligible:  vetoed == 0 && r.providerFailureCount == 0 && !needsRetry,
 					storageTrustPath:  r.storageTrustPath,
 					storageTrustState: r.storageTrustState,
 					storageTrustSnap:  r.storageTrustSnap,
@@ -5511,6 +5568,7 @@ func (e *Engine) collectAndBatch(
 
 flush:
 	flushPending()
+	flushBaselineSources()
 
 	// Link subagent child sessions to their parents via
 	// tool_calls.subagent_session_id references. Run once
@@ -5528,21 +5586,13 @@ flush:
 }
 
 func (e *Engine) baselinePendingWriteSources(
-	ctx context.Context, pending []pendingWrite,
+	ctx context.Context, pending []pendingWrite, written []bool,
 ) error {
-	sources := make([]db.SessionSourcePath, 0, reconciliationPageSize)
-	seen := make(map[db.SessionSourcePath]struct{}, reconciliationPageSize)
-	flush := func() error {
-		if err := e.db.BaselineActiveSessionSourcePaths(
-			ctx, e.machine, sources,
-		); err != nil {
-			return fmt.Errorf("baseline parsed source batch: %w", err)
-		}
-		sources = sources[:0]
-		clear(seen)
-		return nil
-	}
-	for _, write := range pending {
+	eligible := make(
+		map[db.SessionSourcePath]bool,
+		min(len(pending), reconciliationPageSize),
+	)
+	for i, write := range pending {
 		path := e.effectiveSourcePath(write.sess.File.Path)
 		source := db.SessionSourcePath{
 			Agent: string(write.sess.Agent), FilePath: path,
@@ -5550,10 +5600,31 @@ func (e *Engine) baselinePendingWriteSources(
 		if source.Agent == "" || source.FilePath == "" {
 			continue
 		}
-		if _, duplicate := seen[source]; duplicate {
+		if _, seen := eligible[source]; !seen {
+			eligible[source] = true
+		}
+		if !write.baselineEligible || i >= len(written) || !written[i] {
+			eligible[source] = false
+		}
+	}
+
+	sources := make([]db.SessionSourcePath, 0, reconciliationPageSize)
+	flush := func() error {
+		if len(sources) == 0 {
+			return nil
+		}
+		if err := e.db.BaselineActiveSessionSourcePaths(
+			ctx, e.machine, sources,
+		); err != nil {
+			return fmt.Errorf("baseline parsed source batch: %w", err)
+		}
+		sources = sources[:0]
+		return nil
+	}
+	for source, ok := range eligible {
+		if !ok {
 			continue
 		}
-		seen[source] = struct{}{}
 		sources = append(sources, source)
 		if len(sources) == reconciliationPageSize {
 			if err := flush(); err != nil {
@@ -6099,6 +6170,10 @@ func (e *Engine) processProviderFile(
 	}
 	applyProviderFingerprintFileInfo(file.Agent, fingerprint, outcome.Results)
 	cleanCache := providerOutcomeAllowsCleanSkipCache(outcome)
+	providerFailureCount := len(outcome.SourceErrors)
+	if !outcome.ResultSetComplete {
+		providerFailureCount++
+	}
 	if outcome.SkipReason != parser.SkipNone {
 		excludedSessionIDs := append([]string(nil), outcome.ExcludedSessionIDs...)
 		if outcome.ForceReplace && outcome.ResultSetComplete {
@@ -6108,13 +6183,15 @@ func (e *Engine) processProviderFile(
 			)
 		}
 		return processResult{
-			skip:               !outcome.ForceReplace,
-			excludedSessionIDs: excludedSessionIDs,
-			mtime:              fingerprint.MTimeNS,
-			cacheSkip:          cacheSkip,
-			cacheKey:           cacheKey,
-			noCacheSkip:        !cleanCache,
-			forceReplace:       outcome.ForceReplace,
+			skip:                  !outcome.ForceReplace,
+			excludedSessionIDs:    excludedSessionIDs,
+			mtime:                 fingerprint.MTimeNS,
+			cacheSkip:             cacheSkip,
+			cacheKey:              cacheKey,
+			noCacheSkip:           !cleanCache,
+			forceReplace:          outcome.ForceReplace,
+			suppressPresenceSweep: !outcome.ResultSetComplete,
+			providerFailureCount:  providerFailureCount,
 		}, true
 	}
 
@@ -6129,10 +6206,7 @@ func (e *Engine) processProviderFile(
 		noCacheSkip:           !cleanCache,
 		forceReplace:          outcome.ForceReplace || incForceReplace,
 		suppressPresenceSweep: !outcome.ResultSetComplete,
-		providerFailureCount:  len(outcome.SourceErrors),
-	}
-	if !outcome.ResultSetComplete {
-		res.providerFailureCount++
+		providerFailureCount:  providerFailureCount,
 	}
 	// Incremental-append providers (Claude and Codex) need the stored file
 	// identity so a later sync can detect an atomic file replacement
@@ -8231,12 +8305,23 @@ type pendingWrite struct {
 	usageEvents  []parser.ParsedUsageEvent
 	needsRetry   bool
 	forceReplace bool
+	// baselineEligible is set by collectAndBatch only when the complete source
+	// outcome is safe to make deletion-eligible after this write succeeds.
+	baselineEligible bool
 	// storageTrustPath/State/Snap promote the session's OpenCode
 	// storage-gate trust after its batch is confirmed fully written.
 	// Empty for everything else.
 	storageTrustPath  string
 	storageTrustState string
 	storageTrustSnap  storageTrustSnapshot
+}
+
+type writeBatchOutcome struct {
+	writtenSessions int
+	writtenMessages int
+	failedSessions  int
+	cwdFiltered     int
+	written         []bool
 }
 
 func dataVersionForWrite(pw pendingWrite) int {
@@ -8296,18 +8381,29 @@ func (e *Engine) writeBatch(
 	writeMode syncWriteMode,
 	forceReplace bool,
 ) (writtenSessions, writtenMessages, failedSessions, cwdFiltered int) {
+	outcome := e.writeBatchWithOutcome(batch, writeMode, forceReplace)
+	return outcome.writtenSessions, outcome.writtenMessages,
+		outcome.failedSessions, outcome.cwdFiltered
+}
+
+func (e *Engine) writeBatchWithOutcome(
+	batch []pendingWrite,
+	writeMode syncWriteMode,
+	forceReplace bool,
+) writeBatchOutcome {
 	if writeMode == syncWriteBulk {
-		return e.writeBatchBulk(batch, forceReplace)
+		return e.writeBatchBulkWithOutcome(batch, forceReplace)
 	}
 
+	outcome := writeBatchOutcome{written: make([]bool, len(batch))}
 	resolveWorktreeProject := e.loadWorktreeProjectResolver()
-	for _, pw := range batch {
+	for i, pw := range batch {
 		s, msgs, verdict := e.prepareSessionWrite(
 			pw, resolveWorktreeProject,
 		)
 		if verdict != sessionWriteOK {
 			if verdict == sessionWriteCwdFiltered {
-				cwdFiltered++
+				outcome.cwdFiltered++
 			}
 			continue
 		}
@@ -8343,7 +8439,7 @@ func (e *Engine) writeBatch(
 				continue
 			}
 			log.Printf("upsert session %s: %v", s.ID, err)
-			failedSessions++
+			outcome.failedSessions++
 			continue
 		}
 		if err := e.writeProjectIdentityObservation(
@@ -8372,7 +8468,7 @@ func (e *Engine) writeBatch(
 				"write messages for %s: %v",
 				s.ID, werr,
 			)
-			failedSessions++
+			outcome.failedSessions++
 			continue
 		}
 		if err := e.db.ReplaceSessionUsageEvents(
@@ -8382,7 +8478,7 @@ func (e *Engine) writeBatch(
 				"write usage events for %s: %v",
 				s.ID, err,
 			)
-			failedSessions++
+			outcome.failedSessions++
 			continue
 		}
 
@@ -8412,10 +8508,11 @@ func (e *Engine) writeBatch(
 				log.Printf("signals: update %s: %v", s.ID, err)
 			}
 		}
-		writtenSessions++
-		writtenMessages += len(msgs)
+		outcome.writtenSessions++
+		outcome.writtenMessages += len(msgs)
+		outcome.written[i] = true
 	}
-	return writtenSessions, writtenMessages, failedSessions, cwdFiltered
+	return outcome
 }
 
 // sessionWriteVerdict says whether prepareSessionWrite produced a
@@ -9243,14 +9340,16 @@ type localGitIdentity struct {
 	worktreeKind   export.WorktreeRelationship
 }
 
-func (e *Engine) writeBatchBulk(
+func (e *Engine) writeBatchBulkWithOutcome(
 	batch []pendingWrite, forceReplace bool,
-) (writtenSessions, writtenMessages, failedSessions, cwdFiltered int) {
+) writeBatchOutcome {
+	outcome := writeBatchOutcome{written: make([]bool, len(batch))}
 	writes := make([]db.SessionBatchWrite, 0, len(batch))
+	pendingIndexes := make([]int, 0, len(batch))
 	sources := make(map[string]batchSourceFile, len(batch))
 	resolveWorktreeProject := e.loadWorktreeProjectResolver()
 
-	for _, pw := range batch {
+	for pendingIndex, pw := range batch {
 		tPrep := time.Now()
 		s, msgs, verdict := e.prepareSessionWrite(
 			pw, resolveWorktreeProject,
@@ -9258,7 +9357,7 @@ func (e *Engine) writeBatchBulk(
 		e.phaseStats.PrepNanos.Add(int64(time.Since(tPrep)))
 		if verdict != sessionWriteOK {
 			if verdict == sessionWriteCwdFiltered {
-				cwdFiltered++
+				outcome.cwdFiltered++
 			}
 			continue
 		}
@@ -9280,6 +9379,7 @@ func (e *Engine) writeBatchBulk(
 			DataVersion:     dataVersionForWrite(pw),
 			ReplaceMessages: replaceMessages,
 		})
+		pendingIndexes = append(pendingIndexes, pendingIndex)
 		if pw.sess.File.Path != "" {
 			sources[s.ID] = batchSourceFile{
 				path:        pw.sess.File.Path,
@@ -9289,7 +9389,7 @@ func (e *Engine) writeBatchBulk(
 		}
 	}
 	if len(writes) == 0 {
-		return 0, 0, 0, cwdFiltered
+		return outcome
 	}
 
 	tWrite := time.Now()
@@ -9300,7 +9400,13 @@ func (e *Engine) writeBatchBulk(
 	e.phaseStats.BatchedWrites.Add(int64(result.WrittenSessions))
 	if err != nil {
 		log.Printf("write session batch: %v", err)
-		return 0, 0, len(writes), cwdFiltered
+		outcome.failedSessions = len(writes)
+		return outcome
+	}
+	for _, writtenIndex := range result.WrittenIndexes {
+		if writtenIndex >= 0 && writtenIndex < len(pendingIndexes) {
+			outcome.written[pendingIndexes[writtenIndex]] = true
+		}
 	}
 	for _, id := range result.ExcludedIDs {
 		if source, ok := sources[id]; ok && source.path != "" {
@@ -9312,10 +9418,10 @@ func (e *Engine) writeBatchBulk(
 	for _, err := range result.Errors {
 		log.Printf("write session batch: %v", err)
 	}
-	return result.WrittenSessions,
-		result.WrittenMessages,
-		result.FailedSessions,
-		cwdFiltered
+	outcome.writtenSessions = result.WrittenSessions
+	outcome.writtenMessages = result.WrittenMessages
+	outcome.failedSessions = result.FailedSessions
+	return outcome
 }
 
 func identityObservationOrZero(

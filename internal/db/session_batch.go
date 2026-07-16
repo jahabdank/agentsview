@@ -28,6 +28,7 @@ type SessionBatchWrite struct {
 type SessionBatchResult struct {
 	WrittenSessions  int
 	WrittenMessages  int
+	WrittenIndexes   []int
 	ExcludedSessions int
 	ExcludedIDs      []string
 	FailedSessions   int
@@ -92,6 +93,7 @@ func (db *DB) WriteSessionBatch(
 			)
 			result.WrittenSessions++
 			result.WrittenMessages += messagesWritten
+			result.WrittenIndexes = append(result.WrittenIndexes, i)
 		case errors.Is(err, ErrSessionExcluded),
 			errors.Is(err, ErrSessionTrashed):
 			if rerr := rollbackSavepoint(tx, savepoint); rerr != nil {
@@ -143,7 +145,7 @@ func (db *DB) WriteSessionBatchAtomic(
 	defer func() { _ = tx.Rollback() }()
 	var pendingRecallRevocations recallEvidenceRevocationEvents
 
-	for _, write := range writes {
+	for i, write := range writes {
 		write = sanitizeSessionBatchWrite(write)
 		messagesWritten, err := writeOneSessionBatchTx(
 			tx,
@@ -153,6 +155,7 @@ func (db *DB) WriteSessionBatchAtomic(
 		if err != nil {
 			result.WrittenSessions = 0
 			result.WrittenMessages = 0
+			result.WrittenIndexes = nil
 			switch {
 			case errors.Is(err, ErrSessionExcluded),
 				errors.Is(err, ErrSessionTrashed):
@@ -169,12 +172,14 @@ func (db *DB) WriteSessionBatchAtomic(
 		}
 		result.WrittenSessions++
 		result.WrittenMessages += messagesWritten
+		result.WrittenIndexes = append(result.WrittenIndexes, i)
 	}
 
 	if len(beforeCommit) > 0 && beforeCommit[0] != nil {
 		if err := beforeCommit[0](); err != nil {
 			result.WrittenSessions = 0
 			result.WrittenMessages = 0
+			result.WrittenIndexes = nil
 			return result, err
 		}
 	}

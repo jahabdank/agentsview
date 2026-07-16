@@ -225,6 +225,173 @@ func (f failingDBBackedFactory) Definition() parser.AgentDef {
 	return f.provider.Definition()
 }
 
+func observeSourceBaselineAttempts(t *testing.T, database *db.DB) func() int {
+	t.Helper()
+	raw, err := sql.Open("sqlite3", database.Path())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, raw.Close()) })
+	_, err = raw.Exec(`
+		CREATE TABLE source_baseline_attempt_observer (attempts INTEGER NOT NULL);
+		INSERT INTO source_baseline_attempt_observer VALUES (0);
+		CREATE TRIGGER observe_source_baseline_attempt
+		BEFORE INSERT ON local_session_source_baselines
+		BEGIN
+			UPDATE source_baseline_attempt_observer SET attempts = attempts + 1;
+		END;
+	`)
+	require.NoError(t, err)
+	return func() int {
+		var attempts int
+		require.NoError(t, raw.QueryRow(
+			"SELECT attempts FROM source_baseline_attempt_observer",
+		).Scan(&attempts))
+		return attempts
+	}
+}
+
+func TestSyncAllBaselinesSuccessfulSkipDespiteUnrelatedProviderFailure(t *testing.T) {
+	database := openTestDB(t)
+	claudeRoot := filepath.Join(t.TempDir(), "claude")
+	path := filepath.Join(claudeRoot, "project", "successful-skip.jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(
+		path,
+		[]byte(testjsonl.NewSessionBuilder().
+			AddClaudeUser("2024-01-01T00:00:00Z", "keep me eligible").
+			String()),
+		0o644,
+	))
+	claudeFactory, ok := parser.ProviderFactoryByType(parser.AgentClaude)
+	require.True(t, ok)
+	failing := failingDBBackedProvider{
+		ProviderBase: parser.ProviderBase{Def: parser.AgentDef{
+			Type: parser.AgentWarp, DisplayName: "Warp", FileBased: false,
+		}},
+		err: errors.New("unrelated provider unavailable"), failOnCall: 2,
+	}
+	warpRoot := t.TempDir()
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentClaude: {claudeRoot},
+			parser.AgentWarp:   {warpRoot},
+		},
+		Machine: "local",
+		ProviderFactories: []parser.ProviderFactory{
+			claudeFactory, failingDBBackedFactory{provider: &failing},
+		},
+		ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+			parser.AgentClaude: parser.ProviderMigrationProviderAuthoritative,
+			parser.AgentWarp:   parser.ProviderMigrationProviderAuthoritative,
+		},
+	})
+	t.Cleanup(engine.Close)
+
+	first := engine.SyncAll(t.Context(), nil)
+	require.Equal(t, 1, first.Synced)
+	raw, err := sql.Open("sqlite3", database.Path())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, raw.Close()) })
+	_, err = raw.Exec("DELETE FROM local_session_source_baselines")
+	require.NoError(t, err)
+
+	second := engine.SyncAll(t.Context(), nil)
+
+	assert.Positive(t, second.Failed, "the unrelated provider must fail this pass")
+	assert.Positive(t, second.Skipped, "the unchanged Claude source must skip successfully")
+	ownership, err := database.ListActiveSessionSourceOwnershipPage(
+		t.Context(), "local", string(parser.AgentClaude), claudeRoot,
+		db.SessionSourceCursor{},
+	)
+	require.NoError(t, err)
+	require.Len(t, ownership, 1,
+		"a successful skipped source must acquire baseline eligibility independently")
+	assert.Equal(t, path, ownership[0].FilePath)
+}
+
+func TestSyncAllAfterWatcherOverflowBaselinesParsedSourceOnce(t *testing.T) {
+	database := openTestDB(t)
+	claudeRoot := filepath.Join(t.TempDir(), "claude")
+	path := filepath.Join(claudeRoot, "project", "forced.jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(
+		path,
+		[]byte(testjsonl.NewSessionBuilder().
+			AddClaudeUser("2024-01-01T00:00:00Z", "force parse once").
+			String()),
+		0o644,
+	))
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentClaude: {claudeRoot},
+		},
+		Machine: "local",
+	})
+	t.Cleanup(engine.Close)
+	baselineAttempts := observeSourceBaselineAttempts(t, database)
+
+	stats := engine.SyncAllAfterWatcherOverflow(t.Context(), nil)
+
+	require.Equal(t, 1, stats.Synced)
+	assert.Equal(t, 1, baselineAttempts(),
+		"a successfully parsed source must not be baselined again archive-wide")
+}
+
+func TestSyncPathsBaselinesParsedSourceOnce(t *testing.T) {
+	database := openTestDB(t)
+	claudeRoot := filepath.Join(t.TempDir(), "claude")
+	path := filepath.Join(claudeRoot, "project", "changed.jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(
+		path,
+		[]byte(testjsonl.NewSessionBuilder().
+			AddClaudeUser("2024-01-01T00:00:00Z", "changed path").
+			String()),
+		0o644,
+	))
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentClaude: {claudeRoot},
+		},
+		Machine: "local",
+	})
+	t.Cleanup(engine.Close)
+	baselineAttempts := observeSourceBaselineAttempts(t, database)
+
+	require.NoError(t, engine.SyncPathsContext(t.Context(), []string{path}))
+
+	assert.Equal(t, 1, baselineAttempts(),
+		"a changed-path parse must baseline its source exactly once")
+}
+
+func TestReconcileWatchRootsBaselinesParsedSourceOnce(t *testing.T) {
+	database := openTestDB(t)
+	claudeRoot := filepath.Join(t.TempDir(), "claude")
+	path := filepath.Join(claudeRoot, "project", "reconciled.jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(
+		path,
+		[]byte(testjsonl.NewSessionBuilder().
+			AddClaudeUser("2024-01-01T00:00:00Z", "reconciled path").
+			String()),
+		0o644,
+	))
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentClaude: {claudeRoot},
+		},
+		Machine: "local",
+	})
+	t.Cleanup(engine.Close)
+	baselineAttempts := observeSourceBaselineAttempts(t, database)
+
+	require.NoError(t, engine.ReconcileWatchRoots(
+		t.Context(), []string{claudeRoot}, false,
+	))
+
+	assert.Equal(t, 1, baselineAttempts(),
+		"a reconciled parse must use only the candidate-page baseline")
+}
+
 type directStreamingProvider struct {
 	parser.ProviderBase
 	discoverCalls atomic.Int32
@@ -232,6 +399,7 @@ type directStreamingProvider struct {
 	source        *parser.SourceRef
 	parseErr      error
 	parseOutcome  parser.ParseOutcome
+	fingerprint   parser.SourceFingerprint
 }
 
 func (provider *directStreamingProvider) Discover(context.Context) ([]parser.SourceRef, error) {
@@ -267,7 +435,7 @@ func (provider *directStreamingProvider) SourcesForChangedPath(
 func (provider *directStreamingProvider) Fingerprint(
 	context.Context, parser.SourceRef,
 ) (parser.SourceFingerprint, error) {
-	return parser.SourceFingerprint{}, nil
+	return provider.fingerprint, nil
 }
 
 func (provider *directStreamingProvider) Parse(
@@ -285,6 +453,268 @@ func (factory directStreamingFactory) Definition() parser.AgentDef {
 
 func (factory directStreamingFactory) Capabilities() parser.Capabilities {
 	return factory.provider.Capabilities()
+}
+
+func newChangedPathOutcomeEngine(
+	t *testing.T,
+	agent parser.AgentType,
+	outcome func(string) parser.ParseOutcome,
+) (*db.DB, *Engine, *directStreamingProvider, string, string) {
+	t.Helper()
+	database := openTestDB(t)
+	root := t.TempDir()
+	path := filepath.Join(root, "source.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte("{}\n"), 0o600))
+	source := parser.SourceRef{
+		Provider: agent, Key: path, DisplayPath: path, FingerprintKey: path,
+	}
+	provider := &directStreamingProvider{
+		ProviderBase: parser.ProviderBase{
+			Def: parser.AgentDef{Type: agent, FileBased: true},
+			Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+				DiscoverSources:    parser.CapabilitySupported,
+				StreamingDiscovery: parser.CapabilitySupported,
+				WatchSources:       parser.CapabilitySupported,
+				FindSource:         parser.CapabilitySupported,
+			}},
+		},
+		source: &source, parseOutcome: outcome(path),
+	}
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{agent: {root}},
+		Machine:   "local",
+		ProviderFactories: []parser.ProviderFactory{
+			directStreamingFactory{provider: provider},
+		},
+		ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+			agent: parser.ProviderMigrationProviderAuthoritative,
+		},
+	})
+	t.Cleanup(engine.Close)
+	return database, engine, provider, root, path
+}
+
+func seedActiveBaselineSource(
+	t *testing.T,
+	database *db.DB,
+	agent parser.AgentType,
+	id string,
+	path string,
+) {
+	t.Helper()
+	size := int64(1)
+	mtime := int64(1)
+	require.NoError(t, database.UpsertSession(db.Session{
+		ID: id, Agent: string(agent), Project: "project", Machine: "local",
+		FilePath: &path, FileSize: &size, FileMtime: &mtime,
+	}))
+	require.NoError(t, database.SetSessionDataVersion(id, db.CurrentDataVersion()))
+}
+
+func TestSyncPathsWriteFailureDoesNotBaselineExistingActiveSource(t *testing.T) {
+	const agent parser.AgentType = "baseline-write-failure"
+	const sessionID = "existing-write-failure"
+	database, engine, _, root, path := newChangedPathOutcomeEngine(
+		t, agent, func(path string) parser.ParseOutcome {
+			started := time.Unix(1704067200, 0)
+			return parser.ParseOutcome{
+				Results: []parser.ParseResultOutcome{{
+					Result: parser.ParseResult{Session: parser.ParsedSession{
+						ID: sessionID, Agent: agent, Project: "project", Machine: "local",
+						StartedAt: started, EndedAt: started,
+						File: parser.FileInfo{Path: path},
+					}},
+					DataVersion: parser.DataVersionCurrent,
+				}},
+				ResultSetComplete: true,
+			}
+		},
+	)
+	seedActiveBaselineSource(t, database, agent, sessionID, path)
+	engine.writeBatchOverride = func(
+		batch []pendingWrite, _ syncWriteMode, _ bool,
+	) (int, int, int, int) {
+		return 0, 0, len(batch), 0
+	}
+
+	err := engine.SyncPathsContext(t.Context(), []string{path})
+
+	require.ErrorContains(t, err, "changed-path sync incomplete")
+	assert.Equal(t, 1, engine.LastSyncStats().Failed,
+		"the injected archive write must fail")
+	ownership, ownershipErr := database.ListActiveSessionSourceOwnershipPage(
+		t.Context(), "local", string(agent), root, db.SessionSourceCursor{},
+	)
+	require.NoError(t, ownershipErr)
+	assert.Empty(t, ownership,
+		"a failed write must not make an existing source deletion-eligible")
+}
+
+func TestSyncPathsPartialSkipDoesNotBaselineExistingActiveSource(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		outcome func(string) parser.ParseOutcome
+	}{
+		{
+			name: "source error",
+			outcome: func(path string) parser.ParseOutcome {
+				return parser.ParseOutcome{
+					SourceErrors: []parser.SourceError{{
+						SourceKey: path, SessionID: "existing-partial-skip",
+						Err: errors.New("member parse failed"),
+					}},
+					ResultSetComplete: true,
+					SkipReason:        parser.SkipNoSession,
+				}
+			},
+		},
+		{
+			name: "incomplete result set",
+			outcome: func(string) parser.ParseOutcome {
+				return parser.ParseOutcome{
+					ResultSetComplete: false,
+					SkipReason:        parser.SkipNoSession,
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const agent parser.AgentType = "baseline-partial-skip"
+			const sessionID = "existing-partial-skip"
+			database, engine, _, root, path := newChangedPathOutcomeEngine(
+				t, agent, tc.outcome,
+			)
+			seedActiveBaselineSource(t, database, agent, sessionID, path)
+
+			err := engine.SyncPathsContext(t.Context(), []string{path})
+
+			require.ErrorContains(t, err, "changed-path sync incomplete")
+			assert.Equal(t, 1, engine.LastSyncStats().Failed,
+				"the provider's partial skip must keep the pass incomplete")
+			ownership, ownershipErr := database.ListActiveSessionSourceOwnershipPage(
+				t.Context(), "local", string(agent), root, db.SessionSourceCursor{},
+			)
+			require.NoError(t, ownershipErr)
+			assert.Empty(t, ownership,
+				"a partial skip must not make an existing source deletion-eligible")
+		})
+	}
+}
+
+func TestSyncPathsPartialResultRemainsRetryableOnSecondPass(t *testing.T) {
+	const agent parser.AgentType = "baseline-partial-result"
+	const sessionID = "partial-result"
+	database, engine, provider, root, path := newChangedPathOutcomeEngine(
+		t, agent, func(path string) parser.ParseOutcome {
+			started := time.Unix(1704067200, 0)
+			return parser.ParseOutcome{
+				Results: []parser.ParseResultOutcome{{
+					Result: parser.ParseResult{Session: parser.ParsedSession{
+						ID: sessionID, Agent: agent, Project: "project", Machine: "local",
+						StartedAt: started, EndedAt: started,
+						File: parser.FileInfo{
+							Path: path, Size: 3, Mtime: 2, Hash: "partial-fingerprint",
+						},
+					}},
+					DataVersion: parser.DataVersionCurrent,
+				}},
+				SourceErrors: []parser.SourceError{{
+					SourceKey: path, SessionID: sessionID,
+					Err: errors.New("injected partial member failure"),
+				}},
+				ResultSetComplete: true,
+			}
+		},
+	)
+	provider.fingerprint = parser.SourceFingerprint{
+		Key: path, Size: 3, MTimeNS: 2, Hash: "partial-fingerprint",
+	}
+
+	for pass := 1; pass <= 2; pass++ {
+		err := engine.SyncPathsContext(t.Context(), []string{path})
+		require.ErrorContains(t, err, "changed-path sync incomplete")
+		assert.Equal(t, 1, engine.LastSyncStats().Failed,
+			"pass %d must report the partial source", pass)
+		stored, getErr := database.GetSession(t.Context(), sessionID)
+		require.NoError(t, getErr)
+		require.NotNil(t, stored, "the valid partial result must remain persisted")
+		size, mtime, found := database.GetFileInfoByPath(path)
+		require.True(t, found)
+		assert.Equal(t, int64(3), size)
+		assert.Equal(t, int64(2), mtime)
+		assert.Less(t, stored.DataVersion, db.CurrentDataVersion(),
+			"the partial source must remain retryable")
+		ownership, ownershipErr := database.ListActiveSessionSourceOwnershipPage(
+			t.Context(), "local", string(agent), root, db.SessionSourceCursor{},
+		)
+		require.NoError(t, ownershipErr)
+		assert.Empty(t, ownership,
+			"pass %d must not baseline the partial source", pass)
+	}
+	assert.Equal(t, int32(2), provider.parseCalls.Load(),
+		"the unchanged fingerprint must be reparsed after the partial result")
+}
+
+func TestCollectAndBatchBaselinesHealthySourceBesideFailedSource(t *testing.T) {
+	const agent parser.AgentType = "baseline-batch-outcomes"
+	database := openTestDB(t)
+	root := t.TempDir()
+	healthyPath := filepath.Join(root, "healthy.jsonl")
+	failedPath := filepath.Join(root, "failed.jsonl")
+	seedActiveBaselineSource(t, database, agent, "healthy", healthyPath)
+	seedActiveBaselineSource(t, database, agent, "failed", failedPath)
+	raw, err := sql.Open("sqlite3", database.Path())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, raw.Close()) })
+	_, err = raw.Exec(`
+		CREATE TRIGGER fail_selected_baseline_write
+		BEFORE INSERT ON sessions
+		WHEN NEW.project = 'failed-project'
+		BEGIN
+			SELECT RAISE(FAIL, 'injected source write failure');
+		END;
+	`)
+	require.NoError(t, err)
+	engine := NewEngine(database, EngineConfig{Machine: "local"})
+	t.Cleanup(engine.Close)
+	results := make(chan syncJob, 2)
+	started := time.Unix(1704067200, 0)
+	for _, source := range []struct {
+		path    string
+		project string
+	}{
+		{path: failedPath, project: "failed-project"},
+		{path: healthyPath, project: "healthy-project"},
+	} {
+		results <- syncJob{
+			agent: agent,
+			path:  source.path,
+			processResult: processResult{results: []parser.ParseResult{{
+				Session: parser.ParsedSession{
+					ID: "duplicate", Agent: agent, Project: source.project, Machine: "local",
+					StartedAt: started, EndedAt: started,
+					File: parser.FileInfo{Path: source.path},
+				},
+			}}},
+		}
+	}
+	close(results)
+
+	stats := engine.collectAndBatch(
+		t.Context(), results, 2, 2, nil, syncWriteBulk,
+	)
+
+	assert.Equal(t, 1, stats.Synced)
+	assert.Equal(t, 1, stats.Failed)
+	ownership, err := database.ListActiveSessionSourceOwnershipPage(
+		t.Context(), "local", string(agent), root, db.SessionSourceCursor{},
+	)
+	require.NoError(t, err)
+	require.NotEmpty(t, ownership)
+	for _, row := range ownership {
+		assert.Equal(t, healthyPath, row.FilePath,
+			"the failed source must not baseline beside the successful duplicate ID")
+	}
 }
 
 type manyStreamingProvider struct {
@@ -375,6 +805,240 @@ func (factory manyStreamingFactory) NewProvider(parser.ProviderConfig) parser.Pr
 
 func (factory directStreamingFactory) NewProvider(parser.ProviderConfig) parser.Provider {
 	return factory.provider
+}
+
+type baselineDBBackedProvider struct {
+	parser.ProviderBase
+	sources           []parser.SourceRef
+	fingerprintErrKey string
+	parseErrKey       string
+	outcomes          map[string]parser.ParseOutcome
+	fingerprintCalls  map[string]int
+	parseCalls        map[string]int
+}
+
+func (provider *baselineDBBackedProvider) DiscoverEach(
+	ctx context.Context, yield func(parser.SourceRef) error,
+) error {
+	for _, source := range provider.sources {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := yield(source); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (provider *baselineDBBackedProvider) Fingerprint(
+	_ context.Context, source parser.SourceRef,
+) (parser.SourceFingerprint, error) {
+	provider.fingerprintCalls[source.Key]++
+	if source.Key == provider.fingerprintErrKey {
+		return parser.SourceFingerprint{}, errors.New("injected fingerprint failure")
+	}
+	return parser.SourceFingerprint{
+		Key: source.FingerprintKey, MTimeNS: 2, Hash: "changed",
+	}, nil
+}
+
+func (provider *baselineDBBackedProvider) Parse(
+	_ context.Context, req parser.ParseRequest,
+) (parser.ParseOutcome, error) {
+	provider.parseCalls[req.Source.Key]++
+	if req.Source.Key == provider.parseErrKey {
+		return parser.ParseOutcome{}, errors.New("injected parse failure")
+	}
+	return provider.outcomes[req.Source.Key], nil
+}
+
+type baselineDBBackedFactory struct{ provider *baselineDBBackedProvider }
+
+func (factory baselineDBBackedFactory) Definition() parser.AgentDef {
+	return factory.provider.Definition()
+}
+
+func (factory baselineDBBackedFactory) Capabilities() parser.Capabilities {
+	return factory.provider.Capabilities()
+}
+
+func (factory baselineDBBackedFactory) NewProvider(
+	parser.ProviderConfig,
+) parser.Provider {
+	return factory.provider
+}
+
+func TestSyncProviderDBBackedBaselinesOnlyCompleteSuccessfulSources(t *testing.T) {
+	for _, tc := range []struct {
+		name                 string
+		configure            func(*baselineDBBackedProvider, string)
+		failWrite            bool
+		wantStaleWrite       bool
+		wantProviderFailures int
+		wantFailedParseCalls int
+	}{
+		{
+			name:                 "fingerprint failure",
+			wantProviderFailures: 1,
+			configure: func(provider *baselineDBBackedProvider, failedPath string) {
+				provider.fingerprintErrKey = failedPath
+			},
+		},
+		{
+			name:                 "parse failure",
+			wantProviderFailures: 1,
+			wantFailedParseCalls: 2,
+			configure: func(provider *baselineDBBackedProvider, failedPath string) {
+				provider.parseErrKey = failedPath
+			},
+		},
+		{
+			name:                 "source error",
+			wantStaleWrite:       true,
+			wantProviderFailures: 1,
+			wantFailedParseCalls: 2,
+			configure: func(provider *baselineDBBackedProvider, failedPath string) {
+				outcome := provider.outcomes[failedPath]
+				outcome.SourceErrors = []parser.SourceError{{
+					SourceKey: failedPath, SessionID: "failed",
+					Err: errors.New("injected member failure"),
+				}}
+				provider.outcomes[failedPath] = outcome
+			},
+		},
+		{
+			name:                 "incomplete result set",
+			wantStaleWrite:       true,
+			wantProviderFailures: 1,
+			wantFailedParseCalls: 2,
+			configure: func(provider *baselineDBBackedProvider, failedPath string) {
+				outcome := provider.outcomes[failedPath]
+				outcome.ResultSetComplete = false
+				provider.outcomes[failedPath] = outcome
+			},
+		},
+		{
+			name:                 "result needs retry",
+			wantStaleWrite:       true,
+			wantProviderFailures: 1,
+			wantFailedParseCalls: 2,
+			configure: func(provider *baselineDBBackedProvider, failedPath string) {
+				outcome := provider.outcomes[failedPath]
+				outcome.Results[0].DataVersion = parser.DataVersionNeedsRetry
+				provider.outcomes[failedPath] = outcome
+			},
+		},
+		{name: "write failure", failWrite: true, wantFailedParseCalls: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const agent parser.AgentType = "baseline-db-backed"
+			database := openTestDB(t)
+			root := t.TempDir()
+			healthyPath := filepath.Join(root, "healthy.db")
+			failedPath := filepath.Join(root, "failed.db")
+			seedActiveBaselineSource(t, database, agent, "healthy", healthyPath)
+			seedActiveBaselineSource(t, database, agent, "failed", failedPath)
+			started := time.Unix(1704067200, 0)
+			outcome := func(id, path string) parser.ParseOutcome {
+				return parser.ParseOutcome{
+					Results: []parser.ParseResultOutcome{{
+						Result: parser.ParseResult{Session: parser.ParsedSession{
+							ID: id, Agent: agent, Project: "project", Machine: "local",
+							StartedAt: started, EndedAt: started,
+							File: parser.FileInfo{Path: path, Mtime: 2},
+						}},
+						DataVersion: parser.DataVersionCurrent,
+					}},
+					ResultSetComplete: true,
+				}
+			}
+			provider := &baselineDBBackedProvider{
+				ProviderBase: parser.ProviderBase{
+					Def: parser.AgentDef{Type: agent, FileBased: false},
+					Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+						StreamingDiscovery: parser.CapabilitySupported,
+					}},
+				},
+				sources: []parser.SourceRef{
+					{Provider: agent, Key: healthyPath, DisplayPath: healthyPath, FingerprintKey: healthyPath},
+					{Provider: agent, Key: failedPath, DisplayPath: failedPath, FingerprintKey: failedPath},
+				},
+				outcomes: map[string]parser.ParseOutcome{
+					healthyPath: outcome("healthy", healthyPath),
+					failedPath:  outcome("failed", failedPath),
+				},
+				fingerprintCalls: make(map[string]int),
+				parseCalls:       make(map[string]int),
+			}
+			if tc.configure != nil {
+				tc.configure(provider, failedPath)
+			}
+			if tc.failWrite {
+				raw, err := sql.Open("sqlite3", database.Path())
+				require.NoError(t, err)
+				t.Cleanup(func() { require.NoError(t, raw.Close()) })
+				_, err = raw.Exec(`
+					CREATE TRIGGER fail_selected_db_backed_write
+					BEFORE INSERT ON sessions
+					WHEN NEW.id = 'failed'
+					BEGIN
+						SELECT RAISE(FAIL, 'injected db-backed write failure');
+					END;
+				`)
+				require.NoError(t, err)
+			}
+			engine := NewEngine(database, EngineConfig{
+				AgentDirs: map[parser.AgentType][]string{agent: {root}},
+				Machine:   "local",
+				ProviderFactories: []parser.ProviderFactory{
+					baselineDBBackedFactory{provider: provider},
+				},
+				ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+					agent: parser.ProviderMigrationProviderAuthoritative,
+				},
+			})
+			t.Cleanup(engine.Close)
+			writeMode := syncWriteDefault
+			if tc.failWrite {
+				writeMode = syncWriteBulk
+			}
+
+			for pass := 1; pass <= 2; pass++ {
+				stats := SyncStats{}
+				aborted := engine.syncProviderDBBackedAgent(
+					t.Context(), agent, string(agent), writeMode, false,
+					newRootSyncScope([]string{root}), &stats, func(int, int) {},
+				)
+
+				assert.False(t, aborted)
+				assert.Equal(t, 1, stats.Failed, "pass %d must report the failed source", pass)
+				assert.Equal(t, tc.wantProviderFailures, stats.providerFailures,
+					"pass %d provider failure count", pass)
+				ownership, err := database.ListActiveSessionSourceOwnershipPage(
+					t.Context(), "local", string(agent), root, db.SessionSourceCursor{},
+				)
+				require.NoError(t, err)
+				require.Len(t, ownership, 1,
+					"pass %d must leave only the healthy source baselined", pass)
+				assert.Equal(t, healthyPath, ownership[0].FilePath)
+				if tc.wantStaleWrite {
+					_, mtime, found := database.GetFileInfoByPath(failedPath)
+					require.True(t, found)
+					assert.Equal(t, int64(2), mtime,
+						"the valid result from the unclean source must be persisted")
+					assert.Less(t, database.GetDataVersionByPath(failedPath),
+						db.CurrentDataVersion(),
+						"the persisted partial result must remain retryable")
+				}
+			}
+			assert.Equal(t, 2, provider.fingerprintCalls[failedPath])
+			assert.Equal(t, tc.wantFailedParseCalls, provider.parseCalls[failedPath],
+				"the failed source must not become fresh after an unclean pass")
+			assert.Equal(t, 1, provider.parseCalls[healthyPath],
+				"the clean source should use the fresh shortcut on the second pass")
+		})
+	}
 }
 
 func TestSyncProviderDBBackedAgentFlushesEachSourceBeforeParsingNext(t *testing.T) {
