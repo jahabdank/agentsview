@@ -3109,9 +3109,10 @@ func (e *Engine) reconciliationCandidate(
 			}
 		}
 	}
-	if agent == parser.AgentOpenClaw || agent == parser.AgentQClaw {
-		preference2 = boolPreference(strings.HasSuffix(filepath.Base(path), ".jsonl"))
-		preference3 = source.DiscoveryMTimeNS
+	if ranker, ok := provider.(parser.ReconciliationSourceRanker); ok {
+		rank := ranker.ReconciliationSourceRank(source)
+		preference2 = rank.Class
+		preference3 = rank.Recency
 	}
 	if agent == parser.AgentAntigravityCLI {
 		preference2 = boolPreference(strings.HasSuffix(path, ".db"))

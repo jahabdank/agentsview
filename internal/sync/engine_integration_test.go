@@ -1694,6 +1694,57 @@ func TestReconcileWatchRootsPreservesSameIDReplacementAtNewPath(t *testing.T) {
 	assertSessionMessageCount(t, env.db, "moved-session", 2)
 }
 
+func TestReconcileWatchRootsClaudeDiscoversSymlinkedProjectAndSubagent(t *testing.T) {
+	root := t.TempDir()
+	targetRoot := t.TempDir()
+	projectDir := "-Users-dev-code-demo"
+	sourceProject := filepath.Join(root, projectDir)
+	targetProject := filepath.Join(targetRoot, projectDir)
+	mainPath := filepath.Join(sourceProject, "session-main.jsonl")
+	subagentPath := filepath.Join(
+		sourceProject, "session-main", "subagents", "jobs", "job-1",
+		"agent-linked.jsonl",
+	)
+	mainContent := testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarly, "main through symlink").String()
+	subagentContent := testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarly, "subagent through symlink").String()
+	require.NoError(t, os.MkdirAll(filepath.Dir(
+		filepath.Join(targetProject, "session-main.jsonl")), 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(targetProject, "session-main.jsonl"),
+		[]byte(mainContent), 0o644,
+	))
+	require.NoError(t, os.MkdirAll(filepath.Dir(filepath.Join(
+		targetProject, "session-main", "subagents", "jobs", "job-1",
+		"agent-linked.jsonl",
+	)), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(
+		targetProject, "session-main", "subagents", "jobs", "job-1",
+		"agent-linked.jsonl",
+	), []byte(subagentContent), 0o644))
+	if err := os.Symlink(targetProject, sourceProject); err != nil {
+		t.Skipf("symlink not supported: %v", err)
+	}
+
+	database := dbtest.OpenTestDB(t)
+	engine := sync.NewEngine(database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentClaude: {root}},
+		Machine:   "local",
+	})
+	t.Cleanup(engine.Close)
+
+	require.NoError(t, engine.ReconcileWatchRoots(t.Context(), []string{root}, false))
+	mainSession, err := database.GetSession(t.Context(), "session-main")
+	require.NoError(t, err)
+	require.NotNil(t, mainSession)
+	subagentSession, err := database.GetSession(t.Context(), "agent-linked")
+	require.NoError(t, err)
+	require.NotNil(t, subagentSession)
+	assert.Equal(t, mainPath, database.GetSessionFilePath("session-main"))
+	assert.Equal(t, subagentPath, database.GetSessionFilePath("agent-linked"))
+}
+
 func TestReconcileWatchRootsPreservesPersistentClaudeDuplicatePreference(t *testing.T) {
 	liveDir := t.TempDir()
 	archiveDir := t.TempDir()
@@ -1798,6 +1849,41 @@ func TestReconcileWatchRootsPreservesCodexLiveDuplicatePreference(t *testing.T) 
 	))
 
 	assert.Equal(t, livePath, env.db.GetSessionFilePath("codex:"+uuid))
+}
+
+func TestReconcileWatchRootsOpenClawUsesCanonicalArchiveOrdering(t *testing.T) {
+	root := t.TempDir()
+	sessionsDir := filepath.Join(root, "main", "sessions")
+	require.NoError(t, os.MkdirAll(sessionsDir, 0o755))
+	content := strings.Join([]string{
+		`{"type":"session","version":3,"id":"archive-order","timestamp":"2026-02-25T10:00:00Z","cwd":"/workspace/project"}`,
+		`{"type":"message","id":"m1","timestamp":"2026-02-25T10:00:01Z","message":{"role":"user","content":[{"type":"text","text":"canonical archive"}],"timestamp":"2026-02-25T10:00:01Z"}}`,
+	}, "\n") + "\n"
+	filenameOlder := filepath.Join(
+		sessionsDir,
+		"archive-order.jsonl.deleted.2026-01-01T00-00-00.000Z",
+	)
+	filenameNewer := filepath.Join(
+		sessionsDir,
+		"archive-order.jsonl.deleted.2026-03-01T00-00-00.000Z",
+	)
+	require.NoError(t, os.WriteFile(filenameOlder, []byte(content), 0o644))
+	require.NoError(t, os.WriteFile(filenameNewer, []byte(content), 0o644))
+	mtimeOlder := time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)
+	mtimeNewer := time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
+	require.NoError(t, os.Chtimes(filenameOlder, mtimeOlder, mtimeOlder))
+	require.NoError(t, os.Chtimes(filenameNewer, mtimeNewer, mtimeNewer))
+
+	database := dbtest.OpenTestDB(t)
+	engine := sync.NewEngine(database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentOpenClaw: {root}},
+		Machine:   "local",
+	})
+	t.Cleanup(engine.Close)
+
+	require.NoError(t, engine.ReconcileWatchRoots(t.Context(), []string{root}, false))
+	assert.Equal(t, filenameNewer,
+		database.GetSessionFilePath("openclaw:main:archive-order"))
 }
 
 func TestReconcileWatchRootsOpenCodeHybridPrefersCanonicalStorageSource(t *testing.T) {

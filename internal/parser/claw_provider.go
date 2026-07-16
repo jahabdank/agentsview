@@ -88,6 +88,12 @@ func (p *openClawProvider) Fingerprint(
 	return p.sources.Fingerprint(ctx, source)
 }
 
+func (p *openClawProvider) ReconciliationSourceRank(
+	source SourceRef,
+) ReconciliationSourceRank {
+	return p.sources.reconciliationSourceRank(source)
+}
+
 func (p *openClawProvider) Parse(
 	ctx context.Context,
 	req ParseRequest,
@@ -169,6 +175,12 @@ func (p *qClawProvider) Fingerprint(
 	source SourceRef,
 ) (SourceFingerprint, error) {
 	return p.sources.Fingerprint(ctx, source)
+}
+
+func (p *qClawProvider) ReconciliationSourceRank(
+	source SourceRef,
+) ReconciliationSourceRank {
+	return p.sources.reconciliationSourceRank(source)
 }
 
 func (p *qClawProvider) Parse(
@@ -595,38 +607,47 @@ func (s clawSourceSet) sourcePathForRawID(root, rawID string) string {
 }
 
 func (s clawSourceSet) bestEntry(a, b os.DirEntry) os.DirEntry {
-	aActive := strings.HasSuffix(a.Name(), ".jsonl")
-	bActive := strings.HasSuffix(b.Name(), ".jsonl")
-	if aActive && !bActive {
-		return a
-	}
-	if bActive && !aActive {
-		return b
-	}
-	aTime := clawArchiveTime(a)
-	bTime := clawArchiveTime(b)
-	if !aTime.IsZero() && !bTime.IsZero() {
-		if bTime.After(aTime) {
-			return b
-		}
-		return a
-	}
-	if !aTime.IsZero() {
-		return a
-	}
-	if !bTime.IsZero() {
-		return b
-	}
-	ai, errA := a.Info()
-	bi, errB := b.Info()
-	if errA == nil && errB == nil && bi.ModTime().After(ai.ModTime()) {
+	aRank := clawDirEntryReconciliationRank(a)
+	bRank := clawDirEntryReconciliationRank(b)
+	if bRank.Class > aRank.Class ||
+		(bRank.Class == aRank.Class && bRank.Recency > aRank.Recency) {
 		return b
 	}
 	return a
 }
 
-func clawArchiveTime(e os.DirEntry) time.Time {
-	name := e.Name()
+func (s clawSourceSet) reconciliationSourceRank(
+	source SourceRef,
+) ReconciliationSourceRank {
+	path, ok := s.pathFromSource(source)
+	if !ok {
+		return ReconciliationSourceRank{}
+	}
+	return clawReconciliationSourceRank(
+		filepath.Base(path), source.DiscoveryMTimeNS,
+	)
+}
+
+func clawDirEntryReconciliationRank(entry os.DirEntry) ReconciliationSourceRank {
+	mtime := int64(0)
+	if info, err := entry.Info(); err == nil {
+		mtime = info.ModTime().UnixNano()
+	}
+	return clawReconciliationSourceRank(entry.Name(), mtime)
+}
+
+func clawReconciliationSourceRank(name string, mtime int64) ReconciliationSourceRank {
+	if strings.HasSuffix(name, ".jsonl") {
+		return ReconciliationSourceRank{Class: 2, Recency: mtime}
+	}
+	archiveTime := clawArchiveNameTime(name)
+	if !archiveTime.IsZero() {
+		return ReconciliationSourceRank{Class: 1, Recency: archiveTime.UnixNano()}
+	}
+	return ReconciliationSourceRank{Recency: mtime}
+}
+
+func clawArchiveNameTime(name string) time.Time {
 	idx := strings.Index(name, ".jsonl.")
 	if idx <= 0 {
 		return time.Time{}

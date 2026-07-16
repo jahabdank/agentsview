@@ -104,6 +104,19 @@ type ReconciliationSourceResolver interface {
 	) (SourceRef, bool, error)
 }
 
+// ReconciliationSourceRank is compared lexicographically after configured-root
+// priority when authoritative discovery finds duplicate logical sources.
+type ReconciliationSourceRank struct {
+	Class   int64
+	Recency int64
+}
+
+// ReconciliationSourceRanker declares provider-specific duplicate ordering so
+// authoritative reconciliation selects the same source as FindSource.
+type ReconciliationSourceRanker interface {
+	ReconciliationSourceRank(SourceRef) ReconciliationSourceRank
+}
+
 // ReconciliationMemberIdentityResolver derives the stable logical-member
 // identity stored in a full session ID. Providers whose virtual paths can be
 // reused declare this alongside SourceRef.ReconciliationIdentity so the engine

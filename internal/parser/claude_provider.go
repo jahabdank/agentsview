@@ -2,6 +2,7 @@ package parser
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -254,10 +255,26 @@ func (s claudeSourceSet) DiscoverEach(
 			}
 			continue
 		}
-		err := streamDirectoryTree(ctx, root, func(path string, entry os.DirEntry) error {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
+		err := s.streamLocalRoot(ctx, root, yield)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s claudeSourceSet) streamLocalRoot(
+	ctx context.Context, root string, yield func(SourceRef) error,
+) error {
+	var incomplete error
+	err := streamDirectoryEntries(ctx, root, func(project os.DirEntry) error {
+		if !isDirOrSymlink(project, root) {
+			return nil
+		}
+		projectRoot := filepath.Join(root, project.Name())
+		err := streamDirectoryTreeRecursive(ctx, projectRoot, func(
+			path string, entry os.DirEntry,
+		) error {
 			if !strings.HasSuffix(entry.Name(), ".jsonl") {
 				return nil
 			}
@@ -267,11 +284,22 @@ func (s claudeSourceSet) DiscoverEach(
 			}
 			return yield(source)
 		})
-		if err != nil {
+		if err == nil {
+			return nil
+		}
+		if _, ok := discoveryYieldCause(err); ok {
 			return err
 		}
+		if ctx.Err() != nil {
+			return err
+		}
+		incomplete = errors.Join(incomplete, err)
+		return nil
+	})
+	if cause, ok := discoveryYieldCause(err); ok {
+		return cause
 	}
-	return nil
+	return errors.Join(incomplete, err)
 }
 
 // discoveredSourceRef builds the SourceRef for one enumerated Claude session
