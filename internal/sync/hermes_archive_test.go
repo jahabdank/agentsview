@@ -133,14 +133,39 @@ func TestProcessFileHermesArchiveSkipCacheUsesAggregateMtime(t *testing.T) {
 
 	_, wantMtime := hermesArchiveAggregateFileInfo(t, stateDB)
 
-	engine := NewEngine(dbtest.OpenTestDB(t), EngineConfig{
+	database := dbtest.OpenTestDB(t)
+	engine := NewEngine(database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentHermes: {filepath.Join(root, "sessions")},
 		},
 		Machine: "local",
 	})
+	provider, ok := parser.NewProvider(parser.AgentHermes, parser.ProviderConfig{
+		Roots: []string{filepath.Join(root, "sessions")},
+	})
+	require.True(t, ok)
+	sources, err := provider.Discover(context.Background())
+	require.NoError(t, err)
+	require.Len(t, sources, 1)
+	fingerprint, err := provider.Fingerprint(context.Background(), sources[0])
+	require.NoError(t, err)
+	initial := engine.processFile(context.Background(), parser.DiscoveredFile{
+		Path: stateDB, Agent: parser.AgentHermes,
+	})
+	require.NoError(t, initial.err)
+	require.NotEmpty(t, initial.results)
+	pending := make([]pendingWrite, 0, len(initial.results))
+	for _, result := range initial.results {
+		pending = append(pending, pendingWrite{
+			sess: result.Session, msgs: result.Messages,
+		})
+	}
+	_, _, failed, _ := engine.writeBatch(pending, syncWriteDefault, true)
+	require.Zero(t, failed)
 	engine.InjectSkipCache(map[string]int64{
-		stateDB: wantMtime,
+		providerProcessCacheKeyWithHash(
+			stateDB, parser.AgentHermes, fingerprint,
+		): wantMtime,
 	})
 
 	res := engine.processFile(context.Background(), parser.DiscoveredFile{
@@ -246,6 +271,80 @@ func TestSyncPathsHermesArchiveTranscriptPersistsAggregateFingerprint(t *testing
 	require.True(t, found)
 	assert.Equal(t, wantSize, storedSize)
 	assert.Equal(t, wantMtime, storedMtime)
+}
+
+func TestReconcileHermesStateMemberDetectsSameStatTranscriptRewrite(t *testing.T) {
+	root := t.TempDir()
+	stateDB := writeHermesArchiveStateDB(t, root)
+	sessionsDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.MkdirAll(sessionsDir, 0o755))
+	transcriptPath := filepath.Join(sessionsDir, "session_child.json")
+	writeTranscript := func(message string) {
+		require.NoError(t, os.WriteFile(transcriptPath, []byte(`{
+			"platform":"cli",
+			"session_start":"2026-05-14T10:00:00Z",
+			"last_updated":"2026-05-14T10:02:00Z",
+			"messages":[
+				{"role":"user","content":"`+message+`","timestamp":"2026-05-14T10:01:00Z"},
+				{"role":"assistant","content":"Done.","timestamp":"2026-05-14T10:02:00Z"}
+			]
+		}`), 0o644))
+	}
+	writeTranscript("original prompt")
+
+	database := dbtest.OpenTestDB(t)
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentHermes: {sessionsDir},
+		},
+		Machine: "local",
+	})
+	assertMessages := func(want ...string) {
+		messages, err := database.GetMessages(
+			context.Background(), "hermes:child", 0, len(want), true,
+		)
+		require.NoError(t, err)
+		require.Len(t, messages, len(want))
+		for i := range want {
+			assert.Equal(t, want[i], messages[i].Content)
+		}
+	}
+	require.NoError(t, engine.ReconcileWatchRoots(context.Background(), nil, true))
+	assertMessages("original prompt", "Done.")
+
+	provider, ok := parser.NewProvider(parser.AgentHermes, parser.ProviderConfig{
+		Roots: []string{sessionsDir},
+	})
+	require.True(t, ok)
+	source, found, err := provider.FindSource(context.Background(), parser.FindSourceRequest{
+		RawSessionID: "child",
+	})
+	require.NoError(t, err)
+	require.True(t, found)
+	fingerprint, err := provider.Fingerprint(context.Background(), source)
+	require.NoError(t, err)
+	memberPath := parser.VirtualSourcePath(stateDB, "child")
+	storedSize, storedMtime, found := database.GetFileInfoByPath(memberPath)
+	require.True(t, found)
+	assert.Equal(t, fingerprint.Size, storedSize)
+	assert.Equal(t, fingerprint.MTimeNS, storedMtime)
+	storedHash, found := database.GetFileHashByPath(memberPath)
+	require.True(t, found)
+	assert.Equal(t, fingerprint.Hash, storedHash)
+
+	transcriptInfo, err := os.Stat(transcriptPath)
+	require.NoError(t, err)
+	writeTranscript("modified prompt")
+	require.NoError(t, os.Chtimes(
+		transcriptPath, transcriptInfo.ModTime(), transcriptInfo.ModTime(),
+	))
+	rewrittenInfo, err := os.Stat(transcriptPath)
+	require.NoError(t, err)
+	require.Equal(t, transcriptInfo.Size(), rewrittenInfo.Size())
+	require.Equal(t, transcriptInfo.ModTime(), rewrittenInfo.ModTime())
+
+	require.NoError(t, engine.ReconcileWatchRoots(context.Background(), nil, true))
+	assertMessages("modified prompt", "Done.")
 }
 
 func writeHermesArchiveStateDB(t *testing.T, root string) string {

@@ -823,8 +823,10 @@ func hermesStateMemberFingerprint(
 	if !IsRegularFile(src.StateDB) {
 		return SourceFingerprint{Key: source.FingerprintKey}, nil
 	}
-	var h = sha256.New()
-	if err := writeHermesStateSessionJSONL(h, src.StateDB, src.SessionID); err != nil {
+	ss, messages, selectedPath, err := readHermesStateSessionSource(
+		src.StateDB, src.SessionID,
+	)
+	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return SourceFingerprint{Key: source.FingerprintKey}, nil
 		}
@@ -834,11 +836,64 @@ func hermesStateMemberFingerprint(
 	if err != nil {
 		return SourceFingerprint{}, err
 	}
-	return SourceFingerprint{
+	fingerprint := SourceFingerprint{
 		Key:  firstNonEmptyJSONLString(source.FingerprintKey, source.Key, src.Path),
 		Size: info.Size(), MTimeNS: info.ModTime().UnixNano(),
-		Hash: fmt.Sprintf("%x", h.Sum(nil)),
-	}, nil
+	}
+	h := sha256.New()
+	if err := addHermesStateSessionFingerprint(h, ss, messages); err != nil {
+		return SourceFingerprint{}, err
+	}
+	if selectedPath != src.StateDB {
+		selectedInfo, err := os.Stat(selectedPath)
+		if err != nil {
+			return SourceFingerprint{}, fmt.Errorf("stat %s: %w", selectedPath, err)
+		}
+		fingerprint.Size += selectedInfo.Size()
+		fingerprint.MTimeNS = max(
+			fingerprint.MTimeNS, selectedInfo.ModTime().UnixNano(),
+		)
+		if err := addHermesFingerprintPart(
+			h, "selected-transcript", selectedPath, selectedInfo,
+		); err != nil {
+			return SourceFingerprint{}, err
+		}
+	}
+	fingerprint.Hash = fmt.Sprintf("%x", h.Sum(nil))
+	return fingerprint, nil
+}
+
+func addHermesStateSessionFingerprint(
+	h hash.Hash, ss hermesStateSession, messages []hermesStateMessage,
+) error {
+	if _, err := fmt.Fprintf(
+		h,
+		"state-member\x00%q\x00%q\x00%q\x00%q\x00%d\x00%d\x00%d\x00%d\x00%d\x00%d\x00%d\x00%d\x00%d\x00%t\x00%g\x00%t\x00%g\x00%q\x00%q\x00%q\x00%d\x00",
+		ss.id,
+		ss.source,
+		ss.model,
+		ss.parentSessionID,
+		ss.startedAt.UnixNano(),
+		ss.endedAt.UnixNano(),
+		ss.messageCount,
+		ss.inputTokens,
+		ss.outputTokens,
+		ss.cacheReadTokens,
+		ss.cacheWriteTokens,
+		ss.reasoningTokens,
+		ss.apiCallCount,
+		ss.estimatedCost.Valid,
+		ss.estimatedCost.Float64,
+		ss.actualCost.Valid,
+		ss.actualCost.Float64,
+		ss.costStatus,
+		ss.costSource,
+		ss.title,
+		len(messages),
+	); err != nil {
+		return err
+	}
+	return encodeHermesStateSessionJSONL(h, ss, messages)
 }
 
 // hermesArchiveEffectiveFileInfo returns the aggregate size and mtime of a

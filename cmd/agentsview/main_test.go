@@ -1488,6 +1488,35 @@ func TestWatchPollingObligationsMissingRootLifecycleCardinality(t *testing.T) {
 	}
 }
 
+func TestOpenCodeFormatMissingRootsUseNativeLifecycleWithoutPolling(t *testing.T) {
+	for _, rootCount := range []int{1, 128} {
+		t.Run(fmt.Sprintf("roots=%d", rootCount), func(t *testing.T) {
+			base := t.TempDir()
+			dirs := make([]string, 0, rootCount)
+			for i := range rootCount {
+				dirs = append(dirs, filepath.Join(base, fmt.Sprintf("mimocode-%03d", i)))
+			}
+			cfg := config.Config{AgentDirs: map[parser.AgentType][]string{
+				parser.AgentMiMoCode: dirs,
+			}}
+
+			roots, unwatched := collectWatchRoots(cfg)
+			require.Len(t, roots, rootCount)
+			results := make([]agentsync.RecursiveWatchResult, rootCount)
+			for i := range results {
+				results[i] = agentsync.RecursiveWatchResult{
+					Watched:                   1,
+					MissingRootLifecycleOwned: true,
+				}
+			}
+			unwatched = accountRegisteredWatchRoots(unwatched, roots, results)
+
+			assert.Empty(t, watchPollingObligations(roots, results, unwatched),
+				"absent OpenCode-format providers must not add archive-scale polling")
+		})
+	}
+}
+
 func TestWatchPollingObligationsKeepPendingAndPersistentReasonsIndependent(t *testing.T) {
 	shared := filepath.Join(t.TempDir(), "shared")
 	pendingPath := filepath.Join(shared, "pending")
@@ -1827,8 +1856,9 @@ type watchSyncRecorder struct {
 }
 
 type watchReconcileCall struct {
-	roots []string
-	full  bool
+	roots      []string
+	full       bool
+	lostEvents bool
 }
 
 type watchRetryBatchError interface {
@@ -1875,6 +1905,19 @@ func (r *watchSyncRecorder) ReconcileWatchRoots(
 	r.reconcileCalls = append(r.reconcileCalls, watchReconcileCall{
 		roots: append([]string(nil), roots...),
 		full:  full,
+	})
+	r.callOrder = append(r.callOrder, "reconcile")
+	r.ctxValue = ctx.Value(watchSyncContextKey{})
+	return r.reconcileErr
+}
+
+func (r *watchSyncRecorder) ReconcileWatchRootsAfterLostEvents(
+	ctx context.Context, roots []string, full bool,
+) error {
+	r.reconcileCalls = append(r.reconcileCalls, watchReconcileCall{
+		roots:      append([]string(nil), roots...),
+		full:       full,
+		lostEvents: true,
 	})
 	r.callOrder = append(r.callOrder, "reconcile")
 	r.ctxValue = ctx.Value(watchSyncContextKey{})
@@ -2041,11 +2084,13 @@ func TestSyncWatchBatch(t *testing.T) {
 
 	t.Run("root-count overflow reconciles all roots directly", func(t *testing.T) {
 		recorder := &watchSyncRecorder{}
-		err := syncWatchBatch(ctx, recorder, agentsync.WatchBatch{FullSync: true})
+		err := syncWatchBatch(ctx, recorder, agentsync.WatchBatch{
+			FullSync: true, LostEvents: true,
+		})
 
 		require.NoError(t, err)
 		assert.Empty(t, recorder.pathCalls)
-		assert.Equal(t, []watchReconcileCall{{full: true}}, recorder.reconcileCalls)
+		assert.Equal(t, []watchReconcileCall{{full: true, lostEvents: true}}, recorder.reconcileCalls)
 		assert.Equal(t, "serve", recorder.ctxValue)
 	})
 
@@ -2066,12 +2111,30 @@ func TestSyncWatchBatch(t *testing.T) {
 		reconcileErr := scopedReconciliationError{roots: []string{failedRoot}}
 		recorder := &watchSyncRecorder{reconcileErr: reconcileErr}
 
-		err := syncWatchBatch(ctx, recorder, agentsync.WatchBatch{FullSync: true})
+		err := syncWatchBatch(ctx, recorder, agentsync.WatchBatch{
+			FullSync: true, LostEvents: true,
+		})
 
 		assert.ErrorContains(t, err, reconcileErr.Error())
 		assert.Equal(t, agentsync.WatchBatch{
 			ReconcileRoots: []string{failedRoot},
+			LostEvents:     true,
 		}, requireWatchRetryBatch(t, err))
+	})
+
+	t.Run("scoped lost-event retry keeps forced recovery", func(t *testing.T) {
+		root := "/sessions/unavailable-provider"
+		recorder := &watchSyncRecorder{}
+
+		err := syncWatchBatch(ctx, recorder, agentsync.WatchBatch{
+			ReconcileRoots: []string{root},
+			LostEvents:     true,
+		})
+
+		require.NoError(t, err)
+		assert.Equal(t, []watchReconcileCall{{
+			roots: []string{root}, lostEvents: true,
+		}}, recorder.reconcileCalls)
 	})
 
 	t.Run("changed path failure retains the exact bounded batch", func(t *testing.T) {

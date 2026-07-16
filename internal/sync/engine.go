@@ -2636,6 +2636,12 @@ func (e *Engine) HasActiveSessionSourceBelow(agent, path string) (bool, error) {
 func (e *Engine) ReconcileWatchRoots(
 	ctx context.Context, roots []string, full bool,
 ) error {
+	return e.reconcileWatchRoots(ctx, roots, full, false)
+}
+
+func (e *Engine) reconcileWatchRoots(
+	ctx context.Context, roots []string, full, force bool,
+) error {
 	logicalRoots, excludedRemoteRoots := e.localReconciliationRoots(roots, full)
 	if !full && len(roots) > 0 && len(logicalRoots) == 0 && excludedRemoteRoots > 0 {
 		e.setLastReconciliationResult(ReconciliationResult{
@@ -2645,7 +2651,7 @@ func (e *Engine) ReconcileWatchRoots(
 		return nil
 	}
 	stats, metrics, tombstoned, err := e.reconcileWatchRootsStreamed(
-		ctx, logicalRoots, full,
+		ctx, logicalRoots, full, force,
 	)
 	metrics.ExcludedRemoteRoots = excludedRemoteRoots
 	if stats.Synced > 0 || tombstoned > 0 {
@@ -2665,6 +2671,15 @@ func (e *Engine) ReconcileWatchRoots(
 	return err
 }
 
+// ReconcileWatchRootsAfterLostEvents is the watcher-overflow entrypoint. It is
+// separate from ordinary full-scope reconciliation so directory renames do not
+// force unchanged sources through their parse paths.
+func (e *Engine) ReconcileWatchRootsAfterLostEvents(
+	ctx context.Context, roots []string, full bool,
+) error {
+	return e.reconcileWatchRoots(ctx, roots, full, true)
+}
+
 // ReconciliationRootsForAgent returns every configured root for one provider.
 // Directory rename events use the complete provider scope because FSEvents may
 // report only one endpoint of a move between that provider's roots.
@@ -2673,13 +2688,16 @@ func (e *Engine) ReconciliationRootsForAgent(agent string) []string {
 }
 
 func (e *Engine) reconcileWatchRootsStreamed(
-	ctx context.Context, roots []string, full bool,
+	ctx context.Context, roots []string, full, force bool,
 ) (stats SyncStats, metrics ReconciliationMetrics, tombstoned int, retErr error) {
 	if err := ctx.Err(); err != nil {
 		return SyncStats{Aborted: true}, metrics, 0, err
 	}
 	e.syncMu.Lock()
 	defer e.syncMu.Unlock()
+	if force {
+		e.clearWatcherOverflowCaches()
+	}
 	e.phaseStats.Reset()
 	e.anomalies.reset()
 	defer func() { e.anomalies.applyTo(&stats) }()
@@ -2777,7 +2795,7 @@ func (e *Engine) reconcileWatchRootsStreamed(
 				Path:  candidate.Path,
 			})
 		}
-		files, err := e.rehydrateReconciliationPage(ctx, page, providers, false)
+		files, err := e.rehydrateReconciliationPage(ctx, page, providers, force)
 		if err != nil {
 			stats.Aborted = ctx.Err() != nil
 			stats.providerFailures++
@@ -6463,7 +6481,8 @@ func providerProcessCacheKeyWithHash(
 
 func providerFingerprintHashInCacheKey(agent parser.AgentType) bool {
 	switch agent {
-	case parser.AgentClaude, parser.AgentCodex, parser.AgentDevin, parser.AgentQoder, parser.AgentWindsurf:
+	case parser.AgentClaude, parser.AgentCodex, parser.AgentDevin, parser.AgentHermes,
+		parser.AgentQoder, parser.AgentWindsurf:
 		return true
 	default:
 		return false
@@ -6475,7 +6494,8 @@ func providerFingerprintHashInCacheKey(agent parser.AgentType) bool {
 // older hash siblings so hot append-only files retain only one content version.
 func providerFingerprintHashRequiredForFreshness(agent parser.AgentType) bool {
 	switch agent {
-	case parser.AgentClaude, parser.AgentCodex, parser.AgentDevin, parser.AgentQoder, parser.AgentWindsurf:
+	case parser.AgentClaude, parser.AgentCodex, parser.AgentDevin, parser.AgentHermes,
+		parser.AgentQoder, parser.AgentWindsurf:
 		return true
 	default:
 		return false
@@ -10838,7 +10858,7 @@ func applyProviderFingerprintFileInfo(
 	fingerprint parser.SourceFingerprint,
 	results []parser.ParseResultOutcome,
 ) {
-	if agent != parser.AgentDevin {
+	if agent != parser.AgentDevin && agent != parser.AgentHermes {
 		return
 	}
 	for i := range results {

@@ -2,9 +2,11 @@ package parser
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -131,11 +133,16 @@ func TestHermesProviderStateDBSourceMethods(t *testing.T) {
 
 	stateInfo, err := os.Stat(stateDB)
 	require.NoError(t, err)
+	transcriptInfo, err := os.Stat(transcriptPath)
+	require.NoError(t, err)
 	fingerprint, err := provider.Fingerprint(context.Background(), found)
 	require.NoError(t, err)
 	assert.Equal(t, memberPath, fingerprint.Key)
-	assert.Equal(t, stateInfo.Size(), fingerprint.Size)
-	assert.Equal(t, stateInfo.ModTime().UnixNano(), fingerprint.MTimeNS)
+	assert.Equal(t, stateInfo.Size()+transcriptInfo.Size(), fingerprint.Size)
+	assert.Equal(t,
+		max(stateInfo.ModTime().UnixNano(), transcriptInfo.ModTime().UnixNano()),
+		fingerprint.MTimeNS,
+	)
 	assert.NotEmpty(t, fingerprint.Hash)
 
 	for _, tc := range []struct {
@@ -181,6 +188,69 @@ func TestHermesProviderStateDBSourceMethods(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, changed, 1)
 	assert.Equal(t, stateDB, changed[0].DisplayPath)
+}
+
+func TestHermesStateMemberFingerprintIncludesSelectedTranscriptMetadata(t *testing.T) {
+	root := t.TempDir()
+	sessionsDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.MkdirAll(sessionsDir, 0o755))
+	createHermesStateDB(t, root)
+	transcriptPath := filepath.Join(sessionsDir, "session_child.json")
+	writeSourceFile(t, transcriptPath, hermesProviderJSONFixture("transcript question"))
+	transcriptTime := time.Now().Add(2 * time.Second).Truncate(time.Second)
+	require.NoError(t, os.Chtimes(transcriptPath, transcriptTime, transcriptTime))
+	stateDB := filepath.Join(root, "state.db")
+
+	provider, ok := NewProvider(AgentHermes, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	source, found, err := provider.FindSource(context.Background(), FindSourceRequest{
+		RawSessionID: "child",
+	})
+	require.NoError(t, err)
+	require.True(t, found)
+
+	fingerprint, err := provider.Fingerprint(context.Background(), source)
+	require.NoError(t, err)
+	stateInfo, err := os.Stat(stateDB)
+	require.NoError(t, err)
+	transcriptInfo, err := os.Stat(transcriptPath)
+	require.NoError(t, err)
+	assert.Equal(t, stateInfo.Size()+transcriptInfo.Size(), fingerprint.Size)
+	assert.Equal(t, transcriptInfo.ModTime().UnixNano(), fingerprint.MTimeNS)
+}
+
+func TestHermesStateMemberFingerprintIncludesStateMetadataWhenTranscriptWins(t *testing.T) {
+	root := t.TempDir()
+	sessionsDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.MkdirAll(sessionsDir, 0o755))
+	createHermesStateDB(t, root)
+	transcriptPath := filepath.Join(sessionsDir, "session_child.json")
+	writeSourceFile(t, transcriptPath, hermesProviderJSONFixture("transcript question"))
+	stateDB := filepath.Join(root, "state.db")
+
+	provider, ok := NewProvider(AgentHermes, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	source, found, err := provider.FindSource(context.Background(), FindSourceRequest{
+		RawSessionID: "child",
+	})
+	require.NoError(t, err)
+	require.True(t, found)
+	before, err := provider.Fingerprint(context.Background(), source)
+	require.NoError(t, err)
+	stateInfo, err := os.Stat(stateDB)
+	require.NoError(t, err)
+
+	conn, err := sql.Open("sqlite3", stateDB)
+	require.NoError(t, err)
+	_, err = conn.Exec("UPDATE sessions SET title = ? WHERE id = ?", "Other Session", "child")
+	require.NoError(t, err)
+	require.NoError(t, conn.Close())
+	require.NoError(t, os.Chtimes(stateDB, stateInfo.ModTime(), stateInfo.ModTime()))
+	after, err := provider.Fingerprint(context.Background(), source)
+	require.NoError(t, err)
+
+	assert.NotEqual(t, before.Hash, after.Hash,
+		"state metadata used by parsing must participate even when transcript messages win")
 }
 
 func TestHermesProviderArchiveWatchRoots(t *testing.T) {

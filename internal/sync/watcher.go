@@ -20,8 +20,8 @@ type RecursiveWatchResult struct {
 	Unwatched int
 	Err       error
 	// MissingRootLifecycleOwned reports that the backend has durable native
-	// coverage for a root that did not exist at registration time. Callers do
-	// not need a periodic polling obligation while this ownership is active.
+	// coverage for a root reported missing in the startup plan. Callers do not
+	// need a periodic polling obligation while this ownership is active.
 	MissingRootLifecycleOwned bool
 	BudgetExhausted           bool
 	ResourceExhausted         bool
@@ -54,11 +54,14 @@ type WatchRename struct {
 // WatchBatch describes one serialized watcher callback. FullSync is an
 // explicit overflow signal: retained strings are empty and the consumer must
 // rescan all configured sources so coalescing never silently drops a change.
+// LostEvents distinguishes overflow recovery from an ordinary authoritative
+// reconciliation so freshness shortcuts can be invalidated only when needed.
 type WatchBatch struct {
 	Paths           []string
 	Renames         []WatchRename
 	ReconcileRoots  []string
 	FullSync        bool
+	LostEvents      bool
 	lifecycleTokens []backendLifecycleToken
 }
 
@@ -103,6 +106,7 @@ type pendingWatchBatch struct {
 	maxEntries     int
 	maxPathBytes   int
 	fullSync       bool
+	lostEvents     bool
 	onOverflow     func()
 }
 
@@ -253,7 +257,7 @@ func (p *pendingWatchBatch) AddLifecycle(token backendLifecycleToken) {
 }
 
 func (p *pendingWatchBatch) AddFullSync() {
-	p.makeFullSync()
+	p.makeFullSync(true)
 }
 
 // retainFullSync adds a retry marker without discarding newer fine-grained
@@ -270,7 +274,7 @@ func (p *pendingWatchBatch) merge(other *pendingWatchBatch) {
 		return
 	}
 	if other.fullSync {
-		p.AddFullSync()
+		p.makeFullSync(other.lostEvents)
 	}
 	for path := range other.paths {
 		p.Add(path)
@@ -338,10 +342,10 @@ func (p *pendingWatchBatch) overflow() {
 	if !p.fullSync && p.onOverflow != nil {
 		p.onOverflow()
 	}
-	p.makeFullSync()
+	p.makeFullSync(true)
 }
 
-func (p *pendingWatchBatch) makeFullSync() {
+func (p *pendingWatchBatch) makeFullSync(lostEvents bool) {
 	clear(p.paths)
 	clear(p.renames)
 	clear(p.backendRenames)
@@ -349,6 +353,7 @@ func (p *pendingWatchBatch) makeFullSync() {
 	clear(p.strings)
 	p.pathBytes = 0
 	p.fullSync = true
+	p.lostEvents = p.lostEvents || lostEvents
 }
 
 func (p *pendingWatchBatch) Take() (WatchBatch, bool) {
@@ -363,8 +368,12 @@ func (p *pendingWatchBatch) TakeWithRootAgents(
 	}
 	if p.fullSync {
 		p.fullSync = false
+		lostEvents := p.lostEvents
+		p.lostEvents = false
 		tokens := p.takeLifecycleTokens()
-		return WatchBatch{FullSync: true, lifecycleTokens: tokens}, true
+		return WatchBatch{
+			FullSync: true, LostEvents: lostEvents, lifecycleTokens: tokens,
+		}, true
 	}
 	for rename := range p.backendRenames {
 		agents := []string{""}
@@ -383,8 +392,12 @@ func (p *pendingWatchBatch) TakeWithRootAgents(
 			})
 			if p.fullSync {
 				p.fullSync = false
+				lostEvents := p.lostEvents
+				p.lostEvents = false
 				tokens := p.takeLifecycleTokens()
-				return WatchBatch{FullSync: true, lifecycleTokens: tokens}, true
+				return WatchBatch{
+					FullSync: true, LostEvents: lostEvents, lifecycleTokens: tokens,
+				}, true
 			}
 		}
 	}
@@ -422,9 +435,11 @@ func (p *pendingWatchBatch) TakeWithRootAgents(
 	clear(p.strings)
 	tokens := p.takeLifecycleTokens()
 	p.pathBytes = 0
+	lostEvents := p.lostEvents
+	p.lostEvents = false
 	return WatchBatch{
 		Paths: paths, Renames: renames, ReconcileRoots: roots,
-		lifecycleTokens: tokens,
+		LostEvents: lostEvents, lifecycleTokens: tokens,
 	}, true
 }
 
@@ -1057,6 +1072,7 @@ func (w *Watcher) loop() {
 					case result.batch.FullSync:
 						w.eventSink.RetainRetry(WatchBatch{
 							FullSync:        true,
+							LostEvents:      result.batch.LostEvents,
 							lifecycleTokens: result.batch.lifecycleTokens,
 						})
 						retryRetained = true
@@ -1071,6 +1087,7 @@ func (w *Watcher) loop() {
 					case len(result.batch.ReconcileRoots) > 0:
 						w.eventSink.RetainRetry(WatchBatch{
 							ReconcileRoots:  result.batch.ReconcileRoots,
+							LostEvents:      result.batch.LostEvents,
 							lifecycleTokens: result.batch.lifecycleTokens,
 						})
 						retryRetained = true
@@ -1166,7 +1183,7 @@ func callbackRetryBatch(err error) (WatchBatch, bool) {
 	}
 	retry := retryErr.WatchRetryBatch()
 	if retry.FullSync {
-		return WatchBatch{FullSync: true}, true
+		return WatchBatch{FullSync: true, LostEvents: retry.LostEvents}, true
 	}
 	if len(retry.Paths) == 0 && len(retry.ReconcileRoots) == 0 {
 		return WatchBatch{}, false
@@ -1174,6 +1191,7 @@ func callbackRetryBatch(err error) (WatchBatch, bool) {
 	return WatchBatch{
 		Paths:          append([]string(nil), retry.Paths...),
 		ReconcileRoots: append([]string(nil), retry.ReconcileRoots...),
+		LostEvents:     retry.LostEvents,
 	}, true
 }
 
@@ -1188,6 +1206,7 @@ func retainWatchRetry(pending *pendingWatchBatch, retry WatchBatch) {
 			pending.AddReconcileRoot(root)
 		}
 	}
+	pending.lostEvents = pending.lostEvents || retry.LostEvents
 	for _, token := range retry.lifecycleTokens {
 		pending.AddLifecycle(token)
 	}

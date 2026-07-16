@@ -136,7 +136,7 @@ func TestDarwinWatcherNativeSinkCollapsesBlockedConsumerOverflow(t *testing.T) {
 	}, first)
 	close(releaseConsumer)
 	second := requireReceiveWithin(t, batches, time.Second)
-	assert.Equal(t, WatchBatch{FullSync: true}, second)
+	assert.Equal(t, WatchBatch{FullSync: true, LostEvents: true}, second)
 	assert.Never(t, func() bool { return len(batches) != 0 }, 100*time.Millisecond, 10*time.Millisecond)
 }
 
@@ -708,6 +708,38 @@ func TestDarwinWatcherHybridRegistrationUsesShallowAndPendingCoverage(t *testing
 	}, trace, "an explicit shallow root never creates a stream and pending roots share one ancestor watch")
 }
 
+func TestDarwinWatcherRegistrationOwnsRootCreatedAfterCollection(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "sessions")
+	plan := WatchRoot{
+		Path: root, Recursive: true, Exists: false,
+		Scopes: []WatchScope{{Agent: "agent-a", SyncDir: parent}},
+	}
+	var trace []string
+	backend, watcher := newDarwinLifecycleTestWatcher(t, &trace)
+	backend.pathIsDirectory = func(path string) bool {
+		require.Equal(t, root, path)
+		require.NoError(t, os.Mkdir(root, 0o700))
+		return false
+	}
+
+	results := watcher.RegisterRoots([]WatchRoot{plan}, 10)
+
+	require.Equal(t, []RecursiveWatchResult{{
+		Watched: 1, MissingRootLifecycleOwned: true,
+	}}, results)
+	assert.Equal(t, []string{"shallow-add:" + root}, trace,
+		"the registration race initially acquires bounded root coverage")
+
+	backend.processLifecycle(true)
+
+	assert.Equal(t, []string{
+		"shallow-add:" + root,
+		"stream-new:" + root,
+		"shallow-remove:" + root,
+	}, trace, "the pending root advances into native recursive coverage")
+}
+
 func TestDarwinWatcherPendingRootRetriesWithoutNativeKqueueDelivery(t *testing.T) {
 	ancestor := t.TempDir()
 	root := filepath.Join(ancestor, "state", "sessions")
@@ -736,7 +768,7 @@ func TestDarwinWatcherPendingRootRetriesWithoutNativeKqueueDelivery(t *testing.T
 
 	watcher, batches := newDarwinTestWatcherWithBackend(t, backend)
 	results := watcher.RegisterRoots([]WatchRoot{{
-		Path: root, Recursive: true,
+		Path: root, Recursive: true, Exists: true,
 		Scopes: []WatchScope{{Agent: "agent-a", SyncDir: ancestor}},
 	}}, 10)
 	require.Equal(t, []RecursiveWatchResult{{
@@ -1007,6 +1039,7 @@ func TestDarwinWatcherRootShallowRenameAndRecreation(t *testing.T) {
 	watcher, batches := newDarwinTestWatcherWithBackend(t, backend)
 	results := watcher.RegisterRoots([]WatchRoot{{
 		Path:   root,
+		Exists: true,
 		Scopes: []WatchScope{{Agent: "agent-a", SyncDir: ancestor}},
 	}}, 10)
 	require.Equal(t, RecursiveWatchResult{Watched: 1}, results[0])
@@ -1045,7 +1078,7 @@ func TestDarwinWatcherNativeCallbackDoesNotWaitForLifecycleLock(t *testing.T) {
 	}
 	watcher, _ := newDarwinTestWatcherWithBackend(t, backend)
 	results := watcher.RegisterRoots([]WatchRoot{{
-		Path: root, Recursive: true,
+		Path: root, Recursive: true, Exists: true,
 		Scopes: []WatchScope{{Agent: "agent-a", SyncDir: filepath.Dir(root)}},
 	}}, 10)
 	require.Equal(t, RecursiveWatchResult{Watched: 1}, results[0])
@@ -1088,7 +1121,7 @@ func TestDarwinWatcherHybridTransitionDoesNotSuppressOtherShallowRootEvent(t *te
 	var trace []string
 	backend, watcher := newDarwinLifecycleTestWatcher(t, &trace)
 	results := watcher.RegisterRoots([]WatchRoot{
-		{Path: shallow, Scopes: []WatchScope{{Agent: "agent-a", SyncDir: shallow}}},
+		{Path: shallow, Exists: true, Scopes: []WatchScope{{Agent: "agent-a", SyncDir: shallow}}},
 		{Path: pending, Recursive: true, Scopes: []WatchScope{{Agent: "agent-b", SyncDir: shallow}}},
 	}, 10)
 	require.Equal(t, []RecursiveWatchResult{
@@ -1123,7 +1156,7 @@ func TestDarwinWatcherRootChangedRetiresRecursiveStreamAcrossABA(t *testing.T) {
 	}
 	watcher, _ := newDarwinTestWatcherWithBackend(t, backend)
 	results := watcher.RegisterRoots([]WatchRoot{{
-		Path: root, Recursive: true,
+		Path: root, Recursive: true, Exists: true,
 		Scopes: []WatchScope{{Agent: "agent-a", SyncDir: filepath.Dir(root)}},
 	}}, 10)
 	require.Equal(t, RecursiveWatchResult{Watched: 1}, results[0])
@@ -1170,7 +1203,7 @@ func TestDarwinWatcherCollectingGateWaitsForSuccessfulReconciliation(t *testing.
 	require.NoError(t, err)
 	t.Cleanup(watcher.Stop)
 	results := watcher.RegisterRoots([]WatchRoot{{
-		Path: root, Recursive: true,
+		Path: root, Recursive: true, Exists: true,
 		Scopes: []WatchScope{{Agent: "agent-a", SyncDir: ancestor}},
 	}}, 10)
 	require.Equal(t, RecursiveWatchResult{
@@ -1209,7 +1242,7 @@ func TestDarwinWatcherRootChangedABAReplacesRecursiveCoverageAfterTombstone(t *t
 	}
 	watcher, batches := newDarwinTestWatcherWithBackend(t, backend)
 	results := watcher.RegisterRoots([]WatchRoot{{
-		Path: root, Recursive: true,
+		Path: root, Recursive: true, Exists: true,
 		Scopes: []WatchScope{{Agent: "agent-a", SyncDir: ancestor}},
 	}}, 10)
 	require.Equal(t, RecursiveWatchResult{Watched: 1}, results[0])
@@ -1250,6 +1283,7 @@ func TestDarwinWatcherShallowRenameABAReplacesCoverage(t *testing.T) {
 	}
 	results := watcher.RegisterRoots([]WatchRoot{{
 		Path:   root,
+		Exists: true,
 		Scopes: []WatchScope{{Agent: "agent-a", SyncDir: ancestor}},
 	}}, 10)
 	require.Equal(t, RecursiveWatchResult{Watched: 1}, results[0])

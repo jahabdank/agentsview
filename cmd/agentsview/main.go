@@ -1308,6 +1308,7 @@ type watchSyncer interface {
 	HasActiveSessionSourceBelow(agent, path string) (bool, error)
 	ReconciliationRootsForAgent(agent string) []string
 	ReconcileWatchRoots(context.Context, []string, bool) error
+	ReconcileWatchRootsAfterLostEvents(context.Context, []string, bool) error
 }
 
 type watchReconciliationError struct {
@@ -1316,18 +1317,22 @@ type watchReconciliationError struct {
 }
 
 func newWatchReconciliationError(
-	cause error, roots []string, full bool,
+	cause error, roots []string, full, lostEvents bool,
 ) error {
 	var scoped interface{ ReconciliationRetryRoots() []string }
 	if errors.As(cause, &scoped) {
 		if failedRoots := deduplicateStrings(scoped.ReconciliationRetryRoots()); len(failedRoots) > 0 {
 			return &watchReconciliationError{
 				cause: cause,
-				retry: sync.WatchBatch{ReconcileRoots: failedRoots},
+				retry: sync.WatchBatch{
+					ReconcileRoots: failedRoots,
+					LostEvents:     lostEvents,
+				},
 			}
 		}
 	}
 	retry := sync.WatchBatch{FullSync: full}
+	retry.LostEvents = lostEvents
 	if !full {
 		retry.ReconcileRoots = append([]string(nil), roots...)
 	}
@@ -1349,6 +1354,7 @@ func syncWatchBatch(ctx context.Context, engine watchSyncer, batch sync.WatchBat
 	paths := append([]string(nil), batch.Paths...)
 	full := batch.FullSync
 	reconcileRoots := append([]string(nil), batch.ReconcileRoots...)
+	lostEvents := batch.LostEvents
 	type renameOwner struct {
 		path  string
 		agent string
@@ -1410,7 +1416,7 @@ func syncWatchBatch(ctx context.Context, engine watchSyncer, batch sync.WatchBat
 	}
 	if len(paths) > 0 {
 		if err := engine.SyncPathsContext(ctx, paths); err != nil {
-			retry := sync.WatchBatch{FullSync: full}
+			retry := sync.WatchBatch{FullSync: full, LostEvents: lostEvents}
 			if !full {
 				retry.Paths = append([]string(nil), paths...)
 				retry.ReconcileRoots = deduplicateStrings(reconcileRoots)
@@ -1422,15 +1428,27 @@ func syncWatchBatch(ctx context.Context, engine watchSyncer, batch sync.WatchBat
 		}
 	}
 	if full {
-		if err := engine.ReconcileWatchRoots(ctx, nil, true); err != nil {
-			return newWatchReconciliationError(err, nil, true)
+		var err error
+		if lostEvents {
+			err = engine.ReconcileWatchRootsAfterLostEvents(ctx, nil, true)
+		} else {
+			err = engine.ReconcileWatchRoots(ctx, nil, true)
+		}
+		if err != nil {
+			return newWatchReconciliationError(err, nil, true, lostEvents)
 		}
 		return nil
 	}
 	roots := deduplicateStrings(reconcileRoots)
 	if len(roots) > 0 {
-		if err := engine.ReconcileWatchRoots(ctx, roots, false); err != nil {
-			return newWatchReconciliationError(err, roots, false)
+		var err error
+		if lostEvents {
+			err = engine.ReconcileWatchRootsAfterLostEvents(ctx, roots, false)
+		} else {
+			err = engine.ReconcileWatchRoots(ctx, roots, false)
+		}
+		if err != nil {
+			return newWatchReconciliationError(err, roots, false, lostEvents)
 		}
 	}
 	return nil

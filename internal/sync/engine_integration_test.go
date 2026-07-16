@@ -1258,9 +1258,11 @@ func TestWatcherOverflowReverifiesSameStatOpenCodeStorage(t *testing.T) {
 	require.Equal(t, partInfo.Size(), rewrittenInfo.Size())
 	require.Equal(t, partInfo.ModTime(), rewrittenInfo.ModTime())
 
-	stats = env.engine.SyncAllAfterWatcherOverflow(context.Background(), nil)
-	require.False(t, stats.Aborted)
-	assert.Equal(t, 1, stats.Synced,
+	err = env.engine.ReconcileWatchRootsAfterLostEvents(context.Background(), nil, true)
+	require.NoError(t, err)
+	result := env.engine.LastReconciliationResult()
+	assert.True(t, result.Complete)
+	assert.Equal(t, 1, result.Metrics.MaxRehydratedSources,
 		"overflow recovery must reparse event-sensitive storage sessions")
 	assertMessageContent(t, env.db, sessionID, "modified prompt")
 }

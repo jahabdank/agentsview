@@ -505,7 +505,7 @@ func TestPendingWatchBatchBoundsAllRetainedMetadata(t *testing.T) {
 
 	batch, ok := pending.Take()
 	require.True(t, ok)
-	assert.Equal(t, WatchBatch{FullSync: true}, batch,
+	assert.Equal(t, WatchBatch{FullSync: true, LostEvents: true}, batch,
 		"overflow must discard every retained string")
 }
 
@@ -527,7 +527,7 @@ func TestPendingWatchBatchBoundsMixedMetadataBytesIndependently(t *testing.T) {
 
 	batch, ok := pending.Take()
 	require.True(t, ok)
-	assert.Equal(t, WatchBatch{FullSync: true}, batch,
+	assert.Equal(t, WatchBatch{FullSync: true, LostEvents: true}, batch,
 		"byte overflow must discard every retained string")
 }
 
@@ -563,7 +563,7 @@ func TestPendingWatchBatchMetadataByteOverflowClearsStrings(t *testing.T) {
 
 	batch, ok := pending.Take()
 	require.True(t, ok)
-	assert.Equal(t, WatchBatch{FullSync: true}, batch)
+	assert.Equal(t, WatchBatch{FullSync: true, LostEvents: true}, batch)
 }
 
 func TestPendingWatchBatchRootCountOverflowEmitsOnlyFullSync(t *testing.T) {
@@ -574,7 +574,7 @@ func TestPendingWatchBatchRootCountOverflowEmitsOnlyFullSync(t *testing.T) {
 
 	batch, ok := pending.Take()
 	require.True(t, ok)
-	assert.Equal(t, WatchBatch{FullSync: true}, batch)
+	assert.Equal(t, WatchBatch{FullSync: true, LostEvents: true}, batch)
 }
 
 func TestWatchEventSinkCountsOnlyCapacityOverflowAsOverflow(t *testing.T) {
@@ -1149,6 +1149,24 @@ func TestRetriedFullSyncPreservesChangesArrivingDuringCallback(t *testing.T) {
 	assert.Equal(t, []string{"/sessions/new.jsonl"}, changed.Paths)
 }
 
+func TestRetriedLostEventReconciliationPreservesRecoveryMode(t *testing.T) {
+	pending := newPendingWatchBatch(8, 1_000)
+
+	retainWatchRetry(pending, WatchBatch{
+		ReconcileRoots: []string{"/sessions"},
+		LostEvents:     true,
+	})
+	batch, ok := pending.Take()
+
+	require.True(t, ok)
+	assert.Equal(t, WatchBatch{
+		Paths:          []string{},
+		Renames:        []WatchRename{},
+		ReconcileRoots: []string{"/sessions"},
+		LostEvents:     true,
+	}, batch)
+}
+
 func TestWatcherRetryDelayUsesBoundedExponentialBackoff(t *testing.T) {
 	assert.Equal(t, 5*time.Second, watcherRetryDelay(5*time.Second, 1))
 	assert.Equal(t, 10*time.Second, watcherRetryDelay(5*time.Second, 2))
@@ -1321,6 +1339,39 @@ func (e retryScopedWatchError) Error() string { return "authoritative reconcilia
 
 func (e retryScopedWatchError) WatchRetryBatch() WatchBatch { return e.retry }
 
+func TestWatcherPreservesLostEventsWhenFullRetryNarrowsToRoots(t *testing.T) {
+	backend := newFakeWatchBackend()
+	calls := make(chan WatchBatch, 2)
+	var attempts atomic.Int32
+	w, err := newWatcherWithBackend(
+		0, 10*time.Millisecond,
+		func(_ context.Context, batch WatchBatch) error {
+			calls <- batch
+			if attempts.Add(1) == 1 {
+				return retryScopedWatchError{retry: WatchBatch{
+					ReconcileRoots: []string{"/sessions"},
+					LostEvents:     true,
+				}}
+			}
+			return nil
+		},
+		backend, 8, 1_000,
+	)
+	require.NoError(t, err)
+	w.Start()
+	t.Cleanup(w.Stop)
+
+	backend.sendBackendEvent(t, backendEvent{Op: backendOpFullSync})
+	first := receiveWatchBatch(t, calls)
+	second := receiveWatchBatch(t, calls)
+
+	assert.Equal(t, WatchBatch{FullSync: true, LostEvents: true}, first)
+	assert.Empty(t, second.Paths)
+	assert.Empty(t, second.Renames)
+	assert.Equal(t, []string{"/sessions"}, second.ReconcileRoots)
+	assert.True(t, second.LostEvents)
+}
+
 func TestWatcherUsesCallbackReconciliationScopeForRetry(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -1418,7 +1469,7 @@ func TestRetainWatchRetryPathOverflowPromotesFullSync(t *testing.T) {
 	batch, ok := pending.Take()
 
 	require.True(t, ok)
-	assert.Equal(t, WatchBatch{FullSync: true}, batch,
+	assert.Equal(t, WatchBatch{FullSync: true, LostEvents: true}, batch,
 		"retry paths use the normal bounded accumulator")
 }
 

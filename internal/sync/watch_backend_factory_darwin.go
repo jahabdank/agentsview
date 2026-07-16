@@ -159,6 +159,7 @@ type darwinWatchBackend struct {
 	roots     atomic.Pointer[darwinRootSnapshot]
 
 	newStream              func(string, func([]fsevents.Event)) (darwinStream, error)
+	pathIsDirectory        func(string) bool
 	lstat                  func(string) (os.FileInfo, error)
 	stat                   func(string) (os.FileInfo, error)
 	addShallow             func(string) error
@@ -250,6 +251,7 @@ func newDarwinWatchBackend(
 	}
 	backend.lstat = os.Lstat
 	backend.stat = os.Stat
+	backend.pathIsDirectory = pathIsDirectory
 	backend.addShallow = backend.kqueue.AddShallow
 	backend.removeShallow = backend.kqueue.Remove
 	backend.startKqueue = backend.kqueue.Start
@@ -297,6 +299,10 @@ func (b *darwinWatchBackend) RegisterRoots(
 	results := make([]RecursiveWatchResult, len(roots))
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	isDirectory := b.pathIsDirectory
+	if isDirectory == nil {
+		isDirectory = pathIsDirectory
+	}
 	streamCreationFailed := false
 	for i, plan := range roots {
 		plan.Path = filepath.Clean(plan.Path)
@@ -313,7 +319,7 @@ func (b *darwinWatchBackend) RegisterRoots(
 		}
 		state := &darwinLogicalRoot{plan: plan, backend: b}
 		b.logical[plan.Path] = state
-		if pathIsDirectory(plan.Path) {
+		if isDirectory(plan.Path) {
 			if streamCreationFailed && plan.Recursive {
 				continue
 			}
@@ -327,7 +333,10 @@ func (b *darwinWatchBackend) RegisterRoots(
 				results[i] = RecursiveWatchResult{Unwatched: 1, Err: err}
 				continue
 			}
-			results[i].Watched = 1
+			results[i] = RecursiveWatchResult{
+				Watched:                   1,
+				MissingRootLifecycleOwned: !plan.Exists,
+			}
 			continue
 		}
 		ancestor := nearestExistingAncestor(plan.Path)
@@ -911,7 +920,8 @@ func (b *darwinWatchBackend) processLifecycle(checkPending bool) {
 			continue
 		}
 		ancestor := nearestExistingAncestor(state.plan.Path)
-		if ancestor == "" || ancestor == state.ancestor {
+		if ancestor == "" ||
+			(ancestor == state.ancestor && ancestor != state.plan.Path) {
 			b.schedulePendingRetryLocked(state, now)
 			continue
 		}

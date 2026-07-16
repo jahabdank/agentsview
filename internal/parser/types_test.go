@@ -976,8 +976,20 @@ func TestResolveOpenCodeWatchRootsSQLite(t *testing.T) {
 
 func TestResolveOpenCodeWatchRootsMissingRoot(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "missing")
-	got := ResolveOpenCodeWatchRoots(root)
-	assert.Nil(t, got, "ResolveOpenCodeWatchRoots()")
+	for _, tc := range []struct {
+		name    string
+		resolve func(string) []string
+	}{
+		{name: "opencode", resolve: ResolveOpenCodeWatchRoots},
+		{name: "kilo", resolve: ResolveKiloWatchRoots},
+		{name: "mimocode", resolve: ResolveMiMoCodeWatchRoots},
+		{name: "icodemate", resolve: ResolveIcodemateWatchRoots},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, []string{root}, tc.resolve(root),
+				"missing roots need a deterministic lifecycle watch plan")
+		})
+	}
 }
 
 func TestParseOpenCodeSQLiteVirtualPath(t *testing.T) {
