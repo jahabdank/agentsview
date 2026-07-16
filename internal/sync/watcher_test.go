@@ -1372,6 +1372,53 @@ func TestWatcherPreservesLostEventsWhenFullRetryNarrowsToRoots(t *testing.T) {
 	assert.True(t, second.LostEvents)
 }
 
+func TestWatcherPreservesLostEventsWhenAmbiguousRenameRetryPromotesToFullSync(t *testing.T) {
+	backend := newFakeWatchBackend()
+	calls := make(chan WatchBatch, 3)
+	releaseFirst := make(chan struct{})
+	var attempts atomic.Int32
+	w, err := newWatcherWithBackend(
+		0, 100*time.Millisecond,
+		func(_ context.Context, batch WatchBatch) error {
+			calls <- batch
+			switch attempts.Add(1) {
+			case 1:
+				<-releaseFirst
+				return retryScopedWatchError{retry: WatchBatch{
+					ReconcileRoots: []string{"/sessions"},
+					LostEvents:     true,
+				}}
+			case 2:
+				return errors.New("rename classification failed")
+			default:
+				return nil
+			}
+		},
+		backend, 8, 1_000,
+	)
+	require.NoError(t, err)
+	w.SetRootAgents("/sessions", []string{"codex"})
+	w.Start()
+	t.Cleanup(w.Stop)
+
+	backend.sendBackendEvent(t, backendEvent{Op: backendOpFullSync})
+	first := receiveWatchBatch(t, calls)
+	backend.sendBackendEvent(t, backendEvent{
+		Path: "/sessions/renamed", Root: "/sessions",
+		Op: backendOpRename, ItemType: backendItemUnknown,
+	})
+	close(releaseFirst)
+	second := receiveWatchBatch(t, calls)
+	third := receiveWatchBatch(t, calls)
+
+	assert.Equal(t, WatchBatch{FullSync: true, LostEvents: true}, first)
+	require.Len(t, second.Renames, 1)
+	assert.Equal(t, ItemIsUnknown, second.Renames[0].ItemType)
+	assert.Equal(t, []string{"/sessions"}, second.ReconcileRoots)
+	assert.True(t, second.LostEvents)
+	assert.Equal(t, WatchBatch{FullSync: true, LostEvents: true}, third)
+}
+
 func TestWatcherUsesCallbackReconciliationScopeForRetry(t *testing.T) {
 	for _, tc := range []struct {
 		name  string

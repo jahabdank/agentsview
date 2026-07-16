@@ -1081,6 +1081,7 @@ func (w *Watcher) loop() {
 						// rename must conservatively retain full reconciliation.
 						w.eventSink.RetainRetry(WatchBatch{
 							FullSync:        true,
+							LostEvents:      result.batch.LostEvents,
 							lifecycleTokens: result.batch.lifecycleTokens,
 						})
 						retryRetained = true
