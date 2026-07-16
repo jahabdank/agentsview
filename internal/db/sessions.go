@@ -28,6 +28,12 @@ var ErrSessionExcluded = errors.New("session excluded")
 // should surface a conflict instead of silently overwriting it.
 var ErrSessionTrashed = errors.New("session trashed")
 
+// deletionCauseSourceMissing marks a watcher-created tombstone. Unlike user
+// trash (the established NULL cause), it is cleared when the exact source is
+// parsed again. Mirror pushes preserve the cause so read backends can keep
+// recoverable source loss distinct from explicit user deletion.
+const deletionCauseSourceMissing = "source_missing"
+
 // sessionBaseCols is the column list for standard session queries
 // (list, get). Keep in sync with scanSessionRow.
 const sessionBaseCols = `id, project, machine, agent,
@@ -120,7 +126,7 @@ const sessionFullCols = `id, project, machine, agent,
 	transcript_fidelity,
 	parser_malformed_lines, is_truncated,
 	last_write_incremental,
-	deleted_at, termination_status, file_path, file_size, file_mtime,
+	deleted_at, deletion_cause, termination_status, file_path, file_size, file_mtime,
 	next_ordinal, last_entry_uuid,
 	file_inode, file_device,
 	file_hash, local_modified_at, transcript_revision, created_at`
@@ -331,6 +337,7 @@ type Session struct {
 	IsTruncated                 bool            `json:"is_truncated,omitempty"`
 
 	DeletedAt         *string `json:"deleted_at,omitempty"`
+	DeletionCause     *string `json:"-"`
 	TerminationStatus *string `json:"termination_status,omitempty"`
 	FilePath          *string `json:"file_path,omitempty"`
 	FileSize          *int64  `json:"file_size,omitempty"`
@@ -1107,7 +1114,8 @@ func (db *DB) GetSessionFull(
 		&s.TranscriptFidelity,
 		&s.ParserMalformedLines, &s.IsTruncated,
 		&s.LastWriteIncremental,
-		&s.DeletedAt, &s.TerminationStatus, &s.FilePath, &s.FileSize,
+		&s.DeletedAt, &s.DeletionCause,
+		&s.TerminationStatus, &s.FilePath, &s.FileSize,
 		&s.FileMtime, &s.NextOrdinal, &s.LastEntryUUID,
 		&s.FileInode, &s.FileDevice,
 		&s.FileHash, &s.LocalModifiedAt,
@@ -1165,7 +1173,8 @@ func (db *DB) IsSessionExcluded(id string) bool {
 func (db *DB) IsSessionTrashed(id string) bool {
 	var n int
 	_ = db.getReader().QueryRow(
-		"SELECT 1 FROM sessions WHERE id = ? AND deleted_at IS NOT NULL", id,
+		"SELECT 1 FROM sessions WHERE id = ?"+
+			" AND deleted_at IS NOT NULL AND deletion_cause IS NULL", id,
 	).Scan(&n)
 	return n == 1
 }
@@ -1176,7 +1185,8 @@ func (db *DB) HasTrashedSessionByFilePath(path, agent string) bool {
 	var n int
 	_ = db.getReader().QueryRow(
 		"SELECT 1 FROM sessions"+
-			" WHERE file_path = ? AND agent = ? AND deleted_at IS NOT NULL"+
+			" WHERE file_path = ? AND agent = ?"+
+			" AND deleted_at IS NOT NULL AND deletion_cause IS NULL"+
 			" LIMIT 1",
 		path, agent,
 	).Scan(&n)
@@ -1339,7 +1349,15 @@ const upsertSessionSQL = insertSessionSQL + `
 			last_entry_uuid = excluded.last_entry_uuid,
 			file_inode = excluded.file_inode,
 			file_device = excluded.file_device,
-			file_hash = excluded.file_hash`
+			file_hash = excluded.file_hash,
+			deleted_at = CASE
+				WHEN sessions.deletion_cause = 'source_missing' THEN NULL
+				ELSE sessions.deleted_at
+			END,
+			deletion_cause = CASE
+				WHEN sessions.deletion_cause = 'source_missing' THEN NULL
+				ELSE sessions.deletion_cause
+			END`
 
 func sessionIsAutomated(s Session) bool {
 	return s.IsAutomated ||
@@ -1392,11 +1410,15 @@ func (db *DB) UpsertSession(s Session) error {
 	if excluded == 1 {
 		return ErrSessionExcluded
 	}
-	var trashed int
-	_ = db.getWriter().QueryRow(
-		"SELECT 1 FROM sessions WHERE id = ? AND deleted_at IS NOT NULL", s.ID,
-	).Scan(&trashed)
-	if trashed == 1 {
+	var deletedAt, deletionCause sql.NullString
+	err := db.getWriter().QueryRow(
+		"SELECT deleted_at, deletion_cause FROM sessions WHERE id = ?", s.ID,
+	).Scan(&deletedAt, &deletionCause)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("checking trash for %s: %w", s.ID, err)
+	}
+	if deletedAt.Valid &&
+		(!deletionCause.Valid || deletionCause.String != deletionCauseSourceMissing) {
 		return ErrSessionTrashed
 	}
 
@@ -1407,7 +1429,7 @@ func (db *DB) UpsertSession(s Session) error {
 	// up-to-date and starve the rewrite on the next sync.
 	// New rows are seeded with 0 (the default) and bumped to
 	// the current version once their messages land.
-	_, err := db.getWriter().Exec(
+	_, err = db.getWriter().Exec(
 		upsertSessionSQL,
 		upsertSessionArgs(s)...,
 	)
@@ -1502,14 +1524,17 @@ func (db *DB) LinkSubagentSessions() error {
 	return nil
 }
 
-// GetSessionFileInfo returns file_size and file_mtime for a
-// session. Used for fast skip checks during sync.
+// GetSessionFileInfo returns file_size and file_mtime for a session. Used for
+// fast skip checks during sync. Recoverable source-missing tombstones are
+// excluded so an identical source restoration cannot be mistaken for fresh.
 func (db *DB) GetSessionFileInfo(
 	id string,
 ) (size int64, mtime int64, ok bool) {
 	var s, m sql.NullInt64
 	err := db.getReader().QueryRow(
-		"SELECT file_size, file_mtime FROM sessions WHERE id = ?",
+		"SELECT file_size, file_mtime FROM sessions WHERE id = ?"+
+			" AND (deletion_cause IS NULL"+
+			" OR deletion_cause <> 'source_missing')",
 		id,
 	).Scan(&s, &m)
 	if err != nil {
@@ -1518,12 +1543,14 @@ func (db *DB) GetSessionFileInfo(
 	return s.Int64, m.Int64, true
 }
 
-// GetSessionFileHash returns file_hash for a session. The bool is false when
-// the session does not exist or the column is NULL.
+// GetSessionFileHash returns file_hash for a non-source-missing session. The
+// bool is false when no eligible session exists or the column is NULL.
 func (db *DB) GetSessionFileHash(id string) (hash string, ok bool) {
 	var h sql.NullString
 	err := db.getReader().QueryRow(
-		"SELECT file_hash FROM sessions WHERE id = ?",
+		"SELECT file_hash FROM sessions WHERE id = ?"+
+			" AND (deletion_cause IS NULL"+
+			" OR deletion_cause <> 'source_missing')",
 		id,
 	).Scan(&h)
 	if err != nil || !h.Valid {
@@ -2044,9 +2071,9 @@ func resetIncrementalMarkerTx(tx *sql.Tx, sessionID string) error {
 	return nil
 }
 
-// GetFileInfoByPath returns file_size and file_mtime for a
-// session identified by file_path. Used for codex/gemini files
-// where the session ID requires parsing.
+// GetFileInfoByPath returns file_size and file_mtime for a session identified
+// by file_path. Recoverable source-missing tombstones are excluded so a source
+// that returns with identical metadata cannot be skipped before revival.
 func (db *DB) GetFileInfoByPath(
 	path string,
 ) (size int64, mtime int64, ok bool) {
@@ -2054,6 +2081,8 @@ func (db *DB) GetFileInfoByPath(
 	err := db.getReader().QueryRow(
 		"SELECT file_size, file_mtime FROM sessions"+
 			" WHERE file_path = ?"+
+			" AND (deletion_cause IS NULL"+
+			" OR deletion_cause <> 'source_missing')"+
 			" ORDER BY file_mtime DESC LIMIT 1",
 		path,
 	).Scan(&s, &m)
@@ -2109,8 +2138,8 @@ func (db *DB) GetSourceRepairStateByPath(
 	return project, dataVersion, fileSize, fileMtime, true
 }
 
-// GetFileHashByPath returns the stored file_hash for the session
-// matching file_path, preferring the most recently modified row.
+// GetFileHashByPath returns the stored file_hash for a non-source-missing
+// session matching file_path, preferring the most recently modified row.
 // The bool is false when no row exists or the column is NULL. Used
 // by the Shelley skip to compare a per-conversation content
 // fingerprint alongside file_mtime.
@@ -2119,6 +2148,8 @@ func (db *DB) GetFileHashByPath(path string) (hash string, ok bool) {
 	err := db.getReader().QueryRow(
 		"SELECT file_hash FROM sessions"+
 			" WHERE file_path = ?"+
+			" AND (deletion_cause IS NULL"+
+			" OR deletion_cause <> 'source_missing')"+
 			" ORDER BY file_mtime DESC LIMIT 1",
 		path,
 	).Scan(&h)
@@ -2159,27 +2190,228 @@ func (db *DB) ListSessionIDsByFilePath(path, agent string) ([]string, error) {
 
 const storedSourcePathHintRootBatchSize = 100
 
+// StoredSourcePathHintScope identifies one affected stored-source prefix.
+// IncludeVirtualMembers is provider-declared ownership of path#member sources;
+// it must not be inferred from filename shape.
+type StoredSourcePathHintScope struct {
+	Path                  string
+	IncludeVirtualMembers bool
+}
+
+// WatchReconcileSourcePageSize bounds each watcher reconciliation ownership
+// page. The engine releases every page before requesting the next one, so its
+// live Go memory does not scale with the number of archived sessions.
+const WatchReconcileSourcePageSize = 128
+
+// SessionSourceCursor is the complete keyset cursor for source ownership
+// pages. Agent is retained to prevent accidentally reusing a cursor across
+// independently ordered agent scans.
+type SessionSourceCursor struct {
+	Agent    string
+	FilePath string
+	ID       string
+}
+
+// SessionSourceOwnership is the exact active row identity used by watcher
+// reconciliation. Conditional tombstoning must match every field.
+type SessionSourceOwnership struct {
+	Machine  string
+	Agent    string
+	ID       string
+	FilePath string
+}
+
+// SessionSourcePath identifies an exact source path observed during a
+// successful local reconciliation. The baseline is deliberately path-exact:
+// callers must pass virtual member paths without splitting their suffixes.
+type SessionSourcePath struct {
+	Agent    string
+	FilePath string
+}
+
+func (o SessionSourceOwnership) Cursor() SessionSourceCursor {
+	return SessionSourceCursor{Agent: o.Agent, FilePath: o.FilePath, ID: o.ID}
+}
+
+// ListActiveSessionSourceOwnershipPage returns one stable keyset page of
+// active source ownership below root for exactly one agent.
+func (db *DB) ListActiveSessionSourceOwnershipPage(
+	ctx context.Context,
+	machine string,
+	agent string,
+	root string,
+	after SessionSourceCursor,
+) ([]SessionSourceOwnership, error) {
+	root = cleanStoredSourcePathHint(root)
+	if machine == "" || agent == "" || root == "" || root == "." {
+		return nil, nil
+	}
+	if after.Agent != "" && after.Agent != agent {
+		return nil, fmt.Errorf(
+			"source ownership cursor agent %q does not match %q", after.Agent, agent,
+		)
+	}
+	likeRoot := sqliteLikeEscape(root)
+	rootClause := `(b.file_path = ? OR b.file_path LIKE ? ESCAPE '!')`
+	args := []any{
+		machine,
+		agent,
+		root,
+		likeRoot + string(filepath.Separator) + "%",
+	}
+	args = append(args,
+		after.FilePath, after.FilePath, after.ID,
+		WatchReconcileSourcePageSize,
+	)
+	rows, err := db.getReader().QueryContext(ctx, `
+		SELECT s.machine, s.agent, s.id, s.file_path
+		FROM local_session_source_baselines AS b
+		JOIN sessions AS s
+		  ON s.id = b.session_id
+		 AND s.machine = b.machine
+		 AND s.agent = b.agent
+		 AND s.file_path = b.file_path
+		WHERE b.machine = ?
+		  AND b.agent = ?
+		  AND s.deleted_at IS NULL
+		  AND `+rootClause+`
+		  AND (b.file_path > ? OR (b.file_path = ? AND b.session_id > ?))
+		ORDER BY b.file_path, b.session_id
+		LIMIT ?`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("listing active session source ownership: %w", err)
+	}
+	defer rows.Close()
+
+	ownership := make([]SessionSourceOwnership, 0, WatchReconcileSourcePageSize)
+	for rows.Next() {
+		var item SessionSourceOwnership
+		if err := rows.Scan(
+			&item.Machine, &item.Agent, &item.ID, &item.FilePath,
+		); err != nil {
+			return nil, fmt.Errorf("scanning active session source ownership: %w", err)
+		}
+		ownership = append(ownership, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating active session source ownership: %w", err)
+	}
+	return ownership, nil
+}
+
+// BaselineActiveSessionSourcePaths marks exact active local ownerships as
+// observed. Callers pass one bounded discovery page or changed-path batch at a
+// time so this update never scales its live memory with the archive.
+func (db *DB) BaselineActiveSessionSourcePaths(
+	ctx context.Context,
+	machine string,
+	sources []SessionSourcePath,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if machine == "" || len(sources) == 0 {
+		return nil
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	tx, err := db.getWriter().BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("starting source baseline transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO local_session_source_baselines
+			(session_id, machine, agent, file_path)
+		SELECT id, machine, agent, file_path
+		FROM sessions
+		WHERE machine = ? AND agent = ? AND file_path = ?
+		  AND file_path IS NOT NULL AND deleted_at IS NULL
+		ON CONFLICT(session_id) DO UPDATE SET
+			machine = excluded.machine,
+			agent = excluded.agent,
+			file_path = excluded.file_path
+		WHERE local_session_source_baselines.machine IS NOT excluded.machine
+		   OR local_session_source_baselines.agent IS NOT excluded.agent
+		   OR local_session_source_baselines.file_path IS NOT excluded.file_path`)
+	if err != nil {
+		return fmt.Errorf("preparing source baseline update: %w", err)
+	}
+	defer stmt.Close()
+	for _, source := range sources {
+		if source.Agent == "" || source.FilePath == "" {
+			continue
+		}
+		if _, err := stmt.ExecContext(
+			ctx, machine, source.Agent, source.FilePath,
+		); err != nil {
+			return fmt.Errorf("baselining active session source path: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing source baseline transaction: %w", err)
+	}
+	return nil
+}
+
+// SoftDeleteSessionSourceOwnership tombstones a session only while the row is
+// still owned by the exact agent and source observed by reconciliation.
+func (db *DB) SoftDeleteSessionSourceOwnership(
+	ctx context.Context,
+	machine string,
+	agent string,
+	id string,
+	filePath string,
+) (bool, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	result, err := db.getWriter().ExecContext(ctx, `
+		UPDATE sessions
+		SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+		    deletion_cause = ?,
+		    local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		WHERE machine = ? AND agent = ? AND id = ? AND file_path = ?
+		  AND deleted_at IS NULL
+		  AND EXISTS (
+			SELECT 1 FROM local_session_source_baselines AS b
+			WHERE b.session_id = sessions.id
+			  AND b.machine = sessions.machine
+			  AND b.agent = sessions.agent
+			  AND b.file_path = sessions.file_path
+		  )`,
+		deletionCauseSourceMissing, machine, agent, id, filePath,
+	)
+	if err != nil {
+		return false, fmt.Errorf("soft-deleting exact session source ownership: %w", err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("counting exact session source tombstone: %w", err)
+	}
+	return count > 0, nil
+}
+
 // ListStoredSourcePathHints returns active source paths for agent whose stored
-// file_path falls under any watched root. It is used by provider changed-path
-// comparison to avoid losing sessions when the changed path is a sidecar or a
-// root-scoped database event rather than the exact persisted source path.
+// file_path falls under any affected source prefix. It is used by provider
+// changed-path comparison to avoid losing sessions when the changed path is a
+// sidecar or database event rather than the exact persisted source path.
 func (db *DB) ListStoredSourcePathHints(
 	agent string,
-	roots []string,
+	scopes []StoredSourcePathHintScope,
 ) ([]string, error) {
 	if agent == "" {
 		return nil, nil
 	}
-	roots = normalizeStoredSourcePathHintRoots(roots)
-	if len(roots) == 0 {
+	scopes = normalizeStoredSourcePathHintScopes(scopes)
+	if len(scopes) == 0 {
 		return nil, nil
 	}
 
 	seen := make(map[string]struct{})
 	var hints []string
-	for start := 0; start < len(roots); start += storedSourcePathHintRootBatchSize {
-		end := min(start+storedSourcePathHintRootBatchSize, len(roots))
-		batch := roots[start:end]
+	for start := 0; start < len(scopes); start += storedSourcePathHintRootBatchSize {
+		end := min(start+storedSourcePathHintRootBatchSize, len(scopes))
+		batch := scopes[start:end]
 		query, args := storedSourcePathHintQuery(agent, batch)
 		rows, err := db.getReader().Query(query, args...)
 		if err != nil {
@@ -2212,53 +2444,61 @@ func (db *DB) ListStoredSourcePathHints(
 	return hints, nil
 }
 
-func normalizeStoredSourcePathHintRoots(roots []string) []string {
-	seen := make(map[string]struct{}, len(roots))
-	out := make([]string, 0, len(roots))
-	for _, root := range roots {
-		root = cleanStoredSourcePathHint(root)
-		if root == "" || root == "." {
+func normalizeStoredSourcePathHintScopes(
+	scopes []StoredSourcePathHintScope,
+) []StoredSourcePathHintScope {
+	byPath := make(map[string]bool, len(scopes))
+	for _, scope := range scopes {
+		path := cleanStoredSourcePathHint(scope.Path)
+		if path == "" || path == "." {
 			continue
 		}
-		if _, ok := seen[root]; ok {
-			continue
-		}
-		seen[root] = struct{}{}
-		out = append(out, root)
+		byPath[path] = byPath[path] || scope.IncludeVirtualMembers
 	}
-	sort.Strings(out)
+	out := make([]StoredSourcePathHintScope, 0, len(byPath))
+	for path, includeVirtualMembers := range byPath {
+		out = append(out, StoredSourcePathHintScope{
+			Path: path, IncludeVirtualMembers: includeVirtualMembers,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Path < out[j].Path
+	})
 	return out
 }
 
-func storedSourcePathHintQuery(agent string, roots []string) (string, []any) {
-	clauses := make([]string, 0, len(roots))
-	args := []any{agent}
-	for _, root := range roots {
-		root = cleanStoredSourcePathHint(root)
+func storedSourcePathHintQuery(
+	agent string,
+	scopes []StoredSourcePathHintScope,
+) (string, []any) {
+	selects := make([]string, 0, len(scopes)*3)
+	var args []any
+	appendSelect := func(predicate string, values ...any) {
+		selects = append(selects, `SELECT file_path
+			FROM sessions
+			WHERE agent = ?
+			  AND file_path IS NOT NULL
+			  AND deleted_at IS NULL
+			  AND `+predicate)
+		args = append(args, agent)
+		args = append(args, values...)
+	}
+	for _, scope := range scopes {
+		root := cleanStoredSourcePathHint(scope.Path)
 		if root == "" || root == "." {
 			continue
 		}
-		likeRoot := sqliteLikeEscape(root)
-		clauses = append(clauses,
-			`(file_path = ? OR
-			  file_path LIKE ? ESCAPE '!' OR
-			  file_path LIKE ? ESCAPE '!')`,
-		)
-		args = append(args,
-			root,
-			likeRoot+string(filepath.Separator)+"%",
-			likeRoot+"#%",
-		)
+		descendantPrefix, descendantEnd := activeSessionSourceBounds(root)
+		appendSelect(`file_path = ?`, root)
+		appendSelect(`file_path >= ? AND file_path < ?`, descendantPrefix, descendantEnd)
+		if scope.IncludeVirtualMembers {
+			appendSelect(`file_path >= ? AND file_path < ?`, root+"#", root+"$")
+		}
 	}
-	if len(clauses) == 0 {
+	if len(selects) == 0 {
 		return `SELECT file_path FROM sessions WHERE 0`, nil
 	}
-	query := `SELECT file_path
-		FROM sessions
-		WHERE agent = ?
-		  AND file_path IS NOT NULL
-		  AND deleted_at IS NULL
-		  AND (` + strings.Join(clauses, " OR ") + `)
+	query := `SELECT file_path FROM (` + strings.Join(selects, " UNION ALL ") + `)
 		ORDER BY file_path`
 	return query, args
 }
@@ -2267,30 +2507,29 @@ func cleanStoredSourcePathHint(path string) string {
 	return filepath.Clean(path)
 }
 
-func storedSourcePathHintInAnyRoot(path string, roots []string) bool {
-	for _, root := range roots {
-		if storedSourcePathHintInRoot(path, root) {
+func storedSourcePathHintInAnyRoot(
+	path string,
+	scopes []StoredSourcePathHintScope,
+) bool {
+	for _, scope := range scopes {
+		if storedSourcePathHintInRoot(path, scope) {
 			return true
 		}
 	}
 	return false
 }
 
-func storedSourcePathHintInRoot(path, root string) bool {
+func storedSourcePathHintInRoot(path string, scope StoredSourcePathHintScope) bool {
 	path = cleanStoredSourcePathHint(path)
-	root = cleanStoredSourcePathHint(root)
+	root := cleanStoredSourcePathHint(scope.Path)
 	if path == root || strings.HasPrefix(path, root+string(filepath.Separator)) {
 		return true
 	}
 	suffix, ok := strings.CutPrefix(path, root+"#")
 	return ok &&
-		storedSourcePathHintAllowsVirtualSuffix(root) &&
+		scope.IncludeVirtualMembers &&
 		suffix != "" &&
 		!strings.ContainsAny(suffix, `/\`)
-}
-
-func storedSourcePathHintAllowsVirtualSuffix(root string) bool {
-	return filepath.Ext(root) != ""
 }
 
 func sqliteLikeEscape(value string) string {
@@ -2300,14 +2539,15 @@ func sqliteLikeEscape(value string) string {
 	return value
 }
 
-// GetDataVersionByPath returns the minimum data_version for
-// sessions matching a file_path. Returns 0 when no session
-// exists for the path.
+// GetDataVersionByPath returns the minimum data_version for non-source-missing
+// sessions matching a file_path. Returns 0 when no eligible session exists.
 func (db *DB) GetDataVersionByPath(path string) int {
 	var v int
 	err := db.getReader().QueryRow(
 		"SELECT MIN(data_version) FROM sessions"+
-			" WHERE file_path = ?", path,
+			" WHERE file_path = ?"+
+			" AND (deletion_cause IS NULL"+
+			" OR deletion_cause <> 'source_missing')", path,
 	).Scan(&v)
 	if err != nil {
 		return 0
@@ -2475,7 +2715,8 @@ func (db *DB) DeleteSessionIfTrashed(id string) (int64, error) {
 	res, err := tx.Exec(
 		`UPDATE sessions
 		 SET deleted_at = deleted_at
-		 WHERE id = ? AND deleted_at IS NOT NULL`,
+		 WHERE id = ? AND deleted_at IS NOT NULL
+		   AND deletion_cause IS NULL`,
 		id,
 	)
 	if err != nil {
@@ -2488,7 +2729,7 @@ func (db *DB) DeleteSessionIfTrashed(id string) (int64, error) {
 		return 0, nil
 	}
 	aliasIDs, err := sessionAliasIDsTx(
-		tx, "id = ? AND deleted_at IS NOT NULL", id,
+		tx, "id = ? AND deleted_at IS NOT NULL AND deletion_cause IS NULL", id,
 	)
 	if err != nil {
 		return 0, err
@@ -2501,7 +2742,8 @@ func (db *DB) DeleteSessionIfTrashed(id string) (int64, error) {
 	}
 
 	res, err = tx.Exec(
-		"DELETE FROM sessions WHERE id = ? AND deleted_at IS NOT NULL",
+		"DELETE FROM sessions WHERE id = ? AND deleted_at IS NOT NULL"+
+			" AND deletion_cause IS NULL",
 		id,
 	)
 	if err != nil {
@@ -2855,22 +3097,26 @@ func (db *DB) FindPruneCandidates(
 	return sessions, rows.Err()
 }
 
-// SoftDeleteSession marks a session as deleted by setting deleted_at.
+// SoftDeleteSession moves an active session to user trash. A recoverable
+// source-missing tombstone is converted to user trash so later source return
+// cannot revive a session the user explicitly removed.
 func (db *DB) SoftDeleteSession(id string) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	_, err := db.getWriter().Exec(
 		`UPDATE sessions
 		 SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+		     deletion_cause = NULL,
 		     local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-		 WHERE id = ? AND deleted_at IS NULL`, id,
+		 WHERE id = ?
+		   AND (deleted_at IS NULL OR deletion_cause = 'source_missing')`, id,
 	)
 	return err
 }
 
-// SoftDeleteSessions marks multiple sessions as deleted by setting
-// deleted_at. Sessions that are already soft-deleted are skipped.
-// Returns the count of newly deleted rows.
+// SoftDeleteSessions moves multiple sessions to user trash. Existing user
+// tombstones are skipped; recoverable source-missing tombstones are converted.
+// Returns the count of newly deleted or converted rows.
 func (db *DB) SoftDeleteSessions(ids []string) (int, error) {
 	if len(ids) == 0 {
 		return 0, nil
@@ -2900,8 +3146,10 @@ func (db *DB) SoftDeleteSessions(ids []string) (int, error) {
 		res, err := tx.Exec(
 			`UPDATE sessions
 			 SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+			     deletion_cause = NULL,
 			     local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-			 WHERE id IN (`+placeholders+`) AND deleted_at IS NULL`,
+			 WHERE id IN (`+placeholders+`)
+			   AND (deleted_at IS NULL OR deletion_cause = 'source_missing')`,
 			args...,
 		)
 		if err != nil {
@@ -2923,17 +3171,37 @@ func (db *DB) SoftDeleteSessions(ids []string) (int, error) {
 func (db *DB) RestoreSession(id string) (int64, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	res, err := db.getWriter().Exec(
+	tx, err := db.getWriter().BeginTx(context.Background(), nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.Exec(
 		`UPDATE sessions
 		 SET deleted_at = NULL,
+		     deletion_cause = NULL,
 		     local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-		 WHERE id = ? AND deleted_at IS NOT NULL`,
+		 WHERE id = ? AND deleted_at IS NOT NULL
+		   AND deletion_cause IS NULL`,
 		id,
 	)
 	if err != nil {
 		return 0, err
 	}
-	n, _ := res.RowsAffected()
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if n > 0 {
+		if _, err := tx.Exec(
+			"DELETE FROM local_session_source_baselines WHERE session_id = ?", id,
+		); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
 	return n, nil
 }
 
@@ -2958,6 +3226,7 @@ func (db *DB) ListTrashedSessions(
 ) ([]Session, error) {
 	query := "SELECT " + sessionBaseCols +
 		" FROM sessions WHERE deleted_at IS NOT NULL" +
+		" AND deletion_cause IS NULL" +
 		" ORDER BY deleted_at DESC LIMIT 500"
 	rows, err := db.getReader().QueryContext(ctx, query)
 	if err != nil {
@@ -2986,16 +3255,20 @@ func (db *DB) EmptyTrash() (int, error) {
 	if _, err := tx.Exec(
 		`UPDATE sessions
 		 SET deleted_at = deleted_at
-		 WHERE deleted_at IS NOT NULL`,
+		 WHERE deleted_at IS NOT NULL AND deletion_cause IS NULL`,
 	); err != nil {
 		return 0, fmt.Errorf("locking trashed sessions: %w", err)
 	}
 
-	aliasIDs, err := sessionAliasIDsTx(tx, "deleted_at IS NOT NULL")
+	aliasIDs, err := sessionAliasIDsTx(
+		tx, "deleted_at IS NOT NULL AND deletion_cause IS NULL",
+	)
 	if err != nil {
 		return 0, err
 	}
-	ids, err := sessionIDsTx(tx, "deleted_at IS NOT NULL")
+	ids, err := sessionIDsTx(
+		tx, "deleted_at IS NOT NULL AND deletion_cause IS NULL",
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -3003,7 +3276,8 @@ func (db *DB) EmptyTrash() (int, error) {
 	// Record all trashed session IDs before deleting.
 	if _, err := tx.Exec(
 		`INSERT OR IGNORE INTO excluded_sessions (id)
-		 SELECT id FROM sessions WHERE deleted_at IS NOT NULL`,
+		 SELECT id FROM sessions
+		 WHERE deleted_at IS NOT NULL AND deletion_cause IS NULL`,
 	); err != nil {
 		return 0, fmt.Errorf("excluding trashed sessions: %w", err)
 	}
@@ -3023,7 +3297,8 @@ func (db *DB) EmptyTrash() (int, error) {
 		}
 	}
 	res, err := tx.Exec(
-		"DELETE FROM sessions WHERE deleted_at IS NOT NULL",
+		"DELETE FROM sessions WHERE deleted_at IS NOT NULL" +
+			" AND deletion_cause IS NULL",
 	)
 	if err != nil {
 		return 0, fmt.Errorf("emptying trash: %w", err)
@@ -3236,7 +3511,8 @@ func (db *DB) ListSessionsModifiedBetween(
 			&s.TranscriptFidelity,
 			&s.ParserMalformedLines, &s.IsTruncated,
 			&s.LastWriteIncremental,
-			&s.DeletedAt, &s.TerminationStatus, &s.FilePath, &s.FileSize,
+			&s.DeletedAt, &s.DeletionCause,
+			&s.TerminationStatus, &s.FilePath, &s.FileSize,
 			&s.FileMtime, &s.NextOrdinal, &s.LastEntryUUID,
 			&s.FileInode, &s.FileDevice,
 			&s.FileHash, &s.LocalModifiedAt,

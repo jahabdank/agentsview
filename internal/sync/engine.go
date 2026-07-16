@@ -7,6 +7,7 @@ import (
 	"log"
 	"maps"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -37,6 +38,97 @@ const (
 )
 
 var errSessionPreserved = errors.New("session preserved")
+
+type reconciliationMetricsContextKey struct{}
+type deferGlobalLinkContextKey struct{}
+
+type reconciliationRuntimeMetrics struct {
+	mu                       gosync.Mutex
+	maxProvider              int
+	maxRehydrated            int
+	workerResults            int
+	maxWorkerResults         int
+	maxPendingWrites         int
+	globalLinkPasses         int
+	providerRetainedBytes    int64
+	maxProviderRetainedBytes int64
+	sharedContainerScans     int
+	openCodeSQLiteParses     int
+}
+
+func reconciliationRuntimeMetricsFor(ctx context.Context) *reconciliationRuntimeMetrics {
+	metrics, _ := ctx.Value(reconciliationMetricsContextKey{}).(*reconciliationRuntimeMetrics)
+	return metrics
+}
+
+func (metrics *reconciliationRuntimeMetrics) providerBuffered(buffered int) {
+	metrics.mu.Lock()
+	metrics.maxProvider = max(metrics.maxProvider, buffered)
+	metrics.mu.Unlock()
+}
+
+func (metrics *reconciliationRuntimeMetrics) rehydrated(count int) {
+	metrics.mu.Lock()
+	metrics.maxRehydrated = max(metrics.maxRehydrated, count)
+	metrics.mu.Unlock()
+}
+
+func (metrics *reconciliationRuntimeMetrics) workerQueued(delta int) {
+	metrics.mu.Lock()
+	metrics.workerResults += delta
+	metrics.maxWorkerResults = max(metrics.maxWorkerResults, metrics.workerResults)
+	metrics.mu.Unlock()
+}
+
+func (metrics *reconciliationRuntimeMetrics) pendingWrites(count int) {
+	metrics.mu.Lock()
+	metrics.maxPendingWrites = max(metrics.maxPendingWrites, count)
+	metrics.mu.Unlock()
+}
+
+func (metrics *reconciliationRuntimeMetrics) globalLinkPass() {
+	metrics.mu.Lock()
+	metrics.globalLinkPasses++
+	metrics.mu.Unlock()
+}
+
+func (metrics *reconciliationRuntimeMetrics) providerRetained(delta int64) {
+	metrics.mu.Lock()
+	metrics.providerRetainedBytes += delta
+	metrics.maxProviderRetainedBytes = max(
+		metrics.maxProviderRetainedBytes,
+		metrics.providerRetainedBytes,
+	)
+	metrics.mu.Unlock()
+}
+
+func (metrics *reconciliationRuntimeMetrics) sharedContainerScan() {
+	metrics.mu.Lock()
+	metrics.sharedContainerScans++
+	metrics.mu.Unlock()
+}
+
+func (metrics *reconciliationRuntimeMetrics) openCodeSQLiteParse() {
+	metrics.mu.Lock()
+	metrics.openCodeSQLiteParses++
+	metrics.mu.Unlock()
+}
+
+func (metrics *reconciliationRuntimeMetrics) snapshot(
+	spool ReconciliationMetrics,
+) ReconciliationMetrics {
+	metrics.mu.Lock()
+	defer metrics.mu.Unlock()
+	spool.MaxProviderBuffered = metrics.maxProvider
+	spool.MaxRehydratedSources = metrics.maxRehydrated
+	spool.MaxWorkerResults = metrics.maxWorkerResults
+	spool.MaxPendingWrites = metrics.maxPendingWrites
+	spool.GlobalLinkPasses = metrics.globalLinkPasses
+	spool.MaxProviderRetainedBytes = metrics.maxProviderRetainedBytes
+	spool.SharedContainerScans = metrics.sharedContainerScans
+	spool.OpenCodeSQLiteParses = metrics.openCodeSQLiteParses
+	return spool
+}
 
 func isIntentionalSessionSkip(err error) bool {
 	return errors.Is(err, db.ErrSessionExcluded) ||
@@ -90,6 +182,10 @@ type EngineConfig struct {
 	// still takes syncMu after it is released so later syncs and resyncs
 	// cannot overlap its database access.
 	DeferStartupMaintenance bool
+	// OnStartupReconciled runs once, after syncMu is released, when a full
+	// startup discovery completed authoritatively. Failed, cancelled, and
+	// aborted attempts leave it eligible for a later successful owner.
+	OnStartupReconciled func(SyncStats, error)
 	// ProviderFactories and ProviderMigrationModes select which concrete
 	// providers own discovery and parsing for their agents. Nil uses the
 	// parser package registry/manifest.
@@ -100,6 +196,7 @@ type EngineConfig struct {
 // Engine orchestrates session file discovery and sync.
 type Engine struct {
 	db                      *db.DB
+	lstat                   func(string) (os.FileInfo, error)
 	openCodeArchiveStore    db.Store
 	agentDirs               map[parser.AgentType][]string
 	machine                 string
@@ -134,11 +231,29 @@ type Engine struct {
 	emitter                 Emitter
 	providerFactories       map[parser.AgentType]parser.ProviderFactory
 	providerMigrationModes  map[parser.AgentType]parser.ProviderMigrationMode
+	providerWatchRootsMu    gosync.Mutex
+	providerWatchRoots      map[parser.AgentType][]parser.WatchRoot
 	projectIdentityMu       gosync.Mutex
 	projectIdentityCache    map[string]projectIdentityCacheEntry
 	projectIdentityWritten  map[string]struct{}
 	startupMaintenanceOnce  gosync.Once
 	startupMaintenanceReady chan struct{}
+	startupReconciledOnce   gosync.Once
+	startupReconciledReady  chan struct{}
+	startupAttemptOnce      gosync.Once
+	startupAttemptReady     chan struct{}
+	startupReconciledStats  SyncStats
+	startupReconciledErr    error
+	startupCallbackOnce     gosync.Once
+	onStartupReconciled     func(SyncStats, error)
+	// writeBatchOverride is a test seam for exercising reconciliation archive
+	// write failures after discovery and parse have succeeded.
+	writeBatchOverride func([]pendingWrite, syncWriteMode, bool) (int, int, int, int)
+	// workerCountOverride is a test seam for exercising the production worker
+	// floor and cap independently of the host CPU count.
+	workerCountOverride  int
+	parseRetentionOnce   gosync.Once
+	parseRetentionBudget *parseRetentionBudget
 
 	// forceParse disables every stored-state skip (skip cache,
 	// size/mtime/data_version checks, incremental JSONL deltas) so
@@ -199,6 +314,33 @@ type Engine struct {
 	verifiedSourceEpoch      uint64
 	verifiedSourcePass       uint64
 	verifiedSourceActivePass uint64
+
+	reconciliationMu           gosync.RWMutex
+	lastReconciliation         ReconciliationResult
+	reconciliationSpoolFactory func(string) (reconciliationSpoolStore, error)
+}
+
+// ReconciliationResult is the structured acknowledgement for the most recent
+// watcher-forced reconciliation attempt.
+type ReconciliationResult struct {
+	Complete         bool
+	Aborted          bool
+	ProviderFailures int
+	Metrics          ReconciliationMetrics
+}
+
+// LastReconciliationResult returns a snapshot of the latest watcher-forced
+// reconciliation acknowledgement.
+func (e *Engine) LastReconciliationResult() ReconciliationResult {
+	e.reconciliationMu.RLock()
+	defer e.reconciliationMu.RUnlock()
+	return e.lastReconciliation
+}
+
+func (e *Engine) setLastReconciliationResult(result ReconciliationResult) {
+	e.reconciliationMu.Lock()
+	e.lastReconciliation = result
+	e.reconciliationMu.Unlock()
 }
 
 // PhaseStats returns the engine's phase counter. The values reflect only
@@ -278,6 +420,7 @@ func NewEngine(
 
 	e := &Engine{
 		db:                      database,
+		lstat:                   os.Lstat,
 		agentDirs:               dirs,
 		machine:                 cfg.Machine,
 		blockedResultCategories: blockedCategorySet(cfg.BlockedResultCategories),
@@ -292,9 +435,17 @@ func NewEngine(
 		emitter:                 cfg.Emitter,
 		providerFactories:       providerFactoryMap(providerFactories),
 		providerMigrationModes:  providerModes,
+		providerWatchRoots:      make(map[parser.AgentType][]parser.WatchRoot),
 		projectIdentityCache:    make(map[string]projectIdentityCacheEntry),
 		projectIdentityWritten:  make(map[string]struct{}),
 		startupMaintenanceReady: make(chan struct{}),
+		startupReconciledReady:  make(chan struct{}),
+		startupAttemptReady:     make(chan struct{}),
+		onStartupReconciled:     cfg.OnStartupReconciled,
+		reconciliationSpoolFactory: func(path string) (reconciliationSpoolStore, error) {
+			return newReconciliationSpool(path)
+		},
+		parseRetentionBudget: newParseRetentionBudget(defaultParseRetentionBytes),
 	}
 	if !cfg.DeferStartupMaintenance {
 		e.ReleaseStartupMaintenance()
@@ -567,7 +718,16 @@ func (e *Engine) Machine() string {
 
 type syncJob struct {
 	processResult
-	path string
+	path           string
+	retentionLease *parseRetentionLease
+}
+
+func (j *syncJob) releaseRetention() {
+	if j == nil {
+		return
+	}
+	j.retentionLease.Release()
+	j.retentionLease = nil
 }
 
 func (j syncJob) skipCacheKey() string {
@@ -586,7 +746,7 @@ func (r processResult) skipCacheKey(path string) string {
 // Paths that don't match known session file patterns are
 // silently ignored.
 func (e *Engine) SyncPaths(paths []string) {
-	e.SyncPathsContext(context.Background(), paths)
+	_ = e.SyncPathsContext(context.Background(), paths)
 }
 
 // SyncPathsContext is SyncPaths with caller-controlled cancellation. The
@@ -594,16 +754,22 @@ func (e *Engine) SyncPaths(paths []string) {
 // path waits for the in-flight onChange callback, so a watcher-driven sync
 // that ignored SIGTERM would hold shutdown until a service manager's kill
 // timeout instead of aborting between files like every other sync path.
-func (e *Engine) SyncPathsContext(ctx context.Context, paths []string) {
+func (e *Engine) SyncPathsContext(ctx context.Context, paths []string) error {
 	if e.refuseWriteInForceParse("SyncPaths") {
-		return
+		return nil
+	}
+	missingPaths := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if _, err := e.lstatSource(path); os.IsNotExist(err) {
+			missingPaths = append(missingPaths, path)
+		}
 	}
 	// Capture container states before classifyPaths lists any session rows,
 	// matching the capture-before-discovery ordering of full syncs.
 	preContainerStates := e.captureSQLiteContainerStates()
 	files := e.classifyPaths(paths)
-	if len(files) == 0 {
-		return
+	if len(files) == 0 && len(missingPaths) == 0 {
+		return nil
 	}
 
 	e.syncMu.Lock()
@@ -612,8 +778,9 @@ func (e *Engine) SyncPathsContext(ctx context.Context, paths []string) {
 	// critical section or deadlock by re-entering sync code. The
 	// stats variable is captured by the closure and populated below.
 	var stats SyncStats
+	var tombstoned int
 	defer func() {
-		if stats.Synced > 0 {
+		if stats.Synced > 0 || tombstoned > 0 {
 			e.emit("sessions")
 		}
 	}()
@@ -638,6 +805,20 @@ func (e *Engine) SyncPathsContext(ctx context.Context, paths []string) {
 	e.finishSQLiteContainerPass(true, false)
 	e.anomalies.applyTo(&stats)
 	e.persistSkipCache()
+	complete := ctx.Err() == nil && !stats.Aborted && stats.Failed == 0 &&
+		stats.providerFailures == 0
+	if complete {
+		if err := e.baselineDiscoveredFiles(ctx, files, true); err != nil {
+			return fmt.Errorf("watcher source baseline: %w", err)
+		}
+	}
+	if complete && len(missingPaths) > 0 {
+		var err error
+		tombstoned, err = e.tombstoneMissingWatchSourcesLocked(ctx, missingPaths, nil)
+		if err != nil {
+			return fmt.Errorf("watcher source tombstone: %w", err)
+		}
+	}
 
 	e.mu.Lock()
 	e.lastSync = time.Now()
@@ -649,6 +830,16 @@ func (e *Engine) SyncPathsContext(ctx context.Context, paths []string) {
 			"sync: %d file(s) updated", stats.Synced,
 		)
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !complete {
+		return fmt.Errorf(
+			"changed-path sync incomplete: %d source or archive failures",
+			stats.Failed,
+		)
+	}
+	return nil
 }
 
 // classifyPaths maps changed file system paths to
@@ -746,41 +937,49 @@ func (e *Engine) classifyProviderChangedPath(
 			Machine: e.machine,
 		})
 		def := provider.Definition()
-		watchRoots := providerChangedPathWatchRoots(ctx, provider, roots)
+		watchRoots := e.providerChangedPathWatchRoots(
+			ctx, agentType, provider, roots,
+		)
 		// Every SourcesForChangedPath implementation resolves the
 		// changed path within the provider's configured roots or plan
-		// watch roots (stored-path hints are already scoped to the
-		// watch root by the query), so an agent whose roots cannot
+		// watch roots (stored-path hints are scoped to the affected
+		// container before the query), so an agent whose roots cannot
 		// contain the path never claims it. Skip it before the
-		// per-root stored-hint DB queries, which otherwise run for
+		// provider-owned stored-hint DB queries, which otherwise run for
 		// every registered agent on every watcher event.
 		if !changedPathWithinAnyRoot(path, roots) &&
 			!changedPathWithinAnyRoot(path, watchRoots) {
 			continue
 		}
 		for _, watchRoot := range watchRoots {
-			var storedSourcePaths []string
+			request := parser.ChangedPathRequest{
+				Path:      path,
+				EventKind: eventKind,
+				WatchRoot: watchRoot,
+			}
 			if provider.Capabilities().Source.StoredSourceHints == parser.CapabilitySupported {
-				var err error
-				storedSourcePaths, err = e.db.ListStoredSourcePathHints(
-					string(def.Type),
-					[]string{watchRoot},
-				)
-				if err != nil {
-					log.Printf(
-						"%s provider changed-path stored hints: %v",
-						def.Type, err,
+				if resolver, ok := provider.(parser.StoredSourceHintScopeProvider); ok {
+					scopes := storedSourceDBHintScopes(
+						resolver.StoredSourceHintScopes(request),
 					)
+					if len(scopes) > 0 {
+						var err error
+						request.StoredSourcePaths, err = e.db.ListStoredSourcePathHints(
+							string(def.Type),
+							scopes,
+						)
+						if err != nil {
+							log.Printf(
+								"%s provider changed-path stored hints: %v",
+								def.Type, err,
+							)
+						}
+					}
 				}
 			}
 			sources, err := provider.SourcesForChangedPath(
 				ctx,
-				parser.ChangedPathRequest{
-					Path:              path,
-					EventKind:         eventKind,
-					WatchRoot:         watchRoot,
-					StoredSourcePaths: storedSourcePaths,
-				},
+				request,
 			)
 			if err != nil {
 				if !errors.Is(err, parser.ErrUnsupportedProviderFeature) {
@@ -807,7 +1006,8 @@ func (e *Engine) classifyProviderChangedPath(
 				if eventKind == "remove" &&
 					filepath.Clean(sourcePath) == filepath.Clean(path) &&
 					!parser.IsRegularFile(sourcePath) &&
-					!providerDeletedPhysicalSQLiteSource(agent, sourcePath) {
+					!providerDeletedPhysicalSQLiteSource(agent, sourcePath) &&
+					!providerVirtualSourceContainerExists(sourcePath) {
 					continue
 				}
 				seen[key] = struct{}{}
@@ -834,39 +1034,77 @@ func (e *Engine) classifyProviderChangedPath(
 	return files
 }
 
-func providerChangedPathWatchRoots(
+func storedSourceDBHintScopes(
+	scopes []parser.StoredSourceHintScope,
+) []db.StoredSourcePathHintScope {
+	out := make([]db.StoredSourcePathHintScope, 0, len(scopes))
+	for _, scope := range scopes {
+		out = append(out, db.StoredSourcePathHintScope{
+			Path: scope.Path, IncludeVirtualMembers: scope.IncludeVirtualMembers,
+		})
+	}
+	return out
+}
+
+func (e *Engine) providerChangedPathWatchRoots(
 	ctx context.Context,
+	agent parser.AgentType,
 	provider parser.Provider,
 	roots []string,
 ) []string {
-	plan, err := provider.WatchPlan(ctx)
-	if err == nil && len(plan.Roots) > 0 {
-		watchRoots := make([]string, 0, len(plan.Roots))
-		seen := make(map[string]struct{}, len(plan.Roots))
-		for _, root := range plan.Roots {
-			path := filepath.Clean(root.Path)
-			if path == "" || path == "." {
-				continue
-			}
-			if _, ok := seen[path]; ok {
-				continue
-			}
-			seen[path] = struct{}{}
-			watchRoots = append(watchRoots, path)
-		}
-		if len(watchRoots) > 0 {
-			return watchRoots
-		}
+	e.providerWatchRootsMu.Lock()
+	defer e.providerWatchRootsMu.Unlock()
+	if cached, ok := e.providerWatchRoots[agent]; ok {
+		return watchRootPaths(cached)
 	}
-	watchRoots := make([]string, 0, len(roots))
+
+	resolved, err := parser.ResolveWatchRoots(ctx, provider)
+	if err != nil {
+		log.Printf("%s provider watch roots: %v", agent, err)
+	}
+	resolved = normalizedProviderWatchRoots(resolved)
+	if len(resolved) == 0 {
+		resolved = make([]parser.WatchRoot, 0, len(roots))
+		for _, root := range roots {
+			resolved = append(resolved, parser.WatchRoot{Path: root})
+		}
+		resolved = normalizedProviderWatchRoots(resolved)
+	}
+	if e.providerWatchRoots == nil {
+		e.providerWatchRoots = make(map[parser.AgentType][]parser.WatchRoot)
+	}
+	e.providerWatchRoots[agent] = resolved
+	return watchRootPaths(resolved)
+}
+
+func normalizedProviderWatchRoots(
+	roots []parser.WatchRoot,
+) []parser.WatchRoot {
+	normalized := make([]parser.WatchRoot, 0, len(roots))
+	seen := make(map[string]struct{}, len(roots))
 	for _, root := range roots {
-		root = filepath.Clean(root)
-		if root == "" || root == "." {
+		path := filepath.Clean(root.Path)
+		if path == "" || path == "." {
 			continue
 		}
-		watchRoots = append(watchRoots, root)
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		root.Path = path
+		root.IncludeGlobs = nil
+		root.ExcludeGlobs = nil
+		normalized = append(normalized, root)
 	}
-	return watchRoots
+	return normalized
+}
+
+func watchRootPaths(roots []parser.WatchRoot) []string {
+	paths := make([]string, 0, len(roots))
+	for _, root := range roots {
+		paths = append(paths, root.Path)
+	}
+	return paths
 }
 
 func providerChangedPathForceParse(
@@ -921,18 +1159,12 @@ func providerChangedPathEventKind(path string) string {
 	if path == "" {
 		return ""
 	}
-	// A virtual source path (e.g. a SQLite per-session path
-	// "<db>#<sessionID>") is never a real file. Resolve it to its physical
-	// container so an existence check reflects whether the backing store is
-	// present rather than always reporting the synthetic path as removed.
-	statPath := path
-	if container, _, ok := parser.ParseVirtualSourcePath(path); ok {
-		statPath = container
+	if _, err := os.Lstat(path); err == nil {
+		return "write"
+	} else if !os.IsNotExist(err) {
+		return "write"
 	}
-	if _, err := os.Lstat(statPath); err != nil && os.IsNotExist(err) {
-		return "remove"
-	}
-	return "write"
+	return "remove"
 }
 
 func providerDiscoveredPath(source parser.SourceRef) string {
@@ -946,6 +1178,11 @@ func providerDiscoveredPath(source parser.SourceRef) string {
 		}
 	}
 	return ""
+}
+
+func providerVirtualSourceContainerExists(path string) bool {
+	container := validatedProviderSourceStatPath(path)
+	return container != path && parser.IsRegularFile(container)
 }
 
 func providerDeletedPhysicalSQLiteSource(
@@ -1206,6 +1443,7 @@ func (e *Engine) ResyncAll(
 		return SyncStats{}
 	}
 	e.syncMu.Lock()
+	defer e.notifyStartupReconciled()
 	// Defers LIFO: Unlock runs before emit.
 	defer func() {
 		if stats.Synced > 0 {
@@ -1214,6 +1452,7 @@ func (e *Engine) ResyncAll(
 	}()
 	defer e.syncMu.Unlock()
 	defer e.clearCurrentProgress()
+	defer func() { e.recordStartupReconciled(ctx, stats, nil) }()
 
 	return e.resyncAllLocked(ctx, onProgress)
 }
@@ -1251,6 +1490,7 @@ func (e *Engine) resyncAllWithOptionsAndOperations(
 		return SyncStats{}, nil
 	}
 	e.syncMu.Lock()
+	defer e.notifyStartupReconciled()
 	defer func() {
 		if stats.Synced > 0 && !stats.Aborted {
 			e.emit("sync")
@@ -1258,6 +1498,7 @@ func (e *Engine) resyncAllWithOptionsAndOperations(
 	}()
 	defer e.syncMu.Unlock()
 	defer e.clearCurrentProgress()
+	defer func() { e.recordStartupReconciled(ctx, stats, err) }()
 	opts.includePhaseDiagnostics = true
 	return e.resyncAllWithOptionsLocked(
 		ctx, onProgress, opts, ops,
@@ -2047,6 +2288,7 @@ func (e *Engine) SyncThenRun(
 		return SyncStats{}, nil
 	}
 	e.syncMu.Lock()
+	defer e.notifyStartupReconciled()
 	// Defers run LIFO: Unlock runs before emit.
 	defer func() {
 		if stats.Synced > 0 {
@@ -2055,6 +2297,7 @@ func (e *Engine) SyncThenRun(
 	}()
 	defer e.syncMu.Unlock()
 	defer e.clearCurrentProgress()
+	defer func() { e.recordStartupReconciled(ctx, stats, err) }()
 	stats, err = e.syncThenRunLocked(ctx, full, onProgress, work)
 	if err == nil {
 		// Release while syncMu is still held. A timed fallback that was
@@ -2132,6 +2375,7 @@ func (e *Engine) SyncThenRunWithRebuild(
 		return SyncStats{}, nil
 	}
 	e.syncMu.Lock()
+	defer e.notifyStartupReconciled()
 	defer func() {
 		if stats.Synced > 0 && !stats.Aborted {
 			e.emit("sync")
@@ -2146,6 +2390,7 @@ func (e *Engine) SyncThenRunWithRebuild(
 		}
 	}()
 	defer e.clearCurrentProgress()
+	defer func() { e.recordStartupReconciled(ctx, stats, retErr) }()
 
 	didResync := full || e.db.NeedsResync()
 	if didResync {
@@ -2201,6 +2446,64 @@ func (e *Engine) ReleaseStartupMaintenance() {
 	})
 }
 
+func (e *Engine) notifyStartupReconciled() {
+	if e.onStartupReconciled == nil || e.startupReconciledReady == nil {
+		return
+	}
+	select {
+	case <-e.startupAttemptReady:
+	default:
+		return
+	}
+	e.startupCallbackOnce.Do(func() {
+		e.onStartupReconciled(e.startupReconciledStats, e.startupReconciledErr)
+	})
+}
+
+func (e *Engine) recordStartupReconciled(
+	ctx context.Context, stats SyncStats, err error,
+) {
+	if ctx.Err() != nil {
+		return
+	}
+	e.startupAttemptOnce.Do(func() {
+		e.startupReconciledStats = stats
+		if err != nil {
+			e.startupReconciledErr = err
+		} else if !stats.AuthoritativeDiscoveryComplete() {
+			e.startupReconciledErr = fmt.Errorf(
+				"startup discovery incomplete: %d provider failures",
+				stats.providerFailures,
+			)
+		}
+		if e.startupAttemptReady != nil {
+			close(e.startupAttemptReady)
+		}
+	})
+	if !startupReconciliationSucceeded(ctx, stats, err) {
+		return
+	}
+	e.startupReconciledOnce.Do(func() {
+		if e.startupReconciledReady != nil {
+			close(e.startupReconciledReady)
+		}
+	})
+}
+
+func startupReconciliationSucceeded(
+	ctx context.Context, stats SyncStats, err error,
+) bool {
+	return err == nil && ctx.Err() == nil &&
+		stats.AuthoritativeDiscoveryComplete()
+}
+
+// AuthoritativeDiscoveryComplete reports whether a full discovery pass
+// completed without cancellation, safety abort, or provider listing failure.
+// Individual parser warnings do not make discovery incomplete.
+func (stats SyncStats) AuthoritativeDiscoveryComplete() bool {
+	return !stats.Aborted && stats.providerFailures == 0
+}
+
 // RunStartupMaintenance waits for the daemon-launching foreground sync, then
 // runs work under the same mutex used by sync and resync database swaps.
 func (e *Engine) RunStartupMaintenance(
@@ -2226,6 +2529,7 @@ func (e *Engine) RunStartupSyncFallback(
 		return SyncStats{}, false, nil
 	}
 	e.syncMu.Lock()
+	defer e.notifyStartupReconciled()
 	// Defers run LIFO: Unlock runs before emit.
 	defer func() {
 		if stats.Synced > 0 {
@@ -2234,10 +2538,11 @@ func (e *Engine) RunStartupSyncFallback(
 	}()
 	defer e.syncMu.Unlock()
 	defer e.clearCurrentProgress()
+	defer func() { e.recordStartupReconciled(ctx, stats, err) }()
 
-	if e.startupMaintenanceReady != nil {
+	if e.startupReconciledReady != nil {
 		select {
-		case <-e.startupMaintenanceReady:
+		case <-e.startupReconciledReady:
 			return SyncStats{}, false, nil
 		default:
 		}
@@ -2273,6 +2578,7 @@ func (e *Engine) SyncAll(
 		return SyncStats{}
 	}
 	e.syncMu.Lock()
+	defer e.notifyStartupReconciled()
 	// Defers run LIFO: Unlock runs before the emit closure so
 	// Emitter implementations cannot widen the syncMu critical
 	// section or deadlock by re-entering sync code.
@@ -2283,6 +2589,7 @@ func (e *Engine) SyncAll(
 	}()
 	defer e.syncMu.Unlock()
 	defer e.clearCurrentProgress()
+	defer func() { e.recordStartupReconciled(ctx, stats, ctx.Err()) }()
 	stats = e.syncAllLocked(
 		ctx, onProgress, time.Time{}, nil, syncWriteDefault, true, false,
 	)
@@ -2314,6 +2621,1035 @@ func (e *Engine) SyncAllAfterWatcherOverflow(
 		ctx, onProgress, time.Time{}, nil, syncWriteDefault, true, true,
 	)
 	return
+}
+
+// HasActiveSessionSourceBelow checks only the exact configured agent that owns
+// the rename event's logical watch root.
+func (e *Engine) HasActiveSessionSourceBelow(agent, path string) (bool, error) {
+	return e.db.HasActiveSessionSourceBelow(agent, path)
+}
+
+// ReconcileWatchRoots runs authoritative discovery for a bounded set of watch
+// roots, or every configured source after an overflow or unscoped recovery.
+// A failed or incomplete discovery is returned to the watcher so its marker is
+// retained and retried rather than acknowledged prematurely.
+func (e *Engine) ReconcileWatchRoots(
+	ctx context.Context, roots []string, full bool,
+) error {
+	logicalRoots, excludedRemoteRoots := e.localReconciliationRoots(roots, full)
+	if !full && len(roots) > 0 && len(logicalRoots) == 0 && excludedRemoteRoots > 0 {
+		e.setLastReconciliationResult(ReconciliationResult{
+			Complete: true,
+			Metrics:  ReconciliationMetrics{ExcludedRemoteRoots: excludedRemoteRoots},
+		})
+		return nil
+	}
+	stats, metrics, tombstoned, err := e.reconcileWatchRootsStreamed(
+		ctx, logicalRoots, full,
+	)
+	metrics.ExcludedRemoteRoots = excludedRemoteRoots
+	if stats.Synced > 0 || tombstoned > 0 {
+		e.emit("sessions")
+	}
+	complete := err == nil && ctx.Err() == nil && !stats.Aborted &&
+		stats.Failed == 0 && stats.providerFailures == 0
+	if err == nil && !complete {
+		err = errors.New("watch root reconciliation aborted")
+	}
+	e.setLastReconciliationResult(ReconciliationResult{
+		Complete:         complete,
+		Aborted:          !complete,
+		ProviderFailures: stats.providerFailures,
+		Metrics:          metrics,
+	})
+	return err
+}
+
+// ReconciliationRootsForAgent returns every configured root for one provider.
+// Directory rename events use the complete provider scope because FSEvents may
+// report only one endpoint of a move between that provider's roots.
+func (e *Engine) ReconciliationRootsForAgent(agent string) []string {
+	return append([]string(nil), e.agentDirs[parser.AgentType(agent)]...)
+}
+
+func (e *Engine) reconcileWatchRootsStreamed(
+	ctx context.Context, roots []string, full bool,
+) (stats SyncStats, metrics ReconciliationMetrics, tombstoned int, retErr error) {
+	if err := ctx.Err(); err != nil {
+		return SyncStats{Aborted: true}, metrics, 0, err
+	}
+	e.syncMu.Lock()
+	defer e.syncMu.Unlock()
+	e.phaseStats.Reset()
+	e.anomalies.reset()
+	defer func() { e.anomalies.applyTo(&stats) }()
+	runtimeMetrics := &reconciliationRuntimeMetrics{}
+	ctx = context.WithValue(ctx, reconciliationMetricsContextKey{}, runtimeMetrics)
+	ctx = parser.WithStreamingDiscoveryBufferObserver(ctx, runtimeMetrics.providerBuffered)
+	ctx = parser.WithStreamingRetainedBytesObserver(ctx, runtimeMetrics.providerRetained)
+	ctx = parser.WithSharedContainerScanObserver(ctx, runtimeMetrics.sharedContainerScan)
+	ctx = context.WithValue(ctx, deferGlobalLinkContextKey{}, true)
+	var closeProviderCache func() error
+	ctx, closeProviderCache, err := parser.WithReconciliationCache(ctx)
+	if err != nil {
+		stats.Aborted = true
+		return stats, metrics, 0, err
+	}
+	defer func() {
+		if cleanupErr := closeProviderCache(); cleanupErr != nil {
+			stats.Aborted = true
+			stats.providerFailures++
+			retErr = errors.Join(retErr, cleanupErr)
+		}
+	}()
+	mergeMetrics := func(spoolMetrics ReconciliationMetrics) ReconciliationMetrics {
+		return runtimeMetrics.snapshot(spoolMetrics)
+	}
+
+	spool, err := e.reconciliationSpoolFactory(e.db.Path())
+	if err != nil {
+		stats.Aborted = true
+		return stats, metrics, 0, err
+	}
+	cleaned := false
+	defer func() {
+		if !cleaned {
+			_ = spool.CloseAndRemove()
+		}
+	}()
+
+	scope := newRootSyncScope(roots)
+	if full {
+		scope = nil
+	}
+	preContainerStates := e.captureSQLiteContainerStates()
+	providers, completedScopes, failedRoots, failures, discoveryErr, err := e.streamReconciliationCandidates(
+		ctx, scope, spool,
+	)
+	stats.providerFailures = failures
+	if err != nil {
+		stats.Aborted = true
+		metrics = mergeMetrics(spool.Metrics())
+		if cleanupErr := spool.CloseAndRemove(); cleanupErr != nil {
+			err = errors.Join(err, cleanupErr)
+		}
+		cleaned = true
+		return stats, metrics, 0, err
+	}
+	e.beginStreamingSQLiteContainerPass(preContainerStates)
+	e.finishStreamingSQLiteContainerDiscovery()
+	defer func() {
+		e.finishSQLiteContainerPass(
+			retErr != nil || stats.Aborted || stats.Failed > 0 || stats.providerFailures > 0,
+			scope == nil,
+		)
+	}()
+
+	var verifiedPass uint64
+	if scope == nil && e.pathRewriter == nil {
+		verifiedPass = e.beginVerifiedSourcePass()
+		defer func() {
+			e.finishVerifiedSourcePass(
+				verifiedPass,
+				retErr == nil && !stats.Aborted && stats.providerFailures == 0,
+			)
+		}()
+	}
+	var cursor reconciliationCursor
+	for {
+		if err := ctx.Err(); err != nil {
+			stats.Aborted = true
+			retErr = err
+			break
+		}
+		page, err := spool.Page(ctx, cursor, reconciliationPageSize)
+		if err != nil {
+			stats.Aborted = true
+			retErr = err
+			break
+		}
+		if len(page) == 0 {
+			break
+		}
+		for _, candidate := range page {
+			e.noteSQLiteContainerDiscovery(parser.DiscoveredFile{
+				Agent: candidate.Provider,
+				Path:  candidate.Path,
+			})
+		}
+		files, err := e.rehydrateReconciliationPage(ctx, page, providers, false)
+		if err != nil {
+			stats.Aborted = ctx.Err() != nil
+			stats.providerFailures++
+			retErr = err
+			break
+		}
+		runtimeMetrics.rehydrated(len(files))
+		if verifiedPass != 0 {
+			e.markVerifiedDiscoveredSources(files)
+		}
+		pageStats := e.collectAndBatch(
+			ctx, e.startWorkers(ctx, files), len(files), len(files), nil,
+			syncWriteDefault,
+		)
+		mergeReconciliationSyncStats(&stats, pageStats)
+		if pageStats.Aborted || pageStats.Failed > 0 {
+			stats.Aborted = true
+			retErr = fmt.Errorf(
+				"watch root reconciliation failed processing page: %d failures",
+				pageStats.Failed,
+			)
+			break
+		}
+		if err := e.baselineReconciliationCandidates(ctx, page); err != nil {
+			stats.RecordFailed()
+			stats.Aborted = true
+			retErr = err
+			break
+		}
+		cursor = page[len(page)-1].Cursor()
+	}
+
+	if retErr == nil && stats.providerFailures > 0 {
+		retErr = &incompleteReconciliationError{
+			failures:  stats.providerFailures,
+			roots:     failedRoots,
+			completed: completedScopes,
+			cause:     discoveryErr,
+		}
+	}
+	if retErr == nil && stats.Failed > 0 {
+		stats.Aborted = true
+		retErr = fmt.Errorf(
+			"watch root reconciliation failed: %d source or archive failures",
+			stats.Failed,
+		)
+	}
+	if retErr == nil {
+		if err := e.linkSubagentSessions(ctx); err != nil {
+			stats.RecordFailed()
+			stats.Aborted = true
+			retErr = fmt.Errorf("link subagent sessions after reconciliation: %w", err)
+		}
+	}
+	if retErr == nil {
+		e.persistSkipCache()
+		e.mu.Lock()
+		e.lastSync = time.Now()
+		e.lastSyncStats = stats
+		e.mu.Unlock()
+	}
+	if retErr == nil && ctx.Err() == nil && !stats.Aborted &&
+		stats.Failed == 0 && stats.providerFailures == 0 {
+		tombstoned, retErr = e.tombstoneMissingWatchSourcesLocked(
+			ctx, roots, spool,
+		)
+	} else if ctx.Err() == nil && !stats.Aborted && stats.Failed == 0 {
+		var incomplete *incompleteReconciliationError
+		if errors.As(retErr, &incomplete) && len(incomplete.completed) > 0 {
+			tombstoned, retErr = e.tombstoneCompletedReconciliationScopesLocked(
+				ctx, spool, incomplete,
+			)
+		}
+	}
+	metrics = mergeMetrics(spool.Metrics())
+	if cleanupErr := spool.CloseAndRemove(); cleanupErr != nil {
+		stats.Aborted = true
+		retErr = errors.Join(retErr, cleanupErr)
+	}
+	cleaned = true
+	return stats, metrics, tombstoned, retErr
+}
+
+func (e *Engine) tombstoneCompletedReconciliationScopesLocked(
+	ctx context.Context,
+	spool reconciliationSpoolStore,
+	incomplete *incompleteReconciliationError,
+) (deleted int, retErr error) {
+	for _, scope := range incomplete.completed {
+		count, err := e.tombstoneMissingWatchSourcesForAgentLocked(
+			ctx, scope.roots, scope.agent, spool,
+		)
+		deleted += count
+		if err == nil {
+			continue
+		}
+		retryRoots := append([]string(nil), incomplete.roots...)
+		for _, completed := range incomplete.completed {
+			retryRoots = append(retryRoots, completed.roots...)
+		}
+		slices.Sort(retryRoots)
+		retryRoots = slices.Compact(retryRoots)
+		return deleted, &incompleteReconciliationError{
+			failures: incomplete.failures,
+			roots:    retryRoots,
+			cause:    errors.Join(incomplete, err),
+		}
+	}
+	return deleted, incomplete
+}
+
+func (e *Engine) baselineReconciliationCandidates(
+	ctx context.Context, candidates []reconciliationCandidate,
+) error {
+	sources := make([]db.SessionSourcePath, 0, len(candidates))
+	for _, candidate := range candidates {
+		sources = append(sources, db.SessionSourcePath{
+			Agent:    string(candidate.Provider),
+			FilePath: e.effectiveSourcePath(candidate.Path),
+		})
+	}
+	if err := e.db.BaselineActiveSessionSourcePaths(ctx, e.machine, sources); err != nil {
+		return fmt.Errorf("baseline reconciliation source page: %w", err)
+	}
+	return nil
+}
+
+func (e *Engine) baselineDiscoveredFiles(
+	ctx context.Context, files []parser.DiscoveredFile, requirePresent bool,
+) error {
+	sources := make([]db.SessionSourcePath, 0, reconciliationPageSize)
+	flush := func() error {
+		if err := e.db.BaselineActiveSessionSourcePaths(
+			ctx, e.machine, sources,
+		); err != nil {
+			return err
+		}
+		sources = sources[:0]
+		return nil
+	}
+	for _, file := range files {
+		if requirePresent {
+			if _, err := e.lstatSource(
+				validatedProviderSourceStatPath(file.Path),
+			); err != nil {
+				continue
+			}
+		}
+		sources = append(sources, db.SessionSourcePath{
+			Agent: string(file.Agent), FilePath: e.effectiveSourcePath(file.Path),
+		})
+		if len(sources) == reconciliationPageSize {
+			if err := flush(); err != nil {
+				return fmt.Errorf("baseline discovered source page: %w", err)
+			}
+		}
+	}
+	if err := flush(); err != nil {
+		return fmt.Errorf("baseline discovered source page: %w", err)
+	}
+	return nil
+}
+
+func (e *Engine) streamReconciliationCandidates(
+	ctx context.Context, scope *rootSyncScope, spool reconciliationSpoolStore,
+) (
+	map[parser.AgentType]parser.Provider,
+	[]reconciliationProviderScope,
+	[]string,
+	int,
+	error,
+	error,
+) {
+	providers := make(map[parser.AgentType]parser.Provider)
+	var completedScopes []reconciliationProviderScope
+	var failedRoots []string
+	var failures int
+	var discoveryErr error
+	agents := make([]parser.AgentType, 0, len(e.providerFactories))
+	for agent := range e.providerFactories {
+		agents = append(agents, agent)
+	}
+	slices.SortFunc(agents, func(a, b parser.AgentType) int {
+		return strings.Compare(string(a), string(b))
+	})
+	for _, agent := range agents {
+		if e.providerMigrationModes[agent] != parser.ProviderMigrationProviderAuthoritative {
+			continue
+		}
+		roots := slices.DeleteFunc(append([]string(nil), e.agentDirs[agent]...), func(root string) bool {
+			return isRemoteReconciliationRoot(root) || !scope.includes(root)
+		})
+		if len(roots) == 0 {
+			continue
+		}
+		factory := e.providerFactories[agent]
+		if factory == nil {
+			continue
+		}
+		provider := factory.NewProvider(parser.ProviderConfig{
+			Roots: roots, Machine: e.machine, PathRewriter: e.pathRewriter,
+		})
+		providers[agent] = provider
+		if provider.Capabilities().Source.StreamingDiscovery != parser.CapabilitySupported {
+			failures++
+			failedRoots = append(failedRoots, roots...)
+			log.Printf("%s provider discovery: streaming discovery unsupported", agent)
+			continue
+		}
+		discoverer, ok := provider.(parser.StreamingDiscoverer)
+		if !ok {
+			failures++
+			failedRoots = append(failedRoots, roots...)
+			continue
+		}
+		watchRoots, err := parser.ResolveWatchRoots(ctx, provider)
+		if err != nil {
+			failures++
+			failedRoots = append(failedRoots, roots...)
+			discoveryErr = errors.Join(discoveryErr, fmt.Errorf(
+				"%s provider watch roots: %w", agent, err,
+			))
+			continue
+		}
+		var spoolErr error
+		err = discoverer.DiscoverEach(ctx, func(source parser.SourceRef) error {
+			candidate, ok := e.reconciliationCandidate(provider, source, roots, watchRoots)
+			if !ok {
+				return nil
+			}
+			spoolErr = spool.Add(ctx, candidate)
+			return spoolErr
+		})
+		if err != nil {
+			if spoolErr != nil {
+				return providers, completedScopes, failedRoots, failures, discoveryErr, spoolErr
+			}
+			if ctx.Err() != nil {
+				return providers, completedScopes, failedRoots, failures, discoveryErr, ctx.Err()
+			}
+			log.Printf("%s provider streaming discovery: %v", agent, err)
+			failures++
+			failedRoots = append(failedRoots, roots...)
+			discoveryErr = errors.Join(discoveryErr, fmt.Errorf(
+				"%s provider streaming discovery: %w", agent, err,
+			))
+			continue
+		}
+		completedScopes = append(completedScopes, reconciliationProviderScope{
+			agent: agent,
+			roots: append([]string(nil), roots...),
+		})
+	}
+	slices.Sort(failedRoots)
+	failedRoots = slices.Compact(failedRoots)
+	return providers, completedScopes, failedRoots, failures, discoveryErr, nil
+}
+
+type reconciliationProviderScope struct {
+	agent parser.AgentType
+	roots []string
+}
+
+type incompleteReconciliationError struct {
+	failures  int
+	roots     []string
+	completed []reconciliationProviderScope
+	cause     error
+}
+
+func (e *incompleteReconciliationError) Error() string {
+	return fmt.Sprintf(
+		"watch root reconciliation incomplete: %d provider discoveries failed",
+		e.failures,
+	)
+}
+
+func (e *incompleteReconciliationError) Unwrap() error { return e.cause }
+
+func (e *incompleteReconciliationError) ReconciliationRetryRoots() []string {
+	return append([]string(nil), e.roots...)
+}
+
+func (e *Engine) reconciliationCandidate(
+	provider parser.Provider, source parser.SourceRef, roots []string,
+	watchRoots []parser.WatchRoot,
+) (reconciliationCandidate, bool) {
+	path := providerDiscoveredPath(source)
+	if path == "" || isRemoteReconciliationRoot(path) {
+		return reconciliationCandidate{}, false
+	}
+	agent := source.Provider
+	if agent == "" {
+		agent = provider.Definition().Type
+	}
+	identity := reconciliationSourceIdentity(agent, source)
+	if identity == "" {
+		return reconciliationCandidate{}, false
+	}
+	root := reconciliationWatchRoot(path, watchRoots, roots)
+	preference1, preference2, preference3 := int64(0), int64(0), int64(0)
+	statPath := validatedProviderSourceStatPath(path)
+	if agent == parser.AgentClaude {
+		if info, err := os.Stat(statPath); err == nil {
+			preference1 = info.Size()
+			preference2 = info.ModTime().UnixNano()
+			fullID := applyIDPrefixToID(e.idPrefix, identity)
+			storedPath := e.db.GetSessionFilePath(fullID)
+			storedSize, storedMtime, stored := e.db.GetSessionFileInfo(fullID)
+			if stored && e.effectiveSourcePath(path) == storedPath &&
+				storedSize == info.Size() && storedMtime == info.ModTime().UnixNano() &&
+				e.db.GetSessionDataVersion(fullID) >= db.CurrentDataVersion() {
+				preference3 = 1
+			}
+		}
+	}
+	if agent == parser.AgentCodex && codexLayoutForPath(path) == parser.CodexLayoutDated {
+		preference1 = 1
+	}
+	if isOpenCodeFormatAgent(agent) {
+		if statPath == path {
+			preference1 = 1
+		}
+	} else if agent != parser.AgentClaude && agent != parser.AgentCodex {
+		for i, configured := range roots {
+			if samePathOrDescendant(statPath, configured) {
+				preference1 = int64(len(roots) - i)
+				break
+			}
+		}
+	}
+	if agent == parser.AgentOpenClaw || agent == parser.AgentQClaw {
+		preference2 = boolPreference(strings.HasSuffix(filepath.Base(path), ".jsonl"))
+		preference3 = source.DiscoveryMTimeNS
+	}
+	if agent == parser.AgentAntigravityCLI {
+		preference2 = boolPreference(strings.HasSuffix(path, ".db"))
+	}
+	return reconciliationCandidate{
+		Provider: agent, Identity: identity, Path: path,
+		StoredPath: canonicalReconciliationSourceIdentity(
+			e.effectiveSourcePath(path),
+		), MemberIdentity: source.ReconciliationIdentity, WatchRoot: root,
+		Project: source.ProjectHint, Preference1: preference1,
+		Preference2: preference2, Preference3: preference3,
+	}, true
+}
+
+func boolPreference(value bool) int64 {
+	if value {
+		return 1
+	}
+	return 0
+}
+
+func reconciliationSourceIdentity(agent parser.AgentType, source parser.SourceRef) string {
+	if agent == parser.AgentClaude {
+		return claudeSessionIDFromPath(providerDiscoveredPath(source))
+	}
+	if isOpenCodeFormatAgent(agent) {
+		path := providerDiscoveredPath(source)
+		if statPath := validatedProviderSourceStatPath(path); statPath != path {
+			_, sessionID, _ := parser.ParseVirtualSourcePath(path)
+			return sessionID
+		}
+		if strings.EqualFold(filepath.Ext(path), ".json") {
+			return strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+		}
+	}
+	for _, candidate := range []string{source.Key, source.FingerprintKey, source.DisplayPath} {
+		if candidate != "" {
+			return canonicalReconciliationSourceIdentity(candidate)
+		}
+	}
+	return ""
+}
+
+func isOpenCodeFormatAgent(agent parser.AgentType) bool {
+	switch agent {
+	case parser.AgentOpenCode, parser.AgentKilo, parser.AgentMiMoCode, parser.AgentIcodemate:
+		return true
+	default:
+		return false
+	}
+}
+
+func reconciliationWatchRoot(
+	path string, watchRoots []parser.WatchRoot, configuredRoots []string,
+) string {
+	statPath := validatedProviderSourceStatPath(path)
+	best := ""
+	for _, root := range watchRoots {
+		if samePathOrDescendant(statPath, root.Path) && len(root.Path) > len(best) {
+			best = root.Path
+		}
+	}
+	if best != "" {
+		return best
+	}
+	for _, root := range configuredRoots {
+		if samePathOrDescendant(statPath, root) && len(root) > len(best) {
+			best = root
+		}
+	}
+	return best
+}
+
+func (e *Engine) rehydrateReconciliationPage(
+	ctx context.Context, page []reconciliationCandidate,
+	providers map[parser.AgentType]parser.Provider, force bool,
+) ([]parser.DiscoveredFile, error) {
+	files := make([]parser.DiscoveredFile, 0, len(page))
+	for _, candidate := range page {
+		provider := providers[candidate.Provider]
+		if provider == nil {
+			return nil, fmt.Errorf("rehydrate %s source: provider unavailable", candidate.Provider)
+		}
+		if resolver, ok := provider.(parser.ReconciliationSourceResolver); ok {
+			source, found, err := resolver.SourceForReconciliation(
+				ctx, candidate.Path, candidate.Project,
+			)
+			if err != nil {
+				return nil, fmt.Errorf("rehydrate %s source %s: %w", candidate.Provider, candidate.Path, err)
+			}
+			if found && reconciliationSourceIdentity(candidate.Provider, source) == candidate.Identity {
+				files = append(files, parser.DiscoveredFile{
+					Path: candidate.Path, Project: source.ProjectHint,
+					Agent: candidate.Provider, ForceParse: force,
+					ProviderSource: &source, ProviderProcess: true,
+				})
+				continue
+			}
+		}
+		sources, err := provider.SourcesForChangedPath(ctx, parser.ChangedPathRequest{
+			Path: candidate.Path, EventKind: "write", WatchRoot: candidate.WatchRoot,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("rehydrate %s source %s: %w", candidate.Provider, candidate.Path, err)
+		}
+		var matched *parser.SourceRef
+		for i := range sources {
+			if reconciliationSourceIdentity(candidate.Provider, sources[i]) == candidate.Identity &&
+				sameReconciliationSourcePath(providerDiscoveredPath(sources[i]), candidate.Path) {
+				matched = &sources[i]
+				break
+			}
+		}
+		if matched == nil {
+			return nil, fmt.Errorf("rehydrate %s source %s: canonical source not found", candidate.Provider, candidate.Path)
+		}
+		source := *matched
+		files = append(files, parser.DiscoveredFile{
+			Path: candidate.Path, Project: source.ProjectHint,
+			Agent: candidate.Provider, ForceParse: force,
+			ProviderSource: &source, ProviderProcess: true,
+		})
+	}
+	return files, nil
+}
+
+func canonicalReconciliationSourceIdentity(value string) string {
+	if _, err := os.Lstat(value); err == nil || !os.IsNotExist(err) {
+		if looksLikeReconciliationPath(value) {
+			return canonicalReconciliationPath(value)
+		}
+		return value
+	}
+	container, member, virtual := parser.ParseVirtualSourcePath(value)
+	if virtual {
+		return canonicalReconciliationPath(container) + "#" + member
+	}
+	if looksLikeReconciliationPath(value) {
+		return canonicalReconciliationPath(value)
+	}
+	return value
+}
+
+// validatedProviderSourceStatPath resolves synthetic member syntax only after
+// an exact physical-path check failed. Callers use it exclusively for paths
+// emitted or reconstructed by a provider, which supplies the validation that a
+// provider-neutral '#' split cannot establish on its own.
+func validatedProviderSourceStatPath(value string) string {
+	if _, err := os.Lstat(value); err == nil || !os.IsNotExist(err) {
+		return value
+	}
+	if container, _, virtual := parser.ParseVirtualSourcePath(value); virtual {
+		return container
+	}
+	return value
+}
+
+func looksLikeReconciliationPath(value string) bool {
+	return filepath.IsAbs(value) || strings.ContainsAny(value, `/\`) || isWindowsPath(value)
+}
+
+func isWindowsPath(value string) bool {
+	return len(value) >= 3 && ((value[0] >= 'A' && value[0] <= 'Z') ||
+		(value[0] >= 'a' && value[0] <= 'z')) && value[1] == ':' &&
+		(value[2] == '\\' || value[2] == '/') || strings.HasPrefix(value, `\\`)
+}
+
+func canonicalReconciliationPath(value string) string {
+	if isWindowsPath(value) {
+		return strings.ToLower(pathpkg.Clean(strings.ReplaceAll(value, `\`, "/")))
+	}
+	return filepath.Clean(value)
+}
+
+func sameReconciliationSourcePath(left, right string) bool {
+	return canonicalReconciliationSourceIdentity(left) ==
+		canonicalReconciliationSourceIdentity(right)
+}
+
+func mergeReconciliationSyncStats(dst *SyncStats, src SyncStats) {
+	dst.TotalSessions += src.TotalSessions
+	dst.Synced += src.Synced
+	dst.Skipped += src.Skipped
+	dst.Failed += src.Failed
+	dst.filesOK += src.filesOK
+	dst.filesDiscovered += src.filesDiscovered
+	dst.nonContainerDiscovered += src.nonContainerDiscovered
+	dst.messagesIndexed += src.messagesIndexed
+	dst.parserExcludedFiles += src.parserExcludedFiles
+	dst.parserExcludedIDs = append(dst.parserExcludedIDs, src.parserExcludedIDs...)
+	dst.cwdFilteredSessions += src.cwdFilteredSessions
+	dst.cwdFilteredFiles += src.cwdFilteredFiles
+	dst.Aborted = dst.Aborted || src.Aborted
+}
+
+func (e *Engine) tombstoneMissingWatchSources(
+	ctx context.Context,
+	roots []string,
+) (int, error) {
+	e.syncMu.Lock()
+	deleted, err := e.tombstoneMissingWatchSourcesLocked(ctx, roots, nil)
+	e.syncMu.Unlock()
+	if deleted > 0 {
+		e.emit("sessions")
+	}
+	return deleted, err
+}
+
+func (e *Engine) tombstoneMissingWatchSourcesLocked(
+	ctx context.Context,
+	roots []string,
+	spool reconciliationSpoolStore,
+) (deleted int, retErr error) {
+	return e.tombstoneMissingWatchSourcesForAgentLocked(ctx, roots, "", spool)
+}
+
+func (e *Engine) tombstoneMissingWatchSourcesForAgentLocked(
+	ctx context.Context,
+	roots []string,
+	agentFilter parser.AgentType,
+	spool reconciliationSpoolStore,
+) (deleted int, retErr error) {
+	for agent, dirs := range e.agentDirs {
+		if agentFilter != "" && agent != agentFilter {
+			continue
+		}
+		var provider parser.Provider
+		var replacementIndex reconciliationSpoolStore
+		ownsReplacementIndex := false
+		allProviderRootsCovered := reconciliationCoversConfiguredRoots(roots, dirs)
+		if factory := e.providerFactories[agent]; factory != nil {
+			provider = factory.NewProvider(parser.ProviderConfig{
+				Roots: e.agentDirs[agent], Machine: e.machine,
+				PathRewriter: e.pathRewriter,
+			})
+		}
+		for _, root := range roots {
+			if !slices.ContainsFunc(dirs, func(dir string) bool {
+				return samePathOrDescendant(cleanRootPath(dir), cleanRootPath(root)) ||
+					samePathOrDescendant(cleanRootPath(root), cleanRootPath(dir))
+			}) {
+				continue
+			}
+			var cursor db.SessionSourceCursor
+			for {
+				if err := ctx.Err(); err != nil {
+					return deleted, err
+				}
+				page, err := e.db.ListActiveSessionSourceOwnershipPage(
+					ctx, e.machine, string(agent), root, cursor,
+				)
+				if err != nil {
+					return deleted, fmt.Errorf(
+						"list %s watch source ownership: %w", agent, err,
+					)
+				}
+				if len(page) == 0 {
+					break
+				}
+				missingByPath := make(map[string]bool, len(page))
+				for _, ownership := range page {
+					statPath := ownership.FilePath
+					persistentMemberContainerExists := false
+					missing, ok := missingByPath[statPath]
+					if !ok {
+						_, statErr := e.lstatSource(statPath)
+						missing = os.IsNotExist(statErr)
+						missingByPath[statPath] = missing
+					}
+					if !missing {
+						continue
+					}
+					if agent == parser.AgentClaude && provider != nil {
+						if replacementIndex == nil {
+							if spool != nil {
+								if !allProviderRootsCovered {
+									// A scoped pass cannot prove that a same-ID Claude
+									// replacement does not exist under another configured root.
+									continue
+								}
+								replacementIndex = spool
+							} else {
+								replacementIndex, err = e.buildReconciliationReplacementIndex(
+									ctx, provider, dirs,
+								)
+								if err != nil {
+									return deleted, fmt.Errorf(
+										"index %s reconciliation replacements: %w", agent, err,
+									)
+								}
+								ownsReplacementIndex = true
+								defer func() {
+									if ownsReplacementIndex {
+										retErr = errors.Join(
+											retErr, replacementIndex.CloseAndRemove(),
+										)
+									}
+								}()
+							}
+						}
+						identity := claudeSessionIDFromPath(ownership.FilePath)
+						replacement, found, lookupErr := replacementIndex.Candidate(
+							ctx, agent, identity,
+						)
+						if lookupErr != nil {
+							return deleted, fmt.Errorf(
+								"lookup %s reconciliation replacement: %w", agent, lookupErr,
+							)
+						}
+						if found && !sameReconciliationSourcePath(
+							replacement.Path, ownership.FilePath,
+						) {
+							continue
+						}
+					}
+					persistentArchive := provider != nil && provider.Capabilities().Source.PersistentArchive == parser.CapabilitySupported
+					if persistentArchive {
+						resolver, ok := provider.(parser.PersistentArchiveSourceResolver)
+						if ok {
+							physicalPath, valid := resolver.PersistentArchiveSource(
+								statPath, ownership.ID,
+							)
+							if valid {
+								if !allProviderRootsCovered {
+									// A scoped pass cannot prove that this member does not
+									// exist in a persistent container under another root.
+									continue
+								}
+								if _, statErr := e.lstatSource(physicalPath); statErr != nil {
+									// A vanished or unreadable persistent container cannot
+									// authoritatively prove that an archived member was deleted.
+									continue
+								}
+								if spool == nil {
+									continue
+								}
+								present, lookupErr := spool.ContainsSource(
+									ctx, agent,
+									canonicalReconciliationSourceIdentity(ownership.FilePath),
+								)
+								if lookupErr != nil {
+									return deleted, fmt.Errorf(
+										"lookup %s persistent member %s: %w",
+										agent, ownership.FilePath, lookupErr,
+									)
+								}
+								if present {
+									continue
+								}
+								persistentMemberContainerExists = true
+							}
+						}
+					} else if resolver, ok := provider.(parser.ReconciliationSourceResolver); ok {
+						source, found, err := resolver.SourceForReconciliation(
+							ctx, statPath, "",
+						)
+						if err != nil {
+							return deleted, fmt.Errorf(
+								"validate %s source %s during watch reconciliation: %w",
+								agent, statPath, err,
+							)
+						}
+						if found {
+							_, _, virtual := parser.ParseVirtualSourcePath(
+								providerDiscoveredPath(source),
+							)
+							if spool == nil || !virtual {
+								continue
+							}
+							identity := ""
+							identityResolver, resolvesIdentity := provider.(parser.ReconciliationMemberIdentityResolver)
+							if resolvesIdentity {
+								identity = identityResolver.ReconciliationMemberIdentity(
+									ownership.ID,
+								)
+							}
+							present, lookupErr := spool.ContainsSourceIdentity(
+								ctx, agent,
+								canonicalReconciliationSourceIdentity(ownership.FilePath),
+								identity,
+							)
+							if lookupErr != nil {
+								return deleted, fmt.Errorf(
+									"lookup %s virtual member %s: %w",
+									agent, ownership.FilePath, lookupErr,
+								)
+							}
+							if present {
+								continue
+							}
+						}
+					}
+					if !persistentMemberContainerExists {
+						missing, ok = missingByPath[statPath]
+						if !ok {
+							_, statErr := e.lstatSource(statPath)
+							missing = os.IsNotExist(statErr)
+							missingByPath[statPath] = missing
+						}
+						if !missing {
+							continue
+						}
+					}
+					changed, err := e.db.SoftDeleteSessionSourceOwnership(
+						ctx, ownership.Machine, ownership.Agent,
+						ownership.ID, ownership.FilePath,
+					)
+					if err != nil {
+						return deleted, fmt.Errorf(
+							"tombstone %s session %s after watch reconciliation: %w",
+							agent, ownership.ID, err,
+						)
+					}
+					if changed {
+						deleted++
+					}
+				}
+				cursor = page[len(page)-1].Cursor()
+				if len(page) < db.WatchReconcileSourcePageSize {
+					break
+				}
+			}
+		}
+	}
+	return deleted, nil
+}
+
+func reconciliationCoversConfiguredRoots(requested, configured []string) bool {
+	for _, configuredRoot := range configured {
+		if isRemoteReconciliationRoot(configuredRoot) ||
+			!slices.ContainsFunc(requested, func(requestedRoot string) bool {
+				return samePathOrDescendant(
+					cleanRootPath(configuredRoot), cleanRootPath(requestedRoot),
+				)
+			}) {
+			return false
+		}
+	}
+	return true
+}
+
+func (e *Engine) buildReconciliationReplacementIndex(
+	ctx context.Context, provider parser.Provider, configuredRoots []string,
+) (result reconciliationSpoolStore, retErr error) {
+	discoverer, ok := provider.(parser.StreamingDiscoverer)
+	if !ok || provider.Capabilities().Source.StreamingDiscovery != parser.CapabilitySupported {
+		return nil, errors.New("provider does not support streaming discovery")
+	}
+	watchRoots, err := parser.ResolveWatchRoots(ctx, provider)
+	if err != nil {
+		return nil, err
+	}
+	spool, err := e.reconciliationSpoolFactory(e.db.Path())
+	if err != nil {
+		return nil, err
+	}
+	keep := false
+	defer func() {
+		if !keep {
+			retErr = errors.Join(retErr, spool.CloseAndRemove())
+		}
+	}()
+	err = discoverer.DiscoverEach(ctx, func(source parser.SourceRef) error {
+		candidate, admitted := e.reconciliationCandidate(
+			provider, source, configuredRoots, watchRoots,
+		)
+		if !admitted {
+			return nil
+		}
+		return spool.Add(ctx, candidate)
+	})
+	if err != nil {
+		return nil, err
+	}
+	keep = true
+	return spool, nil
+}
+
+func (e *Engine) lstatSource(path string) (os.FileInfo, error) {
+	if e.lstat != nil {
+		return e.lstat(path)
+	}
+	return os.Lstat(path)
+}
+
+func (e *Engine) logicalRootsForWatchRoots(roots []string) []string {
+	var logical []string
+	for _, root := range roots {
+		cleanedRoot := cleanRootPath(root)
+		matched := false
+		for _, dirs := range e.agentDirs {
+			for _, dir := range dirs {
+				cleanedDir := cleanRootPath(dir)
+				if !samePathOrDescendant(cleanedRoot, cleanedDir) &&
+					!samePathOrDescendant(cleanedDir, cleanedRoot) {
+					continue
+				}
+				if !slices.Contains(logical, cleanedDir) {
+					logical = append(logical, cleanedDir)
+				}
+				matched = true
+			}
+		}
+		if !matched && !slices.Contains(logical, cleanedRoot) {
+			logical = append(logical, cleanedRoot)
+		}
+	}
+	return logical
+}
+
+// localReconciliationRoots expands a full watcher recovery to every configured
+// local root before tombstoning. Remote object roots are owned by the remote
+// sync path: local reconciliation neither enumerates nor tombstones them, and
+// reports the exclusion explicitly in its result metrics.
+func (e *Engine) localReconciliationRoots(
+	roots []string, full bool,
+) ([]string, int) {
+	requested := append([]string(nil), roots...)
+	if full {
+		requested = requested[:0]
+		for _, dirs := range e.agentDirs {
+			requested = append(requested, dirs...)
+		}
+	}
+	local := make([]string, 0, len(requested))
+	remote := make(map[string]struct{})
+	for _, root := range requested {
+		if isRemoteReconciliationRoot(root) {
+			remote[root] = struct{}{}
+			continue
+		}
+		local = append(local, root)
+	}
+	return e.logicalRootsForWatchRoots(local), len(remote)
+}
+
+func isRemoteReconciliationRoot(root string) bool {
+	return strings.HasPrefix(strings.ToLower(root), "s3://")
 }
 
 // SyncAllSince syncs only files whose mtime is at or after
@@ -2552,13 +3888,6 @@ func (e *Engine) syncAllLocked(
 	)
 
 	progressTotal := len(all)
-	tDBCount := time.Now()
-	dbBackedCount := e.countDBBackedSessions(ctx, scope)
-	progressTotal += dbBackedCount
-	log.Printf(
-		"counted %d db-backed sessions in %s",
-		dbBackedCount, time.Since(tDBCount).Round(time.Millisecond),
-	)
 	e.reportProgress(onProgress, Progress{
 		Phase:         PhaseSyncing,
 		SessionsTotal: progressTotal,
@@ -2576,6 +3905,7 @@ func (e *Engine) syncAllLocked(
 	stats = e.collectAndBatch(
 		ctx, results, len(all), progressTotal, onProgress, writeMode,
 	)
+	stats.providerFailures = providerFailures
 	for range providerFailures {
 		stats.RecordFailed()
 	}
@@ -2621,14 +3951,14 @@ func (e *Engine) syncAllLocked(
 		MessagesIndexed: stats.messagesIndexed,
 	}
 
-	advanceDBProgress := func(total int, pending []pendingWrite) {
+	advanceDBProgress := func(total, indexedMessages int) {
 		if total == 0 {
 			return
 		}
+		progressTotal += total
+		dbProgress.SessionsTotal = progressTotal
 		dbProgress.SessionsDone += total
-		for _, pw := range pending {
-			dbProgress.MessagesIndexed += len(pw.msgs)
-		}
+		dbProgress.MessagesIndexed += indexedMessages
 		stats.messagesIndexed = dbProgress.MessagesIndexed
 		e.reportProgress(onProgress, dbProgress)
 	}
@@ -2682,6 +4012,13 @@ func (e *Engine) syncAllLocked(
 			return stats
 		}
 	}
+	if !stats.Aborted && ctx.Err() == nil &&
+		stats.Failed == 0 && providerFailures == 0 {
+		if err := e.baselineDiscoveredFiles(ctx, all, false); err != nil {
+			stats.RecordFailed()
+			log.Printf("full-sync source baseline: %v", err)
+		}
+	}
 
 	// Link subagent child sessions to their parents after all DB-backed
 	// agent writes (including provider-authoritative Forge, Piebald, and ZCode).
@@ -2720,7 +4057,7 @@ func (e *Engine) syncAllLocked(
 	e.lastSyncStats = persisted
 	e.mu.Unlock()
 
-	if recordSyncState && providerFailures == 0 {
+	if recordSyncState && stats.providerFailures == 0 {
 		e.recordSyncFinished()
 	}
 	// Emission happens in SyncAll / SyncAllSince after syncMu is
@@ -2778,6 +4115,12 @@ func (e *Engine) discoverProviderSources(
 			Roots:   filteredRoots,
 			Machine: e.machine,
 		})
+		// Shared-database providers are streamed source-by-source by their
+		// dedicated sync phase. Calling Discover here would build an archive-sized
+		// slice only to discard it, then traverse the same database again.
+		if processFileUsesProvider(agentType) {
+			continue
+		}
 		tDiscover := time.Now()
 		sources, err := provider.Discover(ctx)
 		// Log only providers whose discovery is slow enough to matter, so a
@@ -2807,16 +4150,6 @@ func (e *Engine) discoverProviderSources(
 		forceParseSource := func(sourcePath string) bool {
 			_, ok := forceParseSources[filepath.Clean(sourcePath)]
 			return ok
-		}
-		// Forge, Piebald, Warp, and ZCode are DB-backed providers: a shared SQLite
-		// DB hosts every session. Full-sync change detection and counting
-		// run through their dedicated provider-driven DB sync phase
-		// (syncProviderDBBacked), not the per-source discovery list, so a
-		// full sync re-counts only changed sessions exactly as the legacy
-		// path did. The watcher path still classifies their changes through
-		// classifyProviderChangedPath.
-		if processFileUsesProvider(agentType) {
-			continue
 		}
 		def := provider.Definition()
 		for _, source := range sources {
@@ -2881,13 +4214,15 @@ func (e *Engine) visualStudioCopilotMissingVS2026PollSources(
 	roots []string,
 	currentSources map[string]struct{},
 ) ([]parser.SourceRef, map[string]struct{}) {
-	watchRoots := providerChangedPathWatchRoots(ctx, provider, roots)
+	watchRoots := e.providerChangedPathWatchRoots(
+		ctx, parser.AgentVSCopilot, provider, roots,
+	)
 	var out []parser.SourceRef
 	seenHints := make(map[string]struct{})
 	forceParseSources := make(map[string]struct{})
 	for _, watchRoot := range watchRoots {
 		hints, err := e.db.ListStoredSourcePathHints(
-			string(parser.AgentVSCopilot), []string{watchRoot},
+			string(parser.AgentVSCopilot), []db.StoredSourcePathHintScope{{Path: watchRoot}},
 		)
 		if err != nil {
 			log.Printf(
@@ -3609,76 +4944,15 @@ func shelleyDBCompositeMtime(dbPath string) (int64, error) {
 	return maxMtime, nil
 }
 
-func (e *Engine) countDBBackedProgressTotal(
-	agent parser.AgentType, scope *rootSyncScope,
-) int {
-	if processFileUsesProvider(agent) {
-		return e.countProviderDBBackedSessions(
-			context.Background(), agent, scope,
-		)
-	}
-	return 0
-}
-
-// countProviderDBBackedSessions counts every session a DB-backed provider
-// (Forge, Piebald, Warp) currently exposes, via provider discovery. It feeds
-// the progress total so the DB-backed family contributes the same fixed count
-// the legacy countOne*Sessions helpers did.
-func (e *Engine) countProviderDBBackedSessions(
-	ctx context.Context, agent parser.AgentType, scope *rootSyncScope,
-) int {
-	roots := make([]string, 0, len(e.agentDirs[agent]))
-	for _, dir := range e.agentDirs[agent] {
-		if dir == "" || !scope.includes(dir) {
-			continue
-		}
-		roots = append(roots, dir)
-	}
-	if len(roots) == 0 {
-		return 0
-	}
-	factory, ok := e.providerFactories[agent]
-	if !ok || factory == nil {
-		return 0
-	}
-	provider := factory.NewProvider(parser.ProviderConfig{
-		Roots:   roots,
-		Machine: e.machine,
-	})
-	sources, err := provider.Discover(ctx)
-	if err != nil {
-		log.Printf("%s provider session count: %v", agent, err)
-		return 0
-	}
-	return len(sources)
-}
-
-func (e *Engine) countDBBackedSessions(
-	ctx context.Context, scope *rootSyncScope,
-) int {
-	if ctx.Err() != nil {
-		return 0
-	}
-	total := 0
-	for _, agent := range []parser.AgentType{
-		parser.AgentWarp,
-		parser.AgentForge,
-		parser.AgentPiebald,
-		parser.AgentZCode,
-	} {
-		total += e.countDBBackedProgressTotal(agent, scope)
-	}
-	return total
-}
-
 // syncProviderDBBacked enumerates a DB-backed provider's sources, parses only
-// the changed ones through the provider facade, and returns their pending
-// writes. Change detection compares the provider fingerprint mtime against the
-// stored source mtime and requires the stored data version to be current,
-// reproducing the legacy *PendingSessionIDs behavior.
+// the changed ones through the provider facade, and flushes each source before
+// parsing the next. Change detection compares the provider fingerprint mtime
+// against the stored source mtime and requires the stored data version to be
+// current, reproducing the legacy *PendingSessionIDs behavior.
 func (e *Engine) syncProviderDBBacked(
 	ctx context.Context, agent parser.AgentType, scope *rootSyncScope,
-) []pendingWrite {
+	flush func([]pendingWrite),
+) (int, error) {
 	roots := make([]string, 0, len(e.agentDirs[agent]))
 	for _, dir := range e.agentDirs[agent] {
 		if dir == "" || !scope.includes(dir) {
@@ -3687,34 +4961,60 @@ func (e *Engine) syncProviderDBBacked(
 		roots = append(roots, dir)
 	}
 	if len(roots) == 0 {
-		return nil
+		return 0, nil
 	}
 	factory, ok := e.providerFactories[agent]
 	if !ok || factory == nil {
-		return nil
+		return 0, nil
 	}
 	provider := factory.NewProvider(parser.ProviderConfig{
 		Roots:   roots,
 		Machine: e.machine,
 	})
-	sources, err := provider.Discover(ctx)
-	if err != nil {
-		log.Printf("sync %s: %v", agent, err)
+	discoverer, ok := provider.(parser.StreamingDiscoverer)
+	if !ok || provider.Capabilities().Source.StreamingDiscovery != parser.CapabilitySupported {
+		return 0, fmt.Errorf("sync %s: provider lacks streaming discovery", agent)
+	}
+	baselines := make([]db.SessionSourcePath, 0, reconciliationPageSize)
+	flushBaselines := func() error {
+		if len(baselines) == 0 {
+			return nil
+		}
+		if err := e.db.BaselineActiveSessionSourcePaths(
+			ctx, e.machine, baselines,
+		); err != nil {
+			return fmt.Errorf("baseline %s streaming sources: %w", agent, err)
+		}
+		baselines = baselines[:0]
+		return nil
+	}
+	queueBaseline := func(source parser.SourceRef) error {
+		path := providerDiscoveredPath(source)
+		if path == "" {
+			return nil
+		}
+		baselines = append(baselines, db.SessionSourcePath{
+			Agent: string(agent), FilePath: e.effectiveSourcePath(path),
+		})
+		if len(baselines) == reconciliationPageSize {
+			return flushBaselines()
+		}
 		return nil
 	}
 
-	var pending []pendingWrite
-	for _, source := range sources {
-		if ctx.Err() != nil {
-			break
-		}
+	discovered := 0
+	err := discoverer.DiscoverEach(ctx, func(source parser.SourceRef) (retErr error) {
+		discovered++
+		defer func() {
+			retErr = errors.Join(retErr, queueBaseline(source))
+		}()
 		fingerprint, err := provider.Fingerprint(ctx, source)
 		if err != nil {
 			log.Printf("sync %s fingerprint: %v", agent, err)
-			continue
+			return nil
 		}
 		if e.providerDBBackedSourceFresh(source, fingerprint) {
-			continue
+			return nil
 		}
 		outcome, err := provider.Parse(ctx, parser.ParseRequest{
 			Source:      source,
@@ -3723,8 +5023,9 @@ func (e *Engine) syncProviderDBBacked(
 		})
 		if err != nil {
 			log.Printf("sync %s parse: %v", agent, err)
-			continue
+			return nil
 		}
+		pending := make([]pendingWrite, 0, len(outcome.Results))
 		for _, result := range outcome.Results {
 			pending = append(pending, pendingWrite{
 				sess:        result.Result.Session,
@@ -3732,8 +5033,20 @@ func (e *Engine) syncProviderDBBacked(
 				usageEvents: result.Result.UsageEvents,
 			})
 		}
+		if len(pending) > 0 {
+			flush(pending)
+		}
+		return ctx.Err()
+	})
+	if err != nil {
+		log.Printf("sync %s: %v", agent, err)
+		return discovered, err
 	}
-	return pending
+	if err := flushBaselines(); err != nil {
+		log.Printf("sync %s: %v", agent, err)
+		return discovered, err
+	}
+	return discovered, nil
 }
 
 // providerDBBackedSourceFresh reports whether a DB-backed provider source is
@@ -3786,55 +5099,68 @@ func (e *Engine) syncProviderDBBackedAgent(
 	ctx context.Context, agent parser.AgentType, label string,
 	writeMode syncWriteMode, verbose bool, scope *rootSyncScope,
 	stats *SyncStats,
-	advanceDBProgress func(total int, pending []pendingWrite),
+	advanceDBProgress func(total, indexedMessages int),
 ) bool {
 	start := time.Now()
-	pending := e.syncProviderDBBacked(ctx, agent, scope)
 	useWorktreeResolver := agent != parser.AgentPiebald
-	if len(pending) > 0 {
-		stats.TotalSessions += len(pending)
+	resolveWorktreeProject := e.loadWorktreeProjectResolver()
+	var pendingCount, indexedMessages, written int
+	var writeDuration time.Duration
+	flush := func(pending []pendingWrite) {
+		pendingCount += len(pending)
+		for _, pw := range pending {
+			indexedMessages += len(pw.msgs)
+		}
 		tWrite := time.Now()
-		var written int
 		if writeMode == syncWriteBulk {
-			var failedWrites, cwdFiltered int
-			written, _, failedWrites, cwdFiltered = e.writeBatch(
+			writeBatch := e.writeBatch
+			if e.writeBatchOverride != nil {
+				writeBatch = e.writeBatchOverride
+			}
+			batchWritten, _, failedWrites, cwdFiltered := writeBatch(
 				pending, writeMode, true,
 			)
+			written += batchWritten
 			for range failedWrites {
 				stats.RecordFailed()
 			}
 			stats.cwdFilteredSessions += cwdFiltered
 		} else {
-			resolveWorktreeProject := e.loadWorktreeProjectResolver()
 			for _, pw := range pending {
 				if ctx.Err() != nil {
 					break
 				}
 				var err error
 				if useWorktreeResolver {
-					err = e.writeSessionFullWithResolver(
-						pw, resolveWorktreeProject,
-					)
+					err = e.writeSessionFullWithResolver(pw, resolveWorktreeProject)
 				} else {
 					err = e.writeSessionFull(pw)
 				}
 				switch {
 				case err == nil:
 					written++
-				case isIntentionalSessionSkip(err),
-					errors.Is(err, errSessionPreserved):
+				case isIntentionalSessionSkip(err), errors.Is(err, errSessionPreserved):
 					// Intentional skip, not a failure.
 				default:
 					stats.RecordFailed()
 				}
 			}
 		}
+		writeDuration += time.Since(tWrite)
+	}
+	discovered, discoveryErr := e.syncProviderDBBacked(ctx, agent, scope, flush)
+	if discoveryErr != nil {
+		stats.providerFailures++
+		stats.RecordFailed()
+	}
+	if pendingCount > 0 {
+		stats.TotalSessions += pendingCount
 		stats.RecordSynced(written)
 		if verbose {
 			log.Printf(
 				"%s write: %d sessions in %s",
-				label, len(pending),
-				time.Since(tWrite).Round(time.Millisecond),
+				label, pendingCount,
+				writeDuration.Round(time.Millisecond),
 			)
 		}
 	}
@@ -3844,7 +5170,7 @@ func (e *Engine) syncProviderDBBackedAgent(
 			label, time.Since(start).Round(time.Millisecond),
 		)
 	}
-	advanceDBProgress(e.countDBBackedProgressTotal(agent, scope), pending)
+	advanceDBProgress(discovered, indexedMessages)
 	return ctx.Err() != nil
 }
 
@@ -3856,29 +5182,38 @@ func (e *Engine) startWorkers(
 	ctx context.Context,
 	files []parser.DiscoveredFile,
 ) <-chan syncJob {
-	workers := min(max(runtime.NumCPU(), 2), maxWorkers)
+	workers := e.workerCount()
 	buffer := max(workers*2, 1)
 
 	jobs := make(chan parser.DiscoveredFile, buffer)
 	results := make(chan syncJob, buffer)
+	runtimeMetrics := reconciliationRuntimeMetricsFor(ctx)
+	emitResult := func(result syncJob) {
+		if runtimeMetrics != nil {
+			runtimeMetrics.workerQueued(1)
+		}
+		results <- result
+	}
 
 	var wg gosync.WaitGroup
 	for range workers {
 		wg.Go(func() {
 			for file := range jobs {
 				if ctx.Err() != nil {
-					results <- syncJob{
+					emitResult(syncJob{
 						processResult: processResult{
 							err: ctx.Err(),
 						},
 						path: file.Path,
-					}
+					})
 					continue
 				}
-				results <- syncJob{
-					processResult: e.processFile(ctx, file),
-					path:          file.Path,
-				}
+				result, lease := e.processFileWithRetention(ctx, file)
+				emitResult(syncJob{
+					processResult:  result,
+					path:           file.Path,
+					retentionLease: lease,
+				})
 			}
 		})
 	}
@@ -3892,6 +5227,23 @@ func (e *Engine) startWorkers(
 		close(results)
 	}()
 	return results
+}
+
+func (e *Engine) retentionBudget() *parseRetentionBudget {
+	e.parseRetentionOnce.Do(func() {
+		if e.parseRetentionBudget == nil {
+			e.parseRetentionBudget = newParseRetentionBudget(defaultParseRetentionBytes)
+		}
+	})
+	return e.parseRetentionBudget
+}
+
+func (e *Engine) workerCount() int {
+	workers := runtime.NumCPU()
+	if e.workerCountOverride > 0 {
+		workers = e.workerCountOverride
+	}
+	return min(max(workers, 2), maxWorkers)
 }
 
 // collectAndBatch drains the results channel, batches
@@ -3917,15 +5269,65 @@ func (e *Engine) collectAndBatch(
 	}
 
 	var pending []pendingWrite
+	var pendingLeases []*parseRetentionLease
+	runtimeMetrics := reconciliationRuntimeMetricsFor(ctx)
+	flushPending := func() {
+		if len(pending) == 0 {
+			return
+		}
+		func() {
+			defer releaseParseRetentionLeases(pendingLeases)
+			writeBatch := e.writeBatch
+			if e.writeBatchOverride != nil {
+				writeBatch = e.writeBatchOverride
+			}
+			writtenSessions, writtenMessages, failedWrites, cwdFiltered :=
+				writeBatch(pending, writeMode, false)
+			if err := e.baselinePendingWriteSources(ctx, pending); err != nil {
+				log.Printf("baseline parsed session sources: %v", err)
+				failedWrites++
+			}
+			stats.RecordSynced(writtenSessions)
+			for range failedWrites {
+				stats.RecordFailed()
+			}
+			if failedWrites > 0 {
+				e.poisonSQLiteContainerPass()
+			}
+			e.promoteOpenCodeStorageTrustAfterWrite(
+				pending, writtenSessions, failedWrites, cwdFiltered,
+			)
+			stats.cwdFilteredSessions += cwdFiltered
+			progress.MessagesIndexed += writtenMessages
+			stats.messagesIndexed = progress.MessagesIndexed
+		}()
+		pending = pending[:0]
+		pendingLeases = pendingLeases[:0]
+	}
 
+	budget := e.retentionBudget()
+	defer budget.scavengeIfNeeded()
 	for i := range total {
 		var r syncJob
-		select {
-		case <-ctx.Done():
-			stats.Aborted = true
-			drainResults(results, total-i)
-			goto flush
-		case r = <-results:
+		for {
+			var pressure <-chan struct{}
+			if len(pending) > 0 {
+				pressure = budget.pressureSignal()
+			}
+			select {
+			case <-ctx.Done():
+				stats.Aborted = true
+				drainResults(results, total-i)
+				goto flush
+			case <-pressure:
+				flushPending()
+				continue
+			case r = <-results:
+				if runtimeMetrics != nil {
+					runtimeMetrics.workerQueued(-1)
+				}
+			}
+			break
 		}
 
 		if r.err != nil {
@@ -3934,6 +5336,7 @@ func (e *Engine) collectAndBatch(
 			// ctx.Done() branch above.
 			if ctx.Err() != nil {
 				stats.Aborted = true
+				r.releaseRetention()
 				drainResults(results, total-i-1)
 				goto flush
 			}
@@ -3943,6 +5346,7 @@ func (e *Engine) collectAndBatch(
 				e.cacheSkip(r.skipCacheKey(), r.mtime, r.sourceFingerprint)
 			}
 			log.Printf("sync error: %v", r.err)
+			r.releaseRetention()
 			continue
 		}
 		if r.skip {
@@ -3953,7 +5357,11 @@ func (e *Engine) collectAndBatch(
 			e.noteSQLiteContainerResult(r.path, true)
 			progress.SessionsDone++
 			e.reportProgress(onProgress, progress)
+			r.releaseRetention()
 			continue
+		}
+		for range r.providerFailureCount {
+			stats.RecordFailed()
 		}
 		excludedSessionIDs := e.applyIDPrefixToSessionIDs(
 			r.excludedSessionIDs,
@@ -3975,6 +5383,7 @@ func (e *Engine) collectAndBatch(
 				log.Printf("delete parser-excluded sessions: %v", err)
 				stats.RecordFailed()
 				e.noteSQLiteContainerResult(r.path, false)
+				r.releaseRetention()
 				continue
 			}
 			stats.parserExcludedIDs = append(
@@ -3993,6 +5402,7 @@ func (e *Engine) collectAndBatch(
 			e.noteSQLiteContainerResult(r.path, true)
 			progress.SessionsDone++
 			e.reportProgress(onProgress, progress)
+			r.releaseRetention()
 			continue
 		}
 		if r.cacheSkip {
@@ -4022,6 +5432,7 @@ func (e *Engine) collectAndBatch(
 			stats.cwdFilteredFiles++
 			progress.SessionsDone++
 			e.reportProgress(onProgress, progress)
+			r.releaseRetention()
 			continue
 		}
 
@@ -4029,6 +5440,7 @@ func (e *Engine) collectAndBatch(
 			if err := e.writeIncremental(r.incremental); err != nil {
 				log.Printf("%v", err)
 				stats.RecordFailed()
+				r.releaseRetention()
 				continue
 			}
 			stats.RecordSynced(1)
@@ -4036,6 +5448,7 @@ func (e *Engine) collectAndBatch(
 				r.incremental.msgs,
 			)
 			stats.messagesIndexed = progress.MessagesIndexed
+			r.releaseRetention()
 		} else {
 			for _, pr := range allowed {
 				pending = append(pending, pendingWrite{
@@ -4048,6 +5461,16 @@ func (e *Engine) collectAndBatch(
 					storageTrustState: r.storageTrustState,
 					storageTrustSnap:  r.storageTrustSnap,
 				})
+				if runtimeMetrics != nil {
+					runtimeMetrics.pendingWrites(len(pending))
+				}
+			}
+			if r.retentionLease != nil {
+				pendingLeases = append(pendingLeases, r.retentionLease)
+				r.retentionLease = nil
+			}
+			if len(pending) >= batchSize || budget.underPressure() {
+				flushPending()
 			}
 			// A Kiro SQLite store is discovered as one container source
 			// but fans out into one session per row, so `total` counted it
@@ -4063,55 +5486,21 @@ func (e *Engine) collectAndBatch(
 			}
 		}
 
-		if len(pending) >= batchSize {
-			writtenSessions, writtenMessages, failedWrites, cwdFiltered :=
-				e.writeBatch(pending, writeMode, false)
-			stats.RecordSynced(writtenSessions)
-			for range failedWrites {
-				stats.RecordFailed()
-			}
-			// Batch write failures cannot be attributed to individual
-			// sessions, so they block every container promotion this pass.
-			if failedWrites > 0 {
-				e.poisonSQLiteContainerPass()
-			}
-			e.promoteOpenCodeStorageTrustAfterWrite(
-				pending, writtenSessions, failedWrites, cwdFiltered,
-			)
-			stats.cwdFilteredSessions += cwdFiltered
-			progress.MessagesIndexed += writtenMessages
-			stats.messagesIndexed = progress.MessagesIndexed
-			pending = pending[:0]
-		}
-
 		progress.SessionsDone++
 		e.reportProgress(onProgress, progress)
 	}
 
 flush:
-	if len(pending) > 0 {
-		writtenSessions, writtenMessages, failedWrites, cwdFiltered :=
-			e.writeBatch(pending, writeMode, false)
-		stats.RecordSynced(writtenSessions)
-		for range failedWrites {
-			stats.RecordFailed()
-		}
-		if failedWrites > 0 {
-			e.poisonSQLiteContainerPass()
-		}
-		e.promoteOpenCodeStorageTrustAfterWrite(
-			pending, writtenSessions, failedWrites, cwdFiltered,
-		)
-		stats.cwdFilteredSessions += cwdFiltered
-		progress.MessagesIndexed += writtenMessages
-		stats.messagesIndexed = progress.MessagesIndexed
-	}
+	flushPending()
 
 	// Link subagent child sessions to their parents via
 	// tool_calls.subagent_session_id references. Run once
 	// after all batches to avoid repeated full-table scans.
-	if err := e.db.LinkSubagentSessions(); err != nil {
-		log.Printf("link subagent sessions: %v", err)
+	if deferred, _ := ctx.Value(deferGlobalLinkContextKey{}).(bool); !deferred {
+		if err := e.linkSubagentSessions(ctx); err != nil {
+			log.Printf("link subagent sessions: %v", err)
+			stats.RecordFailed()
+		}
 	}
 
 	// PhaseDone is emitted by syncAllLocked after DB-backed
@@ -4119,11 +5508,56 @@ flush:
 	return stats
 }
 
+func (e *Engine) baselinePendingWriteSources(
+	ctx context.Context, pending []pendingWrite,
+) error {
+	sources := make([]db.SessionSourcePath, 0, reconciliationPageSize)
+	seen := make(map[db.SessionSourcePath]struct{}, reconciliationPageSize)
+	flush := func() error {
+		if err := e.db.BaselineActiveSessionSourcePaths(
+			ctx, e.machine, sources,
+		); err != nil {
+			return fmt.Errorf("baseline parsed source batch: %w", err)
+		}
+		sources = sources[:0]
+		clear(seen)
+		return nil
+	}
+	for _, write := range pending {
+		path := e.effectiveSourcePath(write.sess.File.Path)
+		source := db.SessionSourcePath{
+			Agent: string(write.sess.Agent), FilePath: path,
+		}
+		if source.Agent == "" || source.FilePath == "" {
+			continue
+		}
+		if _, duplicate := seen[source]; duplicate {
+			continue
+		}
+		seen[source] = struct{}{}
+		sources = append(sources, source)
+		if len(sources) == reconciliationPageSize {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+	}
+	return flush()
+}
+
+func (e *Engine) linkSubagentSessions(ctx context.Context) error {
+	if runtimeMetrics := reconciliationRuntimeMetricsFor(ctx); runtimeMetrics != nil {
+		runtimeMetrics.globalLinkPass()
+	}
+	return e.db.LinkSubagentSessions()
+}
+
 // drainResults consumes remaining items from the results
 // channel so that worker goroutines can exit and be collected.
 func drainResults(results <-chan syncJob, remaining int) {
 	for range remaining {
-		<-results
+		job := <-results
+		job.releaseRetention()
 	}
 }
 
@@ -4201,6 +5635,10 @@ type processResult struct {
 	// suppressPresenceSweep marks an incomplete source result where
 	// missing stored sessions are expected rather than parser drift.
 	suppressPresenceSweep bool
+	// providerFailureCount carries non-fatal partial outcome failures through
+	// valid partial writes. Reconciliation may persist the valid results, but
+	// must not acknowledge the pass as complete.
+	providerFailureCount int
 	// storageTrustPath/State/Snap carry an OpenCode-family storage
 	// session's pre-parse stat signature and invalidation snapshot to
 	// the write path, which promotes it once the session's batch is
@@ -4296,6 +5734,17 @@ func (e *Engine) processFile(
 	return res
 }
 
+func (e *Engine) processFileWithRetention(
+	ctx context.Context,
+	file parser.DiscoveredFile,
+) (processResult, *parseRetentionLease) {
+	lease, err := e.retentionBudget().acquire(ctx, parseRetentionSourceBytes(file))
+	if err != nil {
+		return processResult{err: err}, nil
+	}
+	return e.processFile(ctx, file), lease
+}
+
 func (e *Engine) shouldUseCachedSkip(
 	file parser.DiscoveredFile, mtime int64, sourceFingerprint string,
 ) bool {
@@ -4371,17 +5820,6 @@ func (e *Engine) processProviderFile(
 	// per-session fingerprint (a DB open per source) and parse.
 	if e.sqliteContainerSourceFresh(file) {
 		return processResult{skip: true}, true
-	}
-
-	// Processing a file-backed storage session makes (or confirms) the
-	// storage copy as the archive's canonical content for its ID, so a
-	// same-ID SQLite row in this root's container is no longer backed by
-	// what its trusted membership verified. Drop it so a storage copy
-	// that appears and disappears entirely between full passes still
-	// forces the re-exposed row to re-verify (see
-	// dropTrustedSQLiteContainerSessionForStorage).
-	if sessionPath := e.openCodeStorageSessionPath(file); sessionPath != "" {
-		e.dropTrustedSQLiteContainerSessionForStorage(file.Agent, sessionPath)
 	}
 
 	// OpenCode-family file-backed storage gate: when the session's
@@ -4496,7 +5934,7 @@ func (e *Engine) processProviderFile(
 			errors.Is(err, os.ErrNotExist) {
 			return processResult{
 				excludedSessionIDs: e.providerSourceSessionIDsForForceReplace(
-					file.Agent,
+					provider,
 					source,
 				),
 				forceReplace: true,
@@ -4606,6 +6044,11 @@ func (e *Engine) processProviderFile(
 		}, true
 	}
 
+	if runtimeMetrics := reconciliationRuntimeMetricsFor(ctx); runtimeMetrics != nil {
+		if _, _, ok := sqliteContainerSourceForFile(file); ok {
+			runtimeMetrics.openCodeSQLiteParse()
+		}
+	}
 	outcome, err := provider.Parse(ctx, parser.ParseRequest{
 		Source:      source,
 		Fingerprint: fingerprint,
@@ -4642,7 +6085,7 @@ func (e *Engine) processProviderFile(
 		if outcome.ForceReplace && outcome.ResultSetComplete {
 			excludedSessionIDs = append(
 				excludedSessionIDs,
-				e.providerSourceSessionIDsForForceReplace(file.Agent, source)...,
+				e.providerSourceSessionIDsForForceReplace(provider, source)...,
 			)
 		}
 		return processResult{
@@ -4667,6 +6110,10 @@ func (e *Engine) processProviderFile(
 		noCacheSkip:           !cleanCache,
 		forceReplace:          outcome.ForceReplace || incForceReplace,
 		suppressPresenceSweep: !outcome.ResultSetComplete,
+		providerFailureCount:  len(outcome.SourceErrors),
+	}
+	if !outcome.ResultSetComplete {
+		res.providerFailureCount++
 	}
 	// Incremental-append providers (Claude and Codex) need the stored file
 	// identity so a later sync can detect an atomic file replacement
@@ -4680,6 +6127,7 @@ func (e *Engine) processProviderFile(
 				res.retrySessionIDs = make(map[string]bool)
 			}
 			res.retrySessionIDs[result.Result.Session.ID] = true
+			res.providerFailureCount++
 		}
 	}
 	if e.forceParse || file.ForceParse {
@@ -4775,9 +6223,10 @@ func (e *Engine) dropUnchangedSharedSQLiteResults(
 }
 
 func (e *Engine) providerSourceSessionIDsForForceReplace(
-	agent parser.AgentType,
+	provider parser.Provider,
 	source parser.SourceRef,
 ) []string {
+	agent := provider.Definition().Type
 	root := ""
 	for _, candidate := range []string{source.DisplayPath, source.FingerprintKey, source.Key} {
 		if candidate != "" {
@@ -4788,10 +6237,20 @@ func (e *Engine) providerSourceSessionIDsForForceReplace(
 	if root == "" {
 		return nil
 	}
-	if e.pathRewriter != nil {
-		root = e.pathRewriter(root)
+	scopes := []parser.StoredSourceHintScope{{Path: root}}
+	if resolver, ok := provider.(parser.StoredSourceHintScopeProvider); ok {
+		if resolved := resolver.StoredSourceHintScopes(parser.ChangedPathRequest{Path: root}); len(resolved) > 0 {
+			scopes = resolved
+		}
 	}
-	sourcePaths, err := e.db.ListStoredSourcePathHints(string(agent), []string{root})
+	if e.pathRewriter != nil {
+		for i := range scopes {
+			scopes[i].Path = e.pathRewriter(scopes[i].Path)
+		}
+	}
+	sourcePaths, err := e.db.ListStoredSourcePathHints(
+		string(agent), storedSourceDBHintScopes(scopes),
+	)
 	if err != nil {
 		log.Printf("list provider force-replace source hints: %v", err)
 		return nil
@@ -5556,6 +7015,14 @@ func (e *Engine) providerSingleSessionFresh(
 	if e.pathRewriter != nil {
 		lookupPath = e.pathRewriter(path)
 	}
+	fullID := applyIDPrefixToID(e.idPrefix, sessionID)
+	if e.db.GetSessionFilePath(fullID) != lookupPath {
+		// A directory rename can preserve size, mtime, inode, and content.
+		// Freshness by session ID alone would keep the vanished source path
+		// forever instead of parsing the discovered destination and updating
+		// source ownership.
+		return 0, false, false, false
+	}
 	// statPath is the on-disk file the stat came from: lookupPath when it
 	// resolves (local sync, where lookupPath == path), otherwise the physical
 	// source path (remote sync rewrites path to a non-local logical key). The
@@ -5576,12 +7043,12 @@ func (e *Engine) providerSingleSessionFresh(
 		return 0, false, true, false
 	}
 	contentChanged, contentVerified := e.providerIncrementalContentChanged(
-		e.idPrefix+sessionID, statPath, info,
+		fullID, statPath, info,
 	)
 	if contentChanged {
 		return 0, false, true, contentVerified
 	}
-	sess, _ := e.db.GetSession(ctx, e.idPrefix+sessionID)
+	sess, _ := e.db.GetSession(ctx, fullID)
 	return info.ModTime().UnixNano(), sess != nil &&
 		sess.Project != "" &&
 		!parser.NeedsProjectReparse(sess.Project), false, contentVerified
@@ -5596,7 +7063,7 @@ func (e *Engine) providerIncrementalIdentityChanged(
 		// the temp inode is expected to change between identical downloads.
 		return false
 	}
-	curInode, curDevice := getFileIdentity(info)
+	curInode, curDevice := getFileIdentity(lookupPath, info)
 	return e.db.FileIdentityChanged(lookupPath, curInode, curDevice)
 }
 
@@ -5713,7 +7180,7 @@ func (e *Engine) stampProviderFileIdentity(
 	if err != nil {
 		return
 	}
-	inode, device := getFileIdentity(info)
+	inode, device := getFileIdentity(path, info)
 	for i := range results {
 		if results[i].Session.File.Inode != 0 ||
 			results[i].Session.File.Device != 0 {
@@ -5900,9 +7367,9 @@ func (e *Engine) tryIncrementalJSONL(
 	// back to a full parse so we don't append on top of stale
 	// state. Only check when both sides have a known identity
 	// (non-zero); zeros mean the data is missing or the
-	// platform doesn't expose inode/device (Windows).
+	// filesystem does not expose a stable identity.
 	if e.pathRewriter == nil && inc.FileInode != 0 && inc.FileDevice != 0 {
-		curInode, curDevice := getFileIdentity(info)
+		curInode, curDevice := getFileIdentity(file.Path, info)
 		if curInode != 0 && curDevice != 0 &&
 			(curInode != inc.FileInode ||
 				curDevice != inc.FileDevice) {
@@ -9579,7 +11046,9 @@ func (e *Engine) SyncSingleSessionContext(
 		}
 	}
 
-	res := e.processFile(ctx, file)
+	res, retentionLease := e.processFileWithRetention(ctx, file)
+	defer e.retentionBudget().scavengeIfNeeded()
+	defer retentionLease.Release()
 	if res.err != nil {
 		if res.cacheSkip && res.mtime != 0 && !res.noCacheSkip {
 			e.cacheSkip(res.skipCacheKey(path), res.mtime, res.sourceFingerprint)
@@ -9629,10 +11098,11 @@ func (e *Engine) SyncSingleSessionContext(
 	for _, pr := range res.results {
 		if err := e.writeSessionFull(
 			pendingWrite{
-				sess:        pr.Session,
-				msgs:        pr.Messages,
-				usageEvents: pr.UsageEvents,
-				needsRetry:  res.needsRetryForSession(pr.Session.ID),
+				sess:         pr.Session,
+				msgs:         pr.Messages,
+				usageEvents:  pr.UsageEvents,
+				needsRetry:   res.needsRetryForSession(pr.Session.ID),
+				forceReplace: res.forceReplace,
 			},
 		); err != nil &&
 			!isIntentionalSessionSkip(err) &&

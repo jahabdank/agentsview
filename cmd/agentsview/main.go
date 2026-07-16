@@ -207,7 +207,11 @@ func runServe(cfg config.Config, opts serveOptions) {
 	}
 
 	var engine *sync.Engine
+	var stopWatcher func()
+	var openWatcherDispatch func()
+	var unwatchedPoller unwatchedPollCoordinator
 	if !cfg.NoSync {
+		var onStartupReconciled func(sync.SyncStats, error)
 		engine = sync.NewEngine(database, sync.EngineConfig{
 			AgentDirs:               cfg.AgentDirs,
 			IncludeCwdPrefixes:      cfg.SyncIncludeCwdPrefixes,
@@ -215,12 +219,49 @@ func runServe(cfg config.Config, opts serveOptions) {
 			BlockedResultCategories: cfg.ResultContentBlockedCategories,
 			Emitter:                 emitter,
 			DeferStartupMaintenance: opts.SkipInitialSync,
+			OnStartupReconciled: func(stats sync.SyncStats, err error) {
+				onStartupReconciled(stats, err)
+			},
 		})
+		defer engine.Close()
+		unwatchedPoller = newUnwatchedPollCoordinator(ctx, engine, idleTracker)
+		defer unwatchedPoller.Stop()
+		stopWatcher, openWatcherDispatch, _ = startFileWatcher(
+			cfg, engine, func(_ context.Context, batch sync.WatchBatch) error {
+				done, ok := idleTracker.BeginWork()
+				if !ok {
+					return context.Canceled
+				}
+				defer done()
+				// The serve ctx reaches watcher-driven syncs so SIGTERM can
+				// interrupt database reconciliation before Stop waits for it.
+				return syncWatchBatch(ctx, engine, batch)
+			},
+			sync.WatcherOptions{
+				OnCoverageDegraded: func(roots []string) error {
+					return unwatchedPoller.AddObligation(pollingObligation{
+						Key: "watcher-fallback", Roots: roots,
+					})
+				},
+				OnPollingRequired: func(obligation sync.PollingObligation) error {
+					return unwatchedPoller.AddObligation(pollingObligation{
+						Key: obligation.Key, Roots: obligation.Roots,
+					})
+				},
+				OnPollingReleased: unwatchedPoller.RemoveObligation,
+			},
+		)
+		defer stopWatcher()
+		onStartupReconciled = newStartupReconciliationHandler(
+			ctx,
+			database.CheckpointWALTruncateWithRetry,
+			openWatcherDispatch,
+		)
 
 		if !opts.SkipInitialSync {
 			if database.NeedsResync() {
 				startupProgress.SetPhase("full resync")
-				signalsCovered := runInitialResync(ctx, engine, startupProgress)
+				signalsCovered, _ := runInitialResync(ctx, engine, startupProgress)
 				if ctx.Err() == nil {
 					finishInitialResync(database, signalsCovered)
 				}
@@ -230,20 +271,6 @@ func runServe(cfg config.Config, opts serveOptions) {
 			}
 			if ctx.Err() != nil {
 				return
-			}
-
-			// The initial sync can leave hundreds of MB in the WAL, and
-			// SQLite checkpoints the whole log — not cancellable — when the
-			// final connection closes. A SIGTERM landing shortly after
-			// startup would spend the service manager's stop timeout inside
-			// that close and get escalated to SIGKILL, so truncate the WAL
-			// now at a controlled moment. Persistent readers just leave it
-			// for the periodic checkpoint loop.
-			if err := database.CheckpointWALTruncateWithRetry(
-				ctx,
-			); err != nil && !errors.Is(err, db.ErrWALCheckpointBusy) &&
-				ctx.Err() == nil {
-				log.Printf("post-sync wal checkpoint: %v", err)
 			}
 		}
 
@@ -401,29 +428,6 @@ func runServe(cfg config.Config, opts serveOptions) {
 		defer vectorServe.Scheduler.Stop()
 	}
 
-	if engine != nil {
-		// Registered before stopWatcher so LIFO defer order stops
-		// the watcher first, then Close flushes any pending
-		// debounced signal recomputes.
-		defer engine.Close()
-		stopWatcher, unwatchedDirs := startFileWatcher(
-			cfg, engine, func(batch sync.WatchBatch) {
-				idleTracker.Do(func() {
-					// The serve ctx must reach watcher-driven syncs:
-					// stopWatcher waits for the in-flight callback, so
-					// a sync that ignored SIGTERM would hold shutdown
-					// open until the service manager escalates to
-					// SIGKILL.
-					syncWatchBatch(ctx, engine, batch)
-				})
-			},
-		)
-		defer stopWatcher()
-		if len(unwatchedDirs) > 0 {
-			go startUnwatchedPoll(ctx, engine, unwatchedDirs, idleTracker)
-		}
-	}
-
 	if err := waitForServerRuntime(ctx, srv, rt); err != nil {
 		fatal("%v", err)
 	}
@@ -448,6 +452,33 @@ func runDeferredStartupSyncFallback(
 	defer done()
 	_, ran, err := engine.RunStartupSyncFallback(ctx, nil)
 	return ran, err
+}
+
+func newStartupReconciliationHandler(
+	ctx context.Context,
+	checkpoint func(context.Context) error,
+	openDispatch func(),
+) func(sync.SyncStats, error) {
+	return func(_ sync.SyncStats, reconciliationErr error) {
+		if ctx.Err() != nil {
+			return
+		}
+		if reconciliationErr == nil {
+			err := checkpoint(ctx)
+			if ctx.Err() != nil {
+				return
+			}
+			if err != nil {
+				log.Printf("post-sync wal checkpoint: %v", err)
+			}
+		} else {
+			log.Printf(
+				"startup sync incomplete; opening watcher dispatch with retry coverage: %v",
+				reconciliationErr,
+			)
+		}
+		openDispatch()
+	}
 }
 
 func ensureServeAuthToken(cfg *config.Config) error {
@@ -736,7 +767,7 @@ func cleanResyncTemp(dbPath string) {
 func runInitialSync(
 	ctx context.Context, engine *sync.Engine,
 	startupProgress *startupStateWriter,
-) {
+) sync.SyncStats {
 	fmt.Println("Running initial sync...")
 	t := time.Now()
 	stats := engine.SyncAll(ctx, func(p sync.Progress) {
@@ -744,6 +775,7 @@ func runInitialSync(
 		startupProgress.SetDetail(startupProgressDetail(p))
 	})
 	printSyncSummary(stats, t)
+	return stats
 }
 
 // runInitialResync runs ResyncAll, falling back to incremental
@@ -753,7 +785,7 @@ func runInitialSync(
 func runInitialResync(
 	ctx context.Context, engine *sync.Engine,
 	startupProgress *startupStateWriter,
-) bool {
+) (bool, sync.SyncStats) {
 	fmt.Println("Data version changed, running full resync...")
 	t := time.Now()
 	progress := newResyncProgressPrinter(os.Stdout, time.Now)
@@ -763,23 +795,24 @@ func runInitialResync(
 	})
 	progress.Finish()
 	printSyncSummary(stats, t)
+	resyncStats := stats
 
 	fellBack := false
 	if stats.Aborted && ctx.Err() == nil {
 		fmt.Println("Resync incomplete, running incremental sync...")
 		t = time.Now()
-		fallback := engine.SyncAll(ctx, func(p sync.Progress) {
+		stats = engine.SyncAll(ctx, func(p sync.Progress) {
 			printSyncProgress(p)
 			startupProgress.SetDetail(startupProgressDetail(p))
 		})
-		printSyncSummary(fallback, t)
+		printSyncSummary(stats, t)
 		fellBack = true
 	}
 
 	if ctx.Err() != nil {
-		return false
+		return false, stats
 	}
-	return resyncCoversSignals(stats, fellBack)
+	return resyncCoversSignals(resyncStats, fellBack), stats
 }
 
 type signalsBackfillMarker interface {
@@ -1082,51 +1115,73 @@ func formatByteProgress(p sync.Progress) string {
 }
 
 func startFileWatcher(
-	cfg config.Config, engine *sync.Engine, onChange func(batch sync.WatchBatch),
-) (stopWatcher func(), unwatchedDirs []string) {
+	cfg config.Config, engine *sync.Engine, onChange sync.WatchCallback,
+	options sync.WatcherOptions,
+) (stopWatcher func(), openDispatch func(), unwatchedDirs []string) {
 	t := time.Now()
-	watcher, err := sync.NewWatcherWithInterval(
+	roots, unwatchedDirs := collectWatchRoots(cfg)
+	watcher, err := sync.NewWatcherWithCallback(
 		watcherBatchDelay,
 		watcherSyncMinInterval,
 		onChange,
 		cfg.WatchExcludePatterns,
+		options,
 	)
 	if err != nil {
+		for _, root := range roots {
+			unwatchedDirs = appendUniqueStrings(unwatchedDirs, root.syncDirs()...)
+		}
+		if options.OnCoverageDegraded != nil {
+			if coverageErr := options.OnCoverageDegraded(unwatchedDirs); coverageErr != nil {
+				err = errors.Join(err, coverageErr)
+			}
+		}
 		log.Printf(
 			"warning: file watcher unavailable: %v"+
 				"; will poll every %s",
 			err, unwatchedPollInterval,
 		)
-		return func() {}, []string{"all"}
+		return func() {}, func() {}, []string{"all"}
 	}
-
-	roots, unwatchedDirs := collectWatchRoots(cfg)
 
 	var totalWatched int
 	var shallowWatched int
-	remaining := recursiveWatchBudget
-	for _, r := range roots {
-		if r.shallow {
-			if watcher.WatchShallow(r.root) {
+	registeredRoots := make([]sync.WatchRoot, 0, len(roots))
+	for _, root := range roots {
+		registeredRoots = append(registeredRoots, root.registeredRoot())
+	}
+	results := watcher.RegisterRoots(registeredRoots, recursiveWatchBudget)
+	unwatchedDirs = accountRegisteredWatchRoots(unwatchedDirs, roots, results)
+	for i, r := range roots {
+		result := results[i]
+		if !r.exists {
+			continue
+		}
+		totalWatched += result.Watched
+		if !r.recursive {
+			if result.Err == nil {
 				shallowWatched++
-				totalWatched++
 			} else {
-				unwatchedDirs = append(unwatchedDirs, r.dirs...)
+				unwatchedDirs = appendUniqueStrings(unwatchedDirs, r.syncDirs()...)
 			}
 			continue
 		}
-		result := watcher.WatchRecursiveBudgeted(r.root, remaining)
-		totalWatched += result.Watched
-		remaining -= result.Watched
 		if result.Unwatched > 0 || result.BudgetExhausted ||
 			result.ResourceExhausted || result.Err != nil {
-			unwatchedDirs = append(unwatchedDirs, r.dirs...)
+			unwatchedDirs = appendUniqueStrings(unwatchedDirs, r.syncDirs()...)
 			log.Printf(
 				"Couldn't watch %d directories under %s, will poll every %s",
-				result.Unwatched, r.root, unwatchedPollInterval,
+				result.Unwatched, r.path, unwatchedPollInterval,
 			)
 			if result.Err != nil {
-				log.Printf("watching %s: %v", r.root, result.Err)
+				log.Printf("watching %s: %v", r.path, result.Err)
+			}
+		}
+	}
+	if options.OnPollingRequired != nil {
+		for _, obligation := range watchPollingObligations(roots, results, unwatchedDirs) {
+			if err := options.OnPollingRequired(obligation); err != nil {
+				log.Printf("register polling obligation %q: %v", obligation.Key, err)
 			}
 		}
 	}
@@ -1148,125 +1203,427 @@ func startFileWatcher(
 			len(unwatchedDirs), unwatchedPollInterval,
 		)
 	}
-	watcher.Start()
-	return watcher.Stop, unwatchedDirs
+	if err := watcher.StartCollecting(); err != nil {
+		log.Printf("warning: file watcher startup failed: %v", err)
+	}
+	return watcher.Stop, watcher.OpenDispatch, unwatchedDirs
+}
+
+func watchPollingObligations(
+	roots []watchRoot,
+	results []sync.RecursiveWatchResult,
+	unwatchedDirs []string,
+) []sync.PollingObligation {
+	byKey := make(map[string][]string)
+	represented := make(map[string]struct{})
+	add := func(key string, roots ...string) {
+		if key == "" {
+			return
+		}
+		for _, root := range roots {
+			if root == "" {
+				continue
+			}
+			root = filepath.Clean(root)
+			byKey[key] = appendUniqueString(byKey[key], root)
+			represented[root] = struct{}{}
+		}
+	}
+	for i, root := range roots {
+		add(root.path, root.pendingPollingDirs...)
+		for _, dir := range root.persistentPollingDirs {
+			add("persistent:"+filepath.Clean(dir), dir)
+		}
+		if i >= len(results) {
+			continue
+		}
+		result := results[i]
+		if result.Unwatched > 0 || result.BudgetExhausted ||
+			result.ResourceExhausted || result.Err != nil {
+			add(root.path, root.syncDirs()...)
+		}
+	}
+	for _, dir := range unwatchedDirs {
+		dir = filepath.Clean(dir)
+		if _, ok := represented[dir]; !ok {
+			add("persistent:"+dir, dir)
+		}
+	}
+	obligations := make([]sync.PollingObligation, 0, len(byKey))
+	for key, roots := range byKey {
+		slices.Sort(roots)
+		obligations = append(obligations, sync.PollingObligation{Key: key, Roots: roots})
+	}
+	slices.SortFunc(obligations, func(a, b sync.PollingObligation) int {
+		return strings.Compare(a.Key, b.Key)
+	})
+	return obligations
+}
+
+func accountRegisteredWatchRoots(
+	unwatchedDirs []string,
+	roots []watchRoot,
+	results []sync.RecursiveWatchResult,
+) []string {
+	explicitReasons := false
+	persistent := make(map[string]bool)
+	for _, root := range roots {
+		if len(root.pendingPollingDirs) > 0 || len(root.persistentPollingDirs) > 0 {
+			explicitReasons = true
+		}
+		for _, dir := range root.persistentPollingDirs {
+			persistent[dir] = true
+		}
+	}
+	if explicitReasons {
+		// Lifecycle coverage observes creation of missing roots, but native
+		// recursive coverage is not authoritative until the activation handoff
+		// reconciles successfully. Keep the configured poll owner until the
+		// backend reports that activation as restored.
+		return unwatchedDirs
+	}
+	covered := make(map[string]bool)
+	for i, root := range roots {
+		if root.exists {
+			continue
+		}
+		result := results[i]
+		pollingDirs := root.pendingPollingDirs
+		if !explicitReasons {
+			// Preserve the helper's historical behavior for callers that construct
+			// watch roots directly without collection metadata.
+			pollingDirs = root.syncDirs()
+		}
+		for _, dir := range pollingDirs {
+			if _, seen := covered[dir]; !seen {
+				covered[dir] = true
+			}
+			if result.Err != nil || result.Watched == 0 {
+				covered[dir] = false
+			}
+		}
+	}
+	return slices.DeleteFunc(unwatchedDirs, func(dir string) bool {
+		return covered[dir] && !persistent[dir]
+	})
 }
 
 type watchSyncer interface {
-	SyncPathsContext(context.Context, []string)
-	SyncAllAfterWatcherOverflow(context.Context, sync.ProgressFunc) sync.SyncStats
+	SyncPathsContext(context.Context, []string) error
+	HasActiveSessionSourceBelow(agent, path string) (bool, error)
+	ReconciliationRootsForAgent(agent string) []string
+	ReconcileWatchRoots(context.Context, []string, bool) error
 }
 
-func syncWatchBatch(ctx context.Context, engine watchSyncer, batch sync.WatchBatch) {
-	if batch.FullSync {
-		engine.SyncAllAfterWatcherOverflow(ctx, nil)
-		return
+type watchReconciliationError struct {
+	cause error
+	retry sync.WatchBatch
+}
+
+func newWatchReconciliationError(
+	cause error, roots []string, full bool,
+) error {
+	var scoped interface{ ReconciliationRetryRoots() []string }
+	if errors.As(cause, &scoped) {
+		if failedRoots := deduplicateStrings(scoped.ReconciliationRetryRoots()); len(failedRoots) > 0 {
+			return &watchReconciliationError{
+				cause: cause,
+				retry: sync.WatchBatch{ReconcileRoots: failedRoots},
+			}
+		}
 	}
-	engine.SyncPathsContext(ctx, batch.Paths)
+	retry := sync.WatchBatch{FullSync: full}
+	if !full {
+		retry.ReconcileRoots = append([]string(nil), roots...)
+	}
+	return &watchReconciliationError{cause: cause, retry: retry}
+}
+
+func (e *watchReconciliationError) Error() string { return e.cause.Error() }
+
+func (e *watchReconciliationError) Unwrap() error { return e.cause }
+
+func (e *watchReconciliationError) WatchRetryBatch() sync.WatchBatch {
+	retry := e.retry
+	retry.Paths = append([]string(nil), retry.Paths...)
+	retry.ReconcileRoots = append([]string(nil), retry.ReconcileRoots...)
+	return retry
+}
+
+func syncWatchBatch(ctx context.Context, engine watchSyncer, batch sync.WatchBatch) error {
+	paths := append([]string(nil), batch.Paths...)
+	full := batch.FullSync
+	reconcileRoots := append([]string(nil), batch.ReconcileRoots...)
+	type renameOwner struct {
+		path  string
+		agent string
+	}
+	authoritativePaths := make(map[string]struct{})
+	authoritativeRenames := make(map[renameOwner]struct{})
+	promoteDirectoryRename := func(rename sync.WatchRename) {
+		roots := engine.ReconciliationRootsForAgent(rename.Agent)
+		if rename.Agent == "" || len(roots) == 0 {
+			full = true
+			return
+		}
+		reconcileRoots = append(reconcileRoots, roots...)
+	}
+	for _, rename := range batch.Renames {
+		owner := renameOwner{path: rename.Path, agent: rename.Agent}
+		if _, authoritative := authoritativeRenames[owner]; authoritative {
+			continue
+		}
+		switch rename.ItemType {
+		case sync.ItemIsFile:
+			paths = appendUniqueString(paths, rename.Path)
+		case sync.ItemIsDir:
+			promoteDirectoryRename(rename)
+			authoritativePaths[rename.Path] = struct{}{}
+			authoritativeRenames[owner] = struct{}{}
+			paths = removeString(paths, rename.Path)
+		default:
+			info, err := os.Stat(rename.Path)
+			if err == nil {
+				if info.IsDir() {
+					promoteDirectoryRename(rename)
+					authoritativePaths[rename.Path] = struct{}{}
+					authoritativeRenames[owner] = struct{}{}
+					paths = removeString(paths, rename.Path)
+				} else {
+					paths = appendUniqueString(paths, rename.Path)
+				}
+				continue
+			}
+			if !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("classifying watcher rename %q: %w", rename.Path, err)
+			}
+			hasDescendant, err := engine.HasActiveSessionSourceBelow(rename.Agent, rename.Path)
+			if err != nil {
+				return err
+			}
+			if hasDescendant {
+				promoteDirectoryRename(rename)
+				authoritativePaths[rename.Path] = struct{}{}
+				authoritativeRenames[owner] = struct{}{}
+				paths = removeString(paths, rename.Path)
+			} else {
+				if _, authoritative := authoritativePaths[rename.Path]; !authoritative {
+					paths = appendUniqueString(paths, rename.Path)
+				}
+			}
+		}
+	}
+	if len(paths) > 0 {
+		if err := engine.SyncPathsContext(ctx, paths); err != nil {
+			retry := sync.WatchBatch{FullSync: full}
+			if !full {
+				retry.Paths = append([]string(nil), paths...)
+				retry.ReconcileRoots = deduplicateStrings(reconcileRoots)
+			}
+			return &watchReconciliationError{
+				cause: err,
+				retry: retry,
+			}
+		}
+	}
+	if full {
+		if err := engine.ReconcileWatchRoots(ctx, nil, true); err != nil {
+			return newWatchReconciliationError(err, nil, true)
+		}
+		return nil
+	}
+	roots := deduplicateStrings(reconcileRoots)
+	if len(roots) > 0 {
+		if err := engine.ReconcileWatchRoots(ctx, roots, false); err != nil {
+			return newWatchReconciliationError(err, roots, false)
+		}
+	}
+	return nil
+}
+
+func removeString(values []string, remove string) []string {
+	return slices.DeleteFunc(values, func(value string) bool { return value == remove })
+}
+
+func deduplicateStrings(values []string) []string {
+	if len(values) < 2 {
+		return values
+	}
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
+}
+
+type watchScope struct {
+	agent   parser.AgentType
+	syncDir string
 }
 
 type watchRoot struct {
-	dirs    []string
-	root    string // actual path passed to WatchRecursive
-	shallow bool   // use shallow watch (root only)
+	path                  string
+	recursive             bool
+	exists                bool
+	scopes                []watchScope
+	pendingPollingDirs    []string
+	persistentPollingDirs []string
+}
+
+func (r watchRoot) registeredRoot() sync.WatchRoot {
+	scopes := make([]sync.WatchScope, 0, len(r.scopes))
+	for _, scope := range r.scopes {
+		scopes = append(scopes, sync.WatchScope{
+			Agent:   string(scope.agent),
+			SyncDir: scope.syncDir,
+		})
+	}
+	return sync.WatchRoot{
+		Path:      r.path,
+		Recursive: r.recursive,
+		Exists:    r.exists,
+		Scopes:    scopes,
+	}
+}
+
+func (r watchRoot) syncDirs() []string {
+	dirs := make([]string, 0, len(r.scopes))
+	for _, scope := range r.scopes {
+		dirs = appendUniqueString(dirs, scope.syncDir)
+	}
+	return dirs
 }
 
 func collectWatchRoots(cfg config.Config) (roots []watchRoot, unwatchedDirs []string) {
 	rootIndexes := make(map[string]int)
-	addRoot := func(dir, root string, shallow bool) {
-		if idx, ok := rootIndexes[root]; ok {
-			if !slices.Contains(roots[idx].dirs, dir) {
-				roots[idx].dirs = append(roots[idx].dirs, dir)
+	persistentPollingDirs := make(map[string]struct{})
+	addRoot := func(agent parser.AgentType, dir, path string, recursive, exists bool) {
+		path = filepath.Clean(path)
+		scope := watchScope{agent: agent, syncDir: dir}
+		if idx, ok := rootIndexes[path]; ok {
+			roots[idx].recursive = roots[idx].recursive || recursive
+			roots[idx].exists = roots[idx].exists || exists
+			if !slices.Contains(roots[idx].scopes, scope) {
+				roots[idx].scopes = append(roots[idx].scopes, scope)
 			}
 			return
 		}
-		rootIndexes[root] = len(roots)
+		rootIndexes[path] = len(roots)
 		roots = append(roots, watchRoot{
-			dirs:    []string{dir},
-			root:    root,
-			shallow: shallow,
+			path:      path,
+			recursive: recursive,
+			exists:    exists,
+			scopes:    []watchScope{scope},
 		})
 	}
 	for _, def := range parser.Registry {
 		for _, d := range cfg.ResolveDirs(def.Type) {
+			addAgentRoot := func(dir, root string, recursive, exists bool) {
+				addRoot(def.Type, dir, root, recursive, exists)
+			}
 			_, hasProvider := parser.ProviderFactoryByType(def.Type)
-			if providerWatched, providerUnwatched := collectProviderWatchRoots(def, d, addRoot); providerWatched {
-				unwatchedDirs = append(unwatchedDirs, providerUnwatched...)
+			if providerWatched, polling := collectProviderWatchRoots(def, d, addAgentRoot); providerWatched {
+				if polling.persistent {
+					persistentPollingDirs[d] = struct{}{}
+					unwatchedDirs = appendUniqueString(unwatchedDirs, d)
+				}
+				for _, missing := range polling.missingRoots {
+					idx, ok := rootIndexes[filepath.Clean(missing)]
+					if !ok || idx < 0 || idx >= len(roots) {
+						continue
+					}
+					roots[idx].pendingPollingDirs = appendUniqueString(
+						roots[idx].pendingPollingDirs, d,
+					)
+					unwatchedDirs = appendUniqueString(unwatchedDirs, d)
+				}
 				continue
 			}
 			if !def.FileBased {
 				if hasProvider {
-					unwatchedDirs = append(unwatchedDirs, d)
+					persistentPollingDirs[d] = struct{}{}
+					unwatchedDirs = appendUniqueString(unwatchedDirs, d)
 				}
 				continue
 			}
-			fallbackUnwatched := collectLegacyWatchRoots(def, d, addRoot)
-			unwatchedDirs = append(unwatchedDirs, fallbackUnwatched...)
+			fallbackUnwatched := collectLegacyWatchRoots(def, d, addAgentRoot)
+			for _, pollingDir := range fallbackUnwatched {
+				persistentPollingDirs[pollingDir] = struct{}{}
+				unwatchedDirs = appendUniqueString(unwatchedDirs, pollingDir)
+			}
+		}
+	}
+	for dir := range persistentPollingDirs {
+		for i := range roots {
+			if slices.Contains(roots[i].syncDirs(), dir) {
+				roots[i].persistentPollingDirs = appendUniqueString(
+					roots[i].persistentPollingDirs, dir,
+				)
+				break
+			}
 		}
 	}
 	return roots, unwatchedDirs
 }
 
+type providerPollingReasons struct {
+	missingRoots []string
+	persistent   bool
+}
+
 func collectProviderWatchRoots(
 	def parser.AgentDef,
 	dir string,
-	addRoot func(dir, root string, shallow bool),
-) (bool, []string) {
+	addRoot func(dir, root string, recursive, exists bool),
+) (bool, providerPollingReasons) {
 	factory, ok := parser.ProviderFactoryByType(def.Type)
 	if !ok {
-		return false, nil
+		return false, providerPollingReasons{}
 	}
 	provider := factory.NewProvider(parser.ProviderConfig{
 		Roots: []string{dir},
 	})
-	plan, err := provider.WatchPlan(context.Background())
-	if err != nil || len(plan.Roots) == 0 {
+	roots, err := parser.ResolveWatchRoots(context.Background(), provider)
+	if err != nil || len(roots) == 0 {
 		if err != nil && !errors.Is(err, parser.ErrUnsupportedProviderFeature) {
 			log.Printf("%s provider watch plan: %v", def.Type, err)
 		}
-		return false, nil
+		return false, providerPollingReasons{}
 	}
-	added := false
-	var addedRoots []watchRoot
+	planned := false
 	var missingRoots []string
-	var unwatchedDirs []string
-	for _, providerRoot := range plan.Roots {
+	var polling providerPollingReasons
+	for _, providerRoot := range roots {
 		root := filepath.Clean(providerRoot.Path)
 		if root == "" || root == "." {
 			continue
 		}
+		planned = true
 		if providerRoot.Recursive && isSymlinkPath(root) {
-			unwatchedDirs = appendUniqueString(unwatchedDirs, dir)
+			polling.persistent = true
 			continue
 		}
-		if _, err := os.Stat(root); err == nil {
-			addRoot(dir, root, !providerRoot.Recursive)
-			added = true
-			addedRoots = append(addedRoots, watchRoot{
-				root:    root,
-				shallow: !providerRoot.Recursive,
-			})
+		_, err := os.Stat(root)
+		exists := err == nil
+		addRoot(dir, root, providerRoot.Recursive, exists)
+		if exists {
 			continue
 		}
 		missingRoots = append(missingRoots, root)
 	}
-	if !added {
-		if len(unwatchedDirs) > 0 {
-			return true, unwatchedDirs
-		}
-		return false, nil
+	if !planned {
+		return false, providerPollingReasons{}
 	}
-	// A watch target that does not exist yet but lives under an already-watched
-	// root needs no separate polling only when the ancestor is recursive or
-	// when a shallow root can observe creation of the missing root itself. A
-	// shallow ancestor sees only immediate child creation, so it cannot cover a
-	// missing nested provider root.
-	for _, missing := range missingRoots {
-		if !pathCoveredByAnyWatchRootCreation(missing, addedRoots) {
-			unwatchedDirs = appendUniqueString(unwatchedDirs, dir)
-		}
-	}
-	return true, unwatchedDirs
+	// Native ancestor coverage can observe creation, but it cannot become the
+	// authoritative owner of the missing target until activation reconciliation
+	// succeeds. Keep each missing target's polling obligation until that handoff.
+	polling.missingRoots = append(polling.missingRoots, missingRoots...)
+	return true, polling
 }
 
 func isSymlinkPath(path string) bool {
@@ -1284,6 +1641,13 @@ func appendUniqueString(values []string, value string) []string {
 	return append(values, value)
 }
 
+func appendUniqueStrings(values []string, additions ...string) []string {
+	for _, value := range additions {
+		values = appendUniqueString(values, value)
+	}
+	return values
+}
+
 // pathCoveredByAnyWatchRootCreation reports whether path is covered by an
 // existing watch root strongly enough to observe creation of the missing root.
 // Recursive roots cover the whole subtree. Shallow roots only cover direct
@@ -1291,14 +1655,17 @@ func appendUniqueString(values []string, value string) []string {
 // which the next watcher setup can add the provider's deeper watch root.
 func pathCoveredByAnyWatchRootCreation(path string, roots []watchRoot) bool {
 	for _, root := range roots {
-		if root.shallow {
-			if filepath.Dir(path) == root.root {
+		if !root.exists {
+			continue
+		}
+		if !root.recursive {
+			if filepath.Dir(path) == root.path {
 				return true
 			}
 			continue
 		}
-		if path == root.root ||
-			strings.HasPrefix(path, root.root+string(filepath.Separator)) {
+		if path == root.path ||
+			strings.HasPrefix(path, root.path+string(filepath.Separator)) {
 			return true
 		}
 	}
@@ -1308,13 +1675,13 @@ func pathCoveredByAnyWatchRootCreation(path string, roots []watchRoot) bool {
 func collectLegacyWatchRoots(
 	def parser.AgentDef,
 	dir string,
-	addRoot func(dir, root string, shallow bool),
+	addRoot func(dir, root string, recursive, exists bool),
 ) []string {
 	var unwatchedDirs []string
 	if def.ShallowWatchRootsFunc != nil {
 		for _, watchDir := range def.ShallowWatchRootsFunc(dir) {
 			if _, err := os.Stat(watchDir); err == nil {
-				addRoot(dir, watchDir, true)
+				addRoot(dir, watchDir, false, true)
 			}
 		}
 	}
@@ -1325,7 +1692,7 @@ func collectLegacyWatchRoots(
 		}
 		for _, watchDir := range watchDirs {
 			if _, err := os.Stat(watchDir); err == nil {
-				addRoot(dir, watchDir, def.ShallowWatch)
+				addRoot(dir, watchDir, !def.ShallowWatch, true)
 				continue
 			}
 			unwatchedDirs = append(unwatchedDirs, dir)
@@ -1334,14 +1701,14 @@ func collectLegacyWatchRoots(
 	}
 	if len(def.WatchSubdirs) == 0 {
 		if _, err := os.Stat(dir); err == nil {
-			addRoot(dir, dir, def.ShallowWatch)
+			addRoot(dir, dir, !def.ShallowWatch, true)
 		}
 		return unwatchedDirs
 	}
 	for _, sub := range def.WatchSubdirs {
 		watchDir := filepath.Join(dir, sub)
 		if _, err := os.Stat(watchDir); err == nil {
-			addRoot(dir, watchDir, def.ShallowWatch)
+			addRoot(dir, watchDir, !def.ShallowWatch, true)
 		}
 	}
 	return unwatchedDirs
@@ -1525,37 +1892,4 @@ func recomputePendingSessions(
 		// pass will retry any that failed.
 		_ = engine.RecomputeSignals(context.Background(), id)
 	}
-}
-
-type unwatchedPollSyncer interface {
-	SyncRootsSince(
-		context.Context, []string, time.Time, sync.ProgressFunc,
-	) sync.SyncStats
-}
-
-func startUnwatchedPoll(
-	ctx context.Context,
-	engine unwatchedPollSyncer,
-	roots []string,
-	idleTracker *server.IdleTracker,
-) {
-	ticker := time.NewTicker(unwatchedPollInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-		log.Println("Polling unwatched directories...")
-		idleTracker.Do(func() {
-			pollUnwatchedRootsOnce(ctx, engine, roots)
-		})
-	}
-}
-
-func pollUnwatchedRootsOnce(
-	ctx context.Context, engine unwatchedPollSyncer, roots []string,
-) {
-	engine.SyncRootsSince(ctx, roots, time.Time{}, nil)
 }

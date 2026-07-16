@@ -302,11 +302,11 @@ func writeOneSessionBatchTx(
 	if excluded == 1 {
 		return 0, ErrSessionExcluded
 	}
-	var deletedAt sql.NullString
+	var deletedAt, deletionCause sql.NullString
 	err = tx.QueryRow(
-		"SELECT deleted_at FROM sessions WHERE id = ?",
+		"SELECT deleted_at, deletion_cause FROM sessions WHERE id = ?",
 		write.Session.ID,
-	).Scan(&deletedAt)
+	).Scan(&deletedAt, &deletionCause)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return 0, fmt.Errorf(
 			"checking trash for %s: %w",
@@ -314,7 +314,8 @@ func writeOneSessionBatchTx(
 		)
 	}
 	sessionExists := err == nil
-	if deletedAt.Valid {
+	if deletedAt.Valid &&
+		(!deletionCause.Valid || deletionCause.String != deletionCauseSourceMissing) {
 		return 0, ErrSessionTrashed
 	}
 	replacementTranscriptChanged := false

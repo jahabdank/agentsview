@@ -3,6 +3,7 @@
 package parser
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -99,7 +100,8 @@ func claudeParseWithExclusions(
 		foundParentSID  bool
 		lineIndex       int
 		malformedLines  int
-		lastLine        string
+		lastLineHasData bool
+		lastLineValid   bool
 		subagentMap     = map[string]string{}
 		globalStart     time.Time
 		globalEnd       time.Time
@@ -111,41 +113,41 @@ func claudeParseWithExclusions(
 	defer releaseLineReader(lr)
 	lastLineFailed := false
 	for {
-		line, ok := lr.next()
+		lineBytes, ok := lr.nextBytes()
 		if !ok {
 			break
 		}
-		lastLine = line
-		if !gjson.Valid(line) {
+		lastLineHasData = len(bytes.TrimSpace(lineBytes)) > 0
+		lastLineValid = gjson.ValidBytes(lineBytes)
+		if !lastLineValid {
 			malformedLines++
 			lastLineFailed = true
 			continue
 		}
-		line = resolveClaudePersistedToolResults(path, line)
 		lastLineFailed = false
 
-		entryType := gjson.Get(line, "type").Str
+		entryType := gjson.GetBytes(lineBytes, "type").Str
 		if agentLabel == "" {
-			if value := gjson.Get(line, "agentSetting").Str; strings.TrimSpace(value) != "" {
-				agentLabel = value
+			if value := gjson.GetBytes(lineBytes, "agentSetting").Str; strings.TrimSpace(value) != "" {
+				agentLabel = strings.Clone(value)
 			}
 		}
 		if entrypoint == "" {
-			if value := gjson.Get(line, "entrypoint").Str; strings.TrimSpace(value) != "" {
-				entrypoint = value
+			if value := gjson.GetBytes(lineBytes, "entrypoint").Str; strings.TrimSpace(value) != "" {
+				entrypoint = strings.Clone(value)
 			}
 		}
 
 		// Extract source version from first line that has it.
 		if sourceVersion == "" {
-			if v := gjson.Get(line, "version").Str; v != "" {
-				sourceVersion = v
+			if v := gjson.GetBytes(lineBytes, "version").Str; v != "" {
+				sourceVersion = strings.Clone(v)
 			}
 		}
 
 		// Track global timestamps from all lines for session
 		// bounds, including non-message events.
-		if ts := extractTimestamp(line); !ts.IsZero() {
+		if ts := extractTimestampBytes(lineBytes); !ts.IsZero() {
 			if globalStart.IsZero() || ts.Before(globalStart) {
 				globalStart = ts
 			}
@@ -156,8 +158,8 @@ func claudeParseWithExclusions(
 
 		// Collect queue-operation enqueue entries for subagent mapping.
 		if entryType == "queue-operation" {
-			if gjson.Get(line, "operation").Str == "enqueue" {
-				contentStr := gjson.Get(line, "content").Str
+			if gjson.GetBytes(lineBytes, "operation").Str == "enqueue" {
+				contentStr := gjson.GetBytes(lineBytes, "content").Str
 				if contentStr != "" {
 					tuid := gjson.Get(contentStr, "tool_use_id").Str
 					taskID := gjson.Get(contentStr, "task_id").Str
@@ -171,7 +173,7 @@ func claudeParseWithExclusions(
 						}
 					}
 					if tuid != "" && taskID != "" {
-						subagentMap[tuid] = "agent-" + taskID
+						subagentMap[strings.Clone(tuid)] = "agent-" + strings.Clone(taskID)
 					}
 				}
 			}
@@ -181,11 +183,11 @@ func claudeParseWithExclusions(
 		// Collect agent_progress events for subagent mapping.
 		// Claude Code v2.1+ emits these instead of queue-operation for Agent tool calls.
 		if entryType == "progress" {
-			if gjson.Get(line, "data.type").Str == "agent_progress" {
-				tuid := gjson.Get(line, "parentToolUseID").Str
-				agentID := gjson.Get(line, "data.agentId").Str
+			if gjson.GetBytes(lineBytes, "data.type").Str == "agent_progress" {
+				tuid := gjson.GetBytes(lineBytes, "parentToolUseID").Str
+				agentID := gjson.GetBytes(lineBytes, "data.agentId").Str
 				if tuid != "" && agentID != "" {
-					subagentMap[tuid] = "agent-" + agentID
+					subagentMap[strings.Clone(tuid)] = "agent-" + strings.Clone(agentID)
 				}
 			}
 			continue
@@ -195,7 +197,8 @@ func claudeParseWithExclusions(
 		// the user typed mid-tool-call. Other attachment types
 		// (e.g. task_reminder) are intentionally dropped.
 		if entryType == "attachment" {
-			if qc, ok := extractQueuedCommand(line); ok {
+			if qc, ok := extractQueuedCommand(string(lineBytes)); ok {
+				qc.prompt = strings.Clone(qc.prompt)
 				queuedCommands = append(queuedCommands, qc)
 			}
 			continue
@@ -205,9 +208,9 @@ func claudeParseWithExclusions(
 		// display name; last rename wins (empty arg clears it).
 		if entryType == "system" {
 			if name, ok := extractRenameName(
-				gjson.Get(line, "content").Str,
+				gjson.GetBytes(lineBytes, "content").Str,
 			); ok {
-				displayName = name
+				displayName = strings.Clone(name)
 			}
 			continue
 		}
@@ -215,15 +218,18 @@ func claudeParseWithExclusions(
 		if entryType != "user" && entryType != "assistant" {
 			continue
 		}
+		line := resolveClaudePersistedToolResults(
+			path, compactClaudeEntry(lineBytes),
+		)
 
 		// Collect subagent links and cwd/gitBranch from user entries.
 		if entryType == "user" {
 			collectToolResultAgentID(line, subagentMap)
 			if cwd == "" {
-				cwd = gjson.Get(line, "cwd").Str
+				cwd = strings.Clone(gjson.GetBytes(lineBytes, "cwd").Str)
 			}
 			if gitBranch == "" {
-				gitBranch = gjson.Get(line, "gitBranch").Str
+				gitBranch = strings.Clone(gjson.GetBytes(lineBytes, "gitBranch").Str)
 			}
 		}
 
@@ -231,11 +237,11 @@ func claudeParseWithExclusions(
 		// then check whether it differs from the file-derived
 		// ID to detect parent sessions.
 		if !foundParentSID {
-			if sid := gjson.Get(line, "sessionId").Str; sid != "" {
+			if sid := gjson.GetBytes(lineBytes, "sessionId").Str; sid != "" {
 				foundParentSID = true
-				sourceSessionID = sid
+				sourceSessionID = strings.Clone(sid)
 				if sid != sessionID {
-					parentSessionID = sid
+					parentSessionID = strings.Clone(sid)
 				}
 			}
 		}
@@ -254,7 +260,7 @@ func claudeParseWithExclusions(
 		entries = append(entries, dagEntry{
 			uuid:       uuid,
 			parentUuid: parentUuid,
-			entryType:  entryType,
+			entryType:  strings.Clone(entryType),
 			lineIndex:  lineIndex,
 			line:       line,
 			timestamp:  ts,
@@ -270,9 +276,8 @@ func claudeParseWithExclusions(
 	// AND the file did not end with a newline. A newline-
 	// terminated invalid line is just a complete malformed
 	// record, not a truncated write.
-	isTruncated := lastLine != "" &&
-		strings.TrimSpace(lastLine) != "" &&
-		!gjson.Valid(lastLine) &&
+	isTruncated := lastLineHasData &&
+		!lastLineValid &&
 		!fileEndsWithNewline(f, info.Size())
 
 	// Merge consecutive assistant entries that share the same
@@ -359,6 +364,110 @@ func claudeParseWithExclusions(
 		kept = append(kept, r)
 	}
 	return kept, excluded, nil
+}
+
+type claudeCompactField struct {
+	name   string
+	result gjson.Result
+}
+
+func compactClaudeEntry(line []byte) string {
+	topFields := []claudeCompactField{
+		{name: "uuid", result: gjson.GetBytes(line, "uuid")},
+		{name: "parentUuid", result: gjson.GetBytes(line, "parentUuid")},
+		{name: "timestamp", result: gjson.GetBytes(line, "timestamp")},
+		{name: "isCompactSummary", result: gjson.GetBytes(line, "isCompactSummary")},
+		{name: "isSidechain", result: gjson.GetBytes(line, "isSidechain")},
+		{name: "isMeta", result: gjson.GetBytes(line, "isMeta")},
+		{name: "requestId", result: gjson.GetBytes(line, "requestId")},
+	}
+	messageFields := []claudeCompactField{
+		{name: "content", result: gjson.GetBytes(line, "message.content")},
+		{name: "id", result: gjson.GetBytes(line, "message.id")},
+		{name: "stop_reason", result: gjson.GetBytes(line, "message.stop_reason")},
+		{name: "model", result: gjson.GetBytes(line, "message.model")},
+		{name: "usage", result: gjson.GetBytes(line, "message.usage")},
+	}
+	snapshotFields := []claudeCompactField{
+		{name: "timestamp", result: gjson.GetBytes(line, "snapshot.timestamp")},
+	}
+	toolResultFields := []claudeCompactField{
+		{name: "agentId", result: gjson.GetBytes(line, "toolUseResult.agentId")},
+		{
+			name:   "persistedOutputPath",
+			result: gjson.GetBytes(line, "toolUseResult.persistedOutputPath"),
+		},
+	}
+
+	var b strings.Builder
+	b.Grow(compactClaudeEntrySize(
+		topFields, snapshotFields, messageFields, toolResultFields,
+	))
+	b.WriteByte('{')
+	first := true
+	writeClaudeCompactFields(&b, &first, topFields)
+	writeClaudeCompactObject(&b, &first, "snapshot", snapshotFields)
+	writeClaudeCompactObject(&b, &first, "message", messageFields)
+	writeClaudeCompactObject(&b, &first, "toolUseResult", toolResultFields)
+	b.WriteByte('}')
+	return b.String()
+}
+
+func compactClaudeEntrySize(groups ...[]claudeCompactField) int {
+	size := 2
+	for _, fields := range groups {
+		for _, field := range fields {
+			if field.result.Exists() {
+				size += len(field.name) + len(field.result.Raw) + 4
+			}
+		}
+	}
+	return size
+}
+
+func writeClaudeCompactObject(
+	b *strings.Builder, first *bool, name string, fields []claudeCompactField,
+) {
+	hasFields := false
+	for _, field := range fields {
+		if field.result.Exists() {
+			hasFields = true
+			break
+		}
+	}
+	if !hasFields {
+		return
+	}
+	writeClaudeCompactSeparator(b, first)
+	b.WriteByte('"')
+	b.WriteString(name)
+	b.WriteString("\":{")
+	nestedFirst := true
+	writeClaudeCompactFields(b, &nestedFirst, fields)
+	b.WriteByte('}')
+}
+
+func writeClaudeCompactFields(
+	b *strings.Builder, first *bool, fields []claudeCompactField,
+) {
+	for _, field := range fields {
+		if !field.result.Exists() {
+			continue
+		}
+		writeClaudeCompactSeparator(b, first)
+		b.WriteByte('"')
+		b.WriteString(field.name)
+		b.WriteString("\":")
+		b.WriteString(field.result.Raw)
+	}
+}
+
+func writeClaudeCompactSeparator(b *strings.Builder, first *bool) {
+	if *first {
+		*first = false
+		return
+	}
+	b.WriteByte(',')
 }
 
 // lastAssistantStopReason returns the StopReason of the most
@@ -1889,6 +1998,23 @@ func extractTimestamp(line string) time.Time {
 	ts := parseTimestamp(tsStr)
 	if ts.IsZero() {
 		snapTsStr := gjson.Get(line, "snapshot.timestamp").Str
+		ts = parseTimestamp(snapTsStr)
+		if ts.IsZero() {
+			if tsStr != "" {
+				logParseError(tsStr)
+			} else if snapTsStr != "" {
+				logParseError(snapTsStr)
+			}
+		}
+	}
+	return ts
+}
+
+func extractTimestampBytes(line []byte) time.Time {
+	tsStr := gjson.GetBytes(line, "timestamp").Str
+	ts := parseTimestamp(tsStr)
+	if ts.IsZero() {
+		snapTsStr := gjson.GetBytes(line, "snapshot.timestamp").Str
 		ts = parseTimestamp(snapTsStr)
 		if ts.IsZero() {
 			if tsStr != "" {

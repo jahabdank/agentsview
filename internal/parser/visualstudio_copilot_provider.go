@@ -1,6 +1,10 @@
 package parser
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -28,17 +32,139 @@ func newVisualStudioCopilotProviderFactory(def AgentDef) ProviderFactory {
 				AgentVSCopilot,
 				cfg.Roots,
 				WithSourceDiscovery(vsCopilotDiscoverSources),
+				WithStreamingSourceDiscovery(vsCopilotDiscoverEach),
 				WithWatchRoots(vsCopilotWatchRoots),
 				WithChangedPathClassifier(vsCopilotClassifyPath),
 				WithMemberLookup(vsCopilotFindMember),
-				WithFingerprint(vsCopilotFingerprintSource),
+				WithContextFingerprint(vsCopilotFingerprintSourceContext),
 				WithContainerParse(vsCopilotParseContainer),
-				WithMemberParse(vsCopilotParseMember),
+				WithContextMemberParse(vsCopilotParseMemberContext),
 				// Every conversation in a trace shares the trace's content hash.
 				WithContainerHashStamping(),
 			)
 		},
 	)
+}
+
+type vsCopilotDiskCandidate struct {
+	Path    string `json:"path"`
+	MTimeNS int64  `json:"mtime_ns"`
+}
+
+// vsCopilotDiscoverEach externalizes the conversation-to-canonical-file index
+// to a temporary SQLite table. Trace and VS 2026 trees are read in fixed-size
+// directory batches; only one decoded trace line is resident at a time.
+func vsCopilotDiscoverEach(
+	ctx context.Context, root string, yield func(multiSessionMatch) error,
+) (retErr error) {
+	index, err := newDiscoveryDiskMapForContext(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		retErr = errors.Join(retErr, index.close())
+	}()
+	remember := func(id, path string, mtimeNS int64) error {
+		current, found, err := index.get(ctx, id)
+		if err != nil {
+			return err
+		}
+		if found {
+			var candidate vsCopilotDiskCandidate
+			if json.Unmarshal([]byte(current), &candidate) == nil &&
+				(candidate.MTimeNS > mtimeNS ||
+					(candidate.MTimeNS == mtimeNS && candidate.Path >= path)) {
+				return nil
+			}
+		}
+		encoded, err := json.Marshal(vsCopilotDiskCandidate{Path: path, MTimeNS: mtimeNS})
+		if err != nil {
+			return err
+		}
+		return index.put(ctx, id, string(encoded), true)
+	}
+	root = filepath.Clean(root)
+	err = streamDirectoryTree(ctx, root, func(path string, entry os.DirEntry) error {
+		if entry.IsDir() {
+			return nil
+		}
+		if isVisualStudioCopilotVS2026SessionPath(path) {
+			info, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			return remember(canonicalVisualStudioCopilotConversationID(entry.Name()), path, info.ModTime().UnixNano())
+		}
+		if filepath.Dir(path) != root || !isVisualStudioCopilotTraceFileName(entry.Name()) {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		err = forEachVisualStudioCopilotTraceSpan(ctx, path, func(span vsCopilotSpan) error {
+			id := canonicalVisualStudioCopilotConversationID(
+				vsCopilotTraceAttrs(span.Attributes)["gen_ai.conversation.id"],
+			)
+			if id == "" {
+				return nil
+			}
+			encoded, err := json.Marshal(span)
+			if err != nil {
+				return err
+			}
+			if err := reconciliationCacheAppend(
+				ctx, vsCopilotCachedSpansKey(root, id), string(encoded),
+			); err != nil {
+				return err
+			}
+			return remember(id, path, info.ModTime().UnixNano())
+		})
+		if err != nil {
+			return err
+		}
+		encoded, found, err := reconciliationCacheGet(
+			ctx, vsCopilotCachedFingerprintKey(path),
+		)
+		if err != nil || !found {
+			return err
+		}
+		var fingerprint SourceFingerprint
+		if err := json.Unmarshal([]byte(encoded), &fingerprint); err != nil {
+			return err
+		}
+		fingerprint.Size, fingerprint.MTimeNS, err =
+			VisualStudioCopilotTraceFingerprintStrict(path)
+		if err != nil {
+			return err
+		}
+		encodedBytes, err := json.Marshal(fingerprint)
+		if err != nil {
+			return err
+		}
+		return reconciliationCachePut(
+			ctx, vsCopilotCachedFingerprintKey(path), string(encodedBytes),
+		)
+	})
+	if err != nil {
+		return err
+	}
+	return index.forEach(ctx, func(id, value string) error {
+		var candidate vsCopilotDiskCandidate
+		if err := json.Unmarshal([]byte(value), &candidate); err != nil {
+			return err
+		}
+		return yield(multiSessionMatch{
+			Path:      VisualStudioCopilotVirtualPath(candidate.Path, id),
+			Container: candidate.Path, MemberID: id,
+			ProjectHint: "visualstudio", DiscoveryMTimeNS: candidate.MTimeNS,
+		})
+	})
+}
+
+func vsCopilotCachedSpansKey(root, conversationID string) string {
+	return "visualstudio-copilot:spans:" + filepath.Clean(root) + "\x00" +
+		canonicalVisualStudioCopilotConversationID(conversationID)
 }
 
 // vsCopilotDiscoverSources emits one match per conversation (virtual path) plus
@@ -589,6 +715,29 @@ func vsCopilotFingerprintSource(
 	}, nil
 }
 
+func vsCopilotCachedFingerprintKey(path string) string {
+	return "visualstudio-copilot:fingerprint:" + filepath.Clean(path)
+}
+
+func vsCopilotFingerprintSourceContext(
+	ctx context.Context, src multiSessionSource,
+) (SourceFingerprint, error) {
+	encoded, found, err := reconciliationCacheGet(
+		ctx, vsCopilotCachedFingerprintKey(src.Container),
+	)
+	if err != nil {
+		return SourceFingerprint{}, err
+	}
+	if !found {
+		return vsCopilotFingerprintSource(src)
+	}
+	var fingerprint SourceFingerprint
+	if err := json.Unmarshal([]byte(encoded), &fingerprint); err != nil {
+		return SourceFingerprint{}, fmt.Errorf("decode cached Visual Studio Copilot fingerprint: %w", err)
+	}
+	return fingerprint, nil
+}
+
 func vsCopilotParseMember(
 	src multiSessionSource, req ParseRequest,
 ) (*ParseResult, error) {
@@ -601,6 +750,41 @@ func vsCopilotParseMember(
 	}
 	if sess == nil {
 		return nil, nil
+	}
+	return &ParseResult{Session: *sess, Messages: msgs}, nil
+}
+
+func vsCopilotParseMemberContext(
+	ctx context.Context, src multiSessionSource, req ParseRequest,
+) (*ParseResult, error) {
+	encoded, found, err := reconciliationCacheGet(
+		ctx, vsCopilotCachedSpansKey(src.Root, src.MemberID),
+	)
+	if err != nil {
+		return nil, err
+	}
+	if !found || isVisualStudioCopilotVS2026SessionPath(src.Container) {
+		return vsCopilotParseMember(src, req)
+	}
+	retained := conservativeDecodedRetainedBytes(int64(len(encoded)))
+	observeStreamingRetainedBytes(ctx, retained)
+	defer observeStreamingRetainedBytes(ctx, -retained)
+	observeReconciliationRetainedMember(ctx, AgentVSCopilot, retained)
+	var spans []vsCopilotSpan
+	for line := range strings.SplitSeq(encoded, "\n") {
+		var span vsCopilotSpan
+		if err := json.Unmarshal([]byte(line), &span); err != nil {
+			return nil, fmt.Errorf("decode cached Visual Studio Copilot span: %w", err)
+		}
+		prepareVisualStudioCopilotSpan(&span)
+		spans = append(spans, span)
+	}
+	project := firstNonEmptyJSONLString(req.Source.ProjectHint, "visualstudio")
+	sess, msgs, err := buildVisualStudioCopilotConversationFromSpans(
+		src.Container, src.MemberID, project, req.Machine, spans,
+	)
+	if err != nil || sess == nil {
+		return nil, err
 	}
 	return &ParseResult{Session: *sess, Messages: msgs}, nil
 }

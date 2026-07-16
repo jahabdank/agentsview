@@ -359,6 +359,8 @@ const ClassifierHashKey = "is_automated_classifier_hash"
 //go:embed schema.sql
 var schemaSQL string
 
+const sourceBaselineTableMigrationKey = "local_source_baseline_table_v1"
+
 // messagesADTriggerDDL is the AFTER DELETE trigger that mirrors row
 // removals into the FTS5 shadow tables. ReplaceSessionMessages drops
 // this trigger inside its transaction (replacing N per-row FTS deletes
@@ -1624,6 +1626,10 @@ func schemaColumnMigrations() []schemaColumnMigration {
 			"ALTER TABLE sessions ADD COLUMN deleted_at TEXT",
 		},
 		{
+			"sessions", "deletion_cause",
+			"ALTER TABLE sessions ADD COLUMN deletion_cause TEXT",
+		},
+		{
 			"messages", "is_system",
 			"ALTER TABLE messages ADD COLUMN is_system INTEGER NOT NULL DEFAULT 0",
 		},
@@ -2079,6 +2085,9 @@ func (db *DB) migrateColumns() error {
 	if err := applySchemaColumnMigrations(w.QueryRow, w.Exec); err != nil {
 		return err
 	}
+	if err := db.migrateSourceBaselinesLocked(w); err != nil {
+		return err
+	}
 	if err := db.createPartialIndexesLocked(w); err != nil {
 		return err
 	}
@@ -2242,6 +2251,60 @@ func (db *DB) migrateColumns() error {
 	return nil
 }
 
+// migrateSourceBaselinesLocked imports watcher proof written by early builds
+// of the bounded-reconciliation branch. The marker prevents a later user
+// restore from being re-authorized by the obsolete sessions column on reopen.
+func (db *DB) migrateSourceBaselinesLocked(w *writerHandle) error {
+	tx, err := w.BeginTx(context.Background(), nil)
+	if err != nil {
+		return fmt.Errorf("starting local source baseline migration: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec("DROP INDEX IF EXISTS idx_sessions_source_baseline_active"); err != nil {
+		return fmt.Errorf("dropping obsolete source baseline index: %w", err)
+	}
+	var completed int
+	if err := tx.QueryRow(`
+		SELECT count(*) FROM archive_metadata WHERE key = ?`,
+		sourceBaselineTableMigrationKey,
+	).Scan(&completed); err != nil {
+		return fmt.Errorf("checking local source baseline migration: %w", err)
+	}
+	if completed == 0 {
+		var legacyColumns int
+		if err := tx.QueryRow(`
+			SELECT count(*) FROM pragma_table_info('sessions')
+			WHERE name = 'source_baseline_path'`,
+		).Scan(&legacyColumns); err != nil {
+			return fmt.Errorf("probing legacy source baseline column: %w", err)
+		}
+		if legacyColumns > 0 {
+			if _, err := tx.Exec(`
+				INSERT INTO local_session_source_baselines
+					(session_id, machine, agent, file_path)
+				SELECT id, machine, agent, file_path
+				FROM sessions
+				WHERE file_path IS NOT NULL
+				  AND source_baseline_path = file_path
+				ON CONFLICT(session_id) DO UPDATE SET
+					machine = excluded.machine,
+					agent = excluded.agent,
+					file_path = excluded.file_path`); err != nil {
+				return fmt.Errorf("importing legacy source baselines: %w", err)
+			}
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO archive_metadata (key, value)
+			VALUES (?, '1')`, sourceBaselineTableMigrationKey); err != nil {
+			return fmt.Errorf("recording local source baseline migration: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing local source baseline migration: %w", err)
+	}
+	return nil
+}
+
 func (db *DB) scrubProjectIdentityGitRemoteCredentialsLocked(
 	w *writerHandle,
 ) error {
@@ -2311,14 +2374,46 @@ func (db *DB) createPartialIndexesLocked(w *writerHandle) error {
 		   AND model != '<synthetic>'`,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_has_secret
 		 ON sessions(secret_leak_count) WHERE secret_leak_count > 0`,
-		`CREATE INDEX IF NOT EXISTS idx_sessions_agent_file_path_active
-		 ON sessions(agent, file_path)
-		 WHERE file_path IS NOT NULL AND deleted_at IS NULL`,
 	}
 	for _, ddl := range indexes {
 		if _, err := w.Exec(ddl); err != nil {
 			return fmt.Errorf("creating index: %w", err)
 		}
+	}
+	var sourceIndexColumns sql.NullString
+	if err := w.QueryRow(`
+		SELECT group_concat(name, ',')
+		FROM (
+			SELECT name
+			FROM pragma_index_info('idx_sessions_agent_file_path_active')
+			ORDER BY seqno
+		)`).Scan(&sourceIndexColumns); err != nil {
+		return fmt.Errorf("probing active session source index: %w", err)
+	}
+	var sourceIndexSQL sql.NullString
+	if err := w.QueryRow(`
+		SELECT sql FROM sqlite_master
+		WHERE type = 'index' AND name = 'idx_sessions_agent_file_path_active'
+	`).Scan(&sourceIndexSQL); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("reading active session source index: %w", err)
+	}
+	normalizedSourceIndexSQL := strings.ToLower(
+		strings.Join(strings.Fields(sourceIndexSQL.String), " "),
+	)
+	if sourceIndexColumns.String != "agent,file_path,id" ||
+		!strings.Contains(normalizedSourceIndexSQL,
+			"where file_path is not null and deleted_at is null") {
+		if _, err := w.Exec(
+			`DROP INDEX IF EXISTS idx_sessions_agent_file_path_active`,
+		); err != nil {
+			return fmt.Errorf("dropping legacy active session source index: %w", err)
+		}
+	}
+	if _, err := w.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_sessions_agent_file_path_active
+		ON sessions(agent, file_path, id)
+		WHERE file_path IS NOT NULL AND deleted_at IS NULL`); err != nil {
+		return fmt.Errorf("creating active session source index: %w", err)
 	}
 	if _, err := w.Exec(
 		`DROP INDEX IF EXISTS idx_messages_usage_timestamp`,

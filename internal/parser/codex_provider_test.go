@@ -1450,6 +1450,29 @@ func TestCodexProviderDiscoverDedupesLiveAndArchivedByUUID(t *testing.T) {
 	assert.NotEqual(t, archivedPath, discovered[0].DisplayPath)
 }
 
+func TestCodexProviderDiscoverEachYieldsDuplicateCandidates(t *testing.T) {
+	base := t.TempDir()
+	liveRoot := filepath.Join(base, "sessions")
+	archivedRoot := filepath.Join(base, "archived_sessions")
+	uuid := "019eb791-cf7d-75c1-8439-9ed74c1229e5"
+	livePath := writeCodexProviderSession(t, liveRoot, uuid, "live")
+	archivedPath := writeCodexProviderArchivedSession(t, archivedRoot, uuid, "archived")
+	provider, ok := NewProvider(AgentCodex, ProviderConfig{
+		Roots: []string{archivedRoot, liveRoot},
+	})
+	require.True(t, ok)
+	discoverer, ok := provider.(StreamingDiscoverer)
+	require.True(t, ok)
+
+	var paths []string
+	require.NoError(t, discoverer.DiscoverEach(t.Context(), func(source SourceRef) error {
+		paths = append(paths, source.DisplayPath)
+		return nil
+	}))
+
+	assert.ElementsMatch(t, []string{archivedPath, livePath}, paths)
+}
+
 func TestCodexProviderFindSourcePinsExactArchivedDuplicate(t *testing.T) {
 	base := t.TempDir()
 	liveRoot := filepath.Join(base, "sessions")

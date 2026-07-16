@@ -397,6 +397,7 @@ var prepareHTTPRebuildCLI = func(
 
 var runLocalSyncWithRebuildCLI = runLocalSyncWithRebuild
 var runLocalSyncWithFallbackCLI = runLocalSyncWithFallback
+var coordinateLocalSyncRunner = coordinateLocalSync
 
 type preparedHTTPRebuildLeaseCLI struct {
 	prepared preparedHTTPRebuildCLI
@@ -737,6 +738,33 @@ func primaryCoordinatorError(err error) error {
 func runLocalSync(
 	ctx context.Context, appCfg config.Config, database *db.DB, full bool,
 ) bool {
+	didResync, _, err := runLocalSyncResult(ctx, appCfg, database, full)
+	if err != nil {
+		log.Printf("local sync failed: %v", err)
+	}
+	return didResync
+}
+
+// runLocalSyncAuthoritative runs a local sync and returns an error unless its
+// provider discovery completed authoritatively. Push-watch callers use it so
+// a mirror update cannot acknowledge watcher reconciliation that never
+// established a complete view of the local sources.
+func runLocalSyncAuthoritative(
+	ctx context.Context, appCfg config.Config, database *db.DB, full bool,
+) (bool, error) {
+	didResync, stats, err := runLocalSyncResult(ctx, appCfg, database, full)
+	if err != nil {
+		return didResync, err
+	}
+	if !stats.AuthoritativeDiscoveryComplete() {
+		return didResync, errors.New("local sync discovery incomplete")
+	}
+	return didResync, nil
+}
+
+func runLocalSyncResult(
+	ctx context.Context, appCfg config.Config, database *db.DB, full bool,
+) (bool, sync.SyncStats, error) {
 	didResync := full || database.NeedsResync()
 	var progress sync.ProgressFunc
 	var resyncProgress *resyncProgressPrinter
@@ -749,7 +777,7 @@ func runLocalSync(
 		progress = printSyncProgress
 	}
 	started := time.Now()
-	didResync, stats, err := coordinateLocalSync(
+	didResync, stats, err := coordinateLocalSyncRunner(
 		ctx, appCfg, database, full, progress, true,
 		func() (sync.RebuildOptions, sync.RebuildCleanup, error) {
 			return sync.RebuildOptions{}, nil, nil
@@ -759,11 +787,8 @@ func runLocalSync(
 	if resyncProgress != nil {
 		resyncProgress.Finish()
 	}
-	if err != nil {
-		log.Printf("local sync failed: %v", err)
-	}
 	printDirectSyncResult(ctx, database, stats, started)
-	return didResync
+	return didResync, stats, err
 }
 
 func runLocalSyncWithRebuild(

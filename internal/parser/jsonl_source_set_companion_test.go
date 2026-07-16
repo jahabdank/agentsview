@@ -2,6 +2,7 @@ package parser
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -112,6 +113,38 @@ func TestJSONLSourceSetCompanionChangedPathMapsToTranscript(t *testing.T) {
 	src, ok := changed[0].Opaque.(JSONLSource)
 	require.True(t, ok)
 	assert.Equal(t, transcript, src.Path)
+}
+
+func TestJSONLSourceSetCompanionWatchRootsStayBoundedByConfiguredRoots(t *testing.T) {
+	measure := func(t *testing.T, transcriptCount int) (int, float64) {
+		t.Helper()
+		root := t.TempDir()
+		for i := range transcriptCount {
+			transcript := filepath.Join(root, fmt.Sprintf("session-%04d.jsonl", i))
+			writeFile(t, transcript, "{}\n")
+			writeFile(t, transcript+".meta", "meta")
+		}
+		set := NewJSONLSourceSet(
+			AgentClaude,
+			[]string{root},
+			WithCompanionFiles(companionFor),
+		)
+
+		var roots []WatchRoot
+		allocs := testing.AllocsPerRun(20, func() {
+			var err error
+			roots, err = set.WatchRoots(context.Background())
+			require.NoError(t, err)
+		})
+		return len(roots), allocs
+	}
+
+	smallRoots, smallAllocs := measure(t, 1)
+	largeRoots, largeAllocs := measure(t, 500)
+	assert.Equal(t, smallRoots, largeRoots,
+		"root-plan cardinality must depend on configured roots, not transcripts")
+	assert.Equal(t, smallAllocs, largeAllocs,
+		"root planning allocations must not scale with transcript companions")
 }
 
 func TestJSONLSourceSetCompanionWatchPlanIncludesCompanionGlob(t *testing.T) {

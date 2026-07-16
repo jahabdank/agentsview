@@ -54,6 +54,10 @@ func (p *codexProvider) Discover(ctx context.Context) ([]SourceRef, error) {
 	return p.sources.Discover(ctx)
 }
 
+func (p *codexProvider) DiscoverEach(ctx context.Context, yield func(SourceRef) error) error {
+	return p.sources.DiscoverEach(ctx, yield)
+}
+
 func (p *codexProvider) WatchPlan(ctx context.Context) (WatchPlan, error) {
 	return p.sources.WatchPlan(ctx)
 }
@@ -295,6 +299,41 @@ func newCodexSourceSet(roots []string) codexSourceSet {
 
 func (s codexSourceSet) Discover(ctx context.Context) ([]SourceRef, error) {
 	return s.discover(ctx, func(string) bool { return true })
+}
+
+func (s codexSourceSet) DiscoverEach(
+	ctx context.Context, yield func(SourceRef) error,
+) error {
+	for _, root := range s.roots {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if strings.HasPrefix(root, "s3://") {
+			for _, file := range discoverCodexS3(root) {
+				if err := yield(s3SourceRefFromDiscoveredFile(file)); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		err := streamDirectoryTree(ctx, root, func(path string, entry os.DirEntry) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if !isCodexSessionFilename(entry.Name()) {
+				return nil
+			}
+			source, ok := s.sourceRef(root, path, true)
+			if !ok {
+				return nil
+			}
+			return yield(source)
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s codexSourceSet) discover(
@@ -757,6 +796,7 @@ func codexProviderCapabilities() Capabilities {
 	return Capabilities{
 		Source: SourceCapabilities{
 			DiscoverSources:      CapabilitySupported,
+			StreamingDiscovery:   CapabilitySupported,
 			WatchSources:         CapabilitySupported,
 			ClassifyChangedPath:  CapabilitySupported,
 			FindSource:           CapabilitySupported,

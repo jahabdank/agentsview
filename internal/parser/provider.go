@@ -9,6 +9,7 @@ import (
 const (
 	ProviderFeatureFingerprint = "fingerprint"
 	ProviderFeatureParse       = "parse"
+	ProviderFeatureWatchRoots  = "watch roots"
 )
 
 // ErrUnsupportedProviderFeature identifies optional provider behavior that is
@@ -93,6 +94,49 @@ type Provider interface {
 	) (IncrementalOutcome, IncrementalStatus, error)
 }
 
+// ReconciliationSourceResolver rebuilds the exact source emitted by streaming
+// discovery without routing the virtual path back through changed-path
+// classification. Shared-container providers use it to avoid rescanning every
+// member in the container once per spool page/member.
+type ReconciliationSourceResolver interface {
+	SourceForReconciliation(
+		context.Context, string, string,
+	) (SourceRef, bool, error)
+}
+
+// ReconciliationMemberIdentityResolver derives the stable logical-member
+// identity stored in a full session ID. Providers whose virtual paths can be
+// reused declare this alongside SourceRef.ReconciliationIdentity so the engine
+// can validate both the path and the member during authoritative discovery.
+type ReconciliationMemberIdentityResolver interface {
+	ReconciliationMemberIdentity(fullSessionID string) string
+}
+
+// PersistentArchiveSourceResolver validates that a stored source belongs to a
+// provider-specific persistent container and returns its physical path. The
+// engine must not infer this policy from provider-neutral virtual-path syntax:
+// hybrid providers can also own ordinary files whose paths contain the same
+// delimiter.
+type PersistentArchiveSourceResolver interface {
+	PersistentArchiveSource(
+		path string, fullSessionID string,
+	) (physicalPath string, ok bool)
+}
+
+// StoredSourceHintScope identifies one bounded stored-path prefix. Providers
+// explicitly declare virtual-member ownership because filename shape cannot
+// distinguish extensionless containers from ordinary paths.
+type StoredSourceHintScope struct {
+	Path                  string
+	IncludeVirtualMembers bool
+}
+
+// StoredSourceHintScopeProvider derives the stored-source scopes that can
+// affect one changed path without reading the archive database.
+type StoredSourceHintScopeProvider interface {
+	StoredSourceHintScopes(ChangedPathRequest) []StoredSourceHintScope
+}
+
 // ProviderBase is embedded by concrete providers to make optional source
 // methods callable with zero-value no-op behavior.
 type ProviderBase struct {
@@ -174,6 +218,11 @@ type SourceRef struct {
 	// file_path values unless a documented provider-specific transition handles
 	// old rows.
 	FingerprintKey string
+	// ReconciliationIdentity is an optional stable logical-member identity used
+	// with DisplayPath to distinguish virtual sources whose positional path can
+	// later be reused by a different member. It is never persisted as source
+	// metadata and is consumed only by authoritative discovery reconciliation.
+	ReconciliationIdentity string
 	// ProjectHint is advisory metadata for UI grouping and may be empty.
 	ProjectHint string
 	// DiscoveryMTimeNS is an optional per-source modification time in Unix
@@ -203,6 +252,54 @@ type SourceRef struct {
 // fields are fallback compatibility only.
 type WatchPlan struct {
 	Roots []WatchRoot
+}
+
+// WatchRootPlanner is the optional bounded scheduling surface for providers
+// and source sets. Unlike WatchPlan, it returns only watcher root metadata and
+// must not discover sources to derive parser-only include globs.
+type WatchRootPlanner interface {
+	WatchRoots(context.Context) ([]WatchRoot, error)
+}
+
+// ResolveWatchRoots returns the bounded root-planning capability when a
+// provider advertises it. Providers that have not migrated yet retain their
+// WatchPlan behavior, but parser-only include/exclude globs are never carried
+// into watcher scheduling.
+func ResolveWatchRoots(
+	ctx context.Context,
+	provider Provider,
+) ([]WatchRoot, error) {
+	if provider.Capabilities().Source.WatchRoots == CapabilitySupported {
+		planner, ok := provider.(WatchRootPlanner)
+		if !ok {
+			return nil, UnsupportedProviderFeatureError{
+				Provider: provider.Definition().Type,
+				Feature:  ProviderFeatureWatchRoots,
+			}
+		}
+		roots, err := planner.WatchRoots(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return watchRootMetadata(roots), nil
+	}
+	plan, err := provider.WatchPlan(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return watchRootMetadata(plan.Roots), nil
+}
+
+func watchRootMetadata(roots []WatchRoot) []WatchRoot {
+	out := make([]WatchRoot, 0, len(roots))
+	for _, root := range roots {
+		out = append(out, WatchRoot{
+			Path:        root.Path,
+			Recursive:   root.Recursive,
+			DebounceKey: root.DebounceKey,
+		})
+	}
+	return out
 }
 
 // WatchRoot is one filesystem root the engine should watch. Recursive roots

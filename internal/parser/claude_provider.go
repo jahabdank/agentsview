@@ -47,6 +47,10 @@ func (p *claudeProvider) Discover(ctx context.Context) ([]SourceRef, error) {
 	return p.sources.Discover(ctx)
 }
 
+func (p *claudeProvider) DiscoverEach(ctx context.Context, yield func(SourceRef) error) error {
+	return p.sources.DiscoverEach(ctx, yield)
+}
+
 func (p *claudeProvider) WatchPlan(ctx context.Context) (WatchPlan, error) {
 	return p.sources.WatchPlan(ctx)
 }
@@ -230,6 +234,44 @@ func (s claudeSourceSet) Discover(ctx context.Context) ([]SourceRef, error) {
 	}
 	sortJSONLSources(sources)
 	return sources, nil
+}
+
+func (s claudeSourceSet) DiscoverEach(
+	ctx context.Context, yield func(SourceRef) error,
+) error {
+	for _, root := range s.roots {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if strings.HasPrefix(root, "s3://") {
+			for _, file := range ClaudeProjectSessionFiles(root) {
+				source, ok := s.discoveredSourceRef(root, file)
+				if ok {
+					if err := yield(source); err != nil {
+						return err
+					}
+				}
+			}
+			continue
+		}
+		err := streamDirectoryTree(ctx, root, func(path string, entry os.DirEntry) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if !strings.HasSuffix(entry.Name(), ".jsonl") {
+				return nil
+			}
+			source, ok := s.sourceRef(root, path)
+			if !ok {
+				return nil
+			}
+			return yield(source)
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // discoveredSourceRef builds the SourceRef for one enumerated Claude session
@@ -535,6 +577,7 @@ func claudeProviderCapabilities() Capabilities {
 	return Capabilities{
 		Source: SourceCapabilities{
 			DiscoverSources:      CapabilitySupported,
+			StreamingDiscovery:   CapabilitySupported,
 			WatchSources:         CapabilitySupported,
 			ClassifyChangedPath:  CapabilitySupported,
 			FindSource:           CapabilitySupported,

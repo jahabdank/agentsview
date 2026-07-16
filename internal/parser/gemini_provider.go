@@ -3,6 +3,7 @@ package parser
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
@@ -48,6 +49,10 @@ type geminiProvider struct {
 
 func (p *geminiProvider) Discover(ctx context.Context) ([]SourceRef, error) {
 	return p.sources.Discover(ctx)
+}
+
+func (p *geminiProvider) DiscoverEach(ctx context.Context, yield func(SourceRef) error) error {
+	return p.sources.DiscoverEach(ctx, yield)
 }
 
 func (p *geminiProvider) WatchPlan(ctx context.Context) (WatchPlan, error) {
@@ -140,6 +145,57 @@ func (s geminiSourceSet) Discover(ctx context.Context) ([]SourceRef, error) {
 	}
 	sortJSONLSources(sources)
 	return sources, nil
+}
+
+func (s geminiSourceSet) DiscoverEach(ctx context.Context, yield func(SourceRef) error) error {
+	for _, root := range s.roots {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		projects, err := newDiscoveryDiskMapForContext(ctx)
+		if err != nil {
+			return err
+		}
+		if err := projects.loadGeminiConfig(ctx, root); err != nil {
+			return errors.Join(err, projects.close())
+		}
+		tmpDir := filepath.Join(root, "tmp")
+		err = streamDirectoryEntries(ctx, tmpDir, func(projectDir os.DirEntry) error {
+			if !isDirOrSymlink(projectDir, tmpDir) {
+				return nil
+			}
+			project, _, err := projects.get(ctx, projectDir.Name())
+			if err != nil {
+				return err
+			}
+			if project == "" {
+				if isHexHash(projectDir.Name()) {
+					project = "unknown"
+				} else {
+					project = NormalizeName(projectDir.Name())
+				}
+			}
+			chatDir := filepath.Join(tmpDir, projectDir.Name(), geminiChatsDir)
+			return streamDirectoryEntries(ctx, chatDir, func(entry os.DirEntry) error {
+				if entry.IsDir() || !isGeminiSessionFilename(entry.Name()) {
+					return nil
+				}
+				path := filepath.Join(chatDir, entry.Name())
+				source, ok := s.sourceRefForPathWithProjectMap(
+					root, path, true, map[string]string{projectDir.Name(): project},
+				)
+				if ok {
+					return yield(source)
+				}
+				return nil
+			})
+		})
+		err = errors.Join(err, projects.close())
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s geminiSourceSet) discoverRoot(
@@ -510,6 +566,7 @@ func geminiProviderCapabilities() Capabilities {
 	return Capabilities{
 		Source: SourceCapabilities{
 			DiscoverSources:      CapabilitySupported,
+			StreamingDiscovery:   CapabilitySupported,
 			WatchSources:         CapabilitySupported,
 			ClassifyChangedPath:  CapabilitySupported,
 			FindSource:           CapabilitySupported,

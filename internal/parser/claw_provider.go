@@ -58,6 +58,10 @@ func (p *openClawProvider) Discover(ctx context.Context) ([]SourceRef, error) {
 	return p.sources.Discover(ctx)
 }
 
+func (p *openClawProvider) DiscoverEach(ctx context.Context, yield func(SourceRef) error) error {
+	return p.sources.DiscoverEach(ctx, yield)
+}
+
 func (p *openClawProvider) WatchPlan(ctx context.Context) (WatchPlan, error) {
 	return p.sources.WatchPlan(ctx)
 }
@@ -135,6 +139,10 @@ type qClawProvider struct {
 
 func (p *qClawProvider) Discover(ctx context.Context) ([]SourceRef, error) {
 	return p.sources.Discover(ctx)
+}
+
+func (p *qClawProvider) DiscoverEach(ctx context.Context, yield func(SourceRef) error) error {
+	return p.sources.DiscoverEach(ctx, yield)
 }
 
 func (p *qClawProvider) WatchPlan(ctx context.Context) (WatchPlan, error) {
@@ -219,6 +227,38 @@ func (s clawSourceSet) Discover(ctx context.Context) ([]SourceRef, error) {
 		return sources[i].Key < sources[j].Key
 	})
 	return sources, nil
+}
+
+func (s clawSourceSet) DiscoverEach(ctx context.Context, yield func(SourceRef) error) error {
+	for _, root := range s.roots {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := streamDirectoryEntries(ctx, root, func(agent os.DirEntry) error {
+			if !isDirOrSymlink(agent, root) || !IsValidSessionID(agent.Name()) {
+				return nil
+			}
+			dir := filepath.Join(root, agent.Name(), "sessions")
+			return streamDirectoryEntries(ctx, dir, func(entry os.DirEntry) error {
+				if entry.IsDir() || !s.spec.sessionFile(entry.Name()) ||
+					!IsValidSessionID(s.spec.sessionID(entry.Name())) {
+					return nil
+				}
+				source, ok := s.sourceRef(root, filepath.Join(dir, entry.Name()))
+				if !ok {
+					return nil
+				}
+				if info, infoErr := entry.Info(); infoErr == nil {
+					source.DiscoveryMTimeNS = info.ModTime().UnixNano()
+				}
+				return yield(source)
+			})
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s clawSourceSet) WatchPlan(context.Context) (WatchPlan, error) {
@@ -424,7 +464,7 @@ func (s clawSourceSet) sourceRef(root string, path string) (SourceRef, bool) {
 	}
 	return SourceRef{
 		Provider:       s.spec.agent,
-		Key:            path,
+		Key:            rawID,
 		DisplayPath:    path,
 		FingerprintKey: path,
 		ProjectHint:    clawAgentIDFromRawID(rawID),
@@ -676,8 +716,10 @@ func qClawProviderCapabilities() Capabilities {
 }
 
 func clawProviderCapabilities() Capabilities {
+	source := jsonlFileProviderSourceCapabilities()
+	source.StreamingDiscovery = CapabilitySupported
 	return Capabilities{
-		Source: jsonlFileProviderSourceCapabilities(),
+		Source: source,
 		Content: ContentCapabilities{
 			FirstMessage:         CapabilitySupported,
 			Thinking:             CapabilitySupported,

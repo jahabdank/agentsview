@@ -14,9 +14,13 @@ import (
 
 func TestRunDeferredStartupSyncFallbackPerformsSkippedSync(t *testing.T) {
 	database := dbtest.OpenTestDB(t)
+	reconciled := make(chan struct{}, 1)
 	engine := syncpkg.NewEngine(database, syncpkg.EngineConfig{
 		Machine:                 "local",
 		DeferStartupMaintenance: true,
+		OnStartupReconciled: func(syncpkg.SyncStats, error) {
+			reconciled <- struct{}{}
+		},
 	})
 	t.Cleanup(engine.Close)
 	timeout := make(chan time.Time, 1)
@@ -30,4 +34,9 @@ func TestRunDeferredStartupSyncFallbackPerformsSkippedSync(t *testing.T) {
 	assert.True(t, ran)
 	assert.False(t, engine.LastSyncStartedAt().IsZero(),
 		"timeout fallback must perform the skipped local sync")
+	select {
+	case <-reconciled:
+	case <-time.After(time.Second):
+		require.FailNow(t, "deferred fallback did not reconcile watcher startup")
+	}
 }

@@ -7,7 +7,7 @@ import (
 )
 
 func newQoderProviderFactory(def AgentDef) ProviderFactory {
-	return NewSourceSetFactory(
+	return NewStreamingSourceSetFactory(
 		def,
 		qoderProviderCapabilities(),
 		func(cfg ProviderConfig) SourceSet { return newQoderSourceSet(cfg.Roots) },

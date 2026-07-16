@@ -53,6 +53,79 @@ func TestSyncFullPushCreatesExpectedRows(t *testing.T) {
 	assert.Equal(t, "alpha first", firstMessage)
 }
 
+func TestSyncPreservesSourceMissingCauseWithoutAddingItToUserTrash(t *testing.T) {
+	ctx := t.Context()
+	local := newLocalDB(t)
+	sourcePath := filepath.Join(t.TempDir(), "missing.jsonl")
+	for _, sess := range []db.Session{
+		{
+			ID: "source-missing", Project: "project", Machine: "local",
+			Agent: "claude", FilePath: &sourcePath,
+		},
+		{
+			ID: "user-trash", Project: "project", Machine: "local",
+			Agent: "claude",
+		},
+	} {
+		require.NoError(t, local.UpsertSession(sess))
+	}
+	require.NoError(t, local.BaselineActiveSessionSourcePaths(
+		ctx, "local", []db.SessionSourcePath{{
+			Agent: "claude", FilePath: sourcePath,
+		}},
+	))
+	tombstoned, err := local.SoftDeleteSessionSourceOwnership(
+		ctx, "local", "claude", "source-missing", sourcePath,
+	)
+	require.NoError(t, err)
+	require.True(t, tombstoned)
+	require.NoError(t, local.SoftDeleteSession("user-trash"))
+
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
+	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, err)
+
+	store := NewStoreFromDB(syncer.DB())
+	missing, err := store.GetSessionFull(ctx, "source-missing")
+	require.NoError(t, err)
+	require.NotNil(t, missing)
+	require.NotNil(t, missing.DeletionCause)
+	assert.Equal(t, "source_missing", *missing.DeletionCause)
+
+	trashed, err := store.ListTrashedSessions(ctx)
+	require.NoError(t, err)
+	require.Len(t, trashed, 1)
+	assert.Equal(t, "user-trash", trashed[0].ID)
+	assert.Nil(t, trashed[0].DeletionCause)
+
+	// An explicit local delete converts the recoverable tombstone to ordinary
+	// user trash. A later mirror upsert must propagate that NULL cause.
+	require.NoError(t, local.SoftDeleteSession("source-missing"))
+	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, err)
+	converted, err := store.GetSessionFull(ctx, "source-missing")
+	require.NoError(t, err)
+	require.NotNil(t, converted)
+	assert.Nil(t, converted.DeletionCause)
+	trashed, err = store.ListTrashedSessions(ctx)
+	require.NoError(t, err)
+	require.Len(t, trashed, 2)
+	assert.ElementsMatch(t, []string{"source-missing", "user-trash"},
+		[]string{trashed[0].ID, trashed[1].ID})
+}
+
+func TestDuckSessionFingerprintIncludesDeletionCause(t *testing.T) {
+	base := db.Session{ID: "session", Machine: "machine"}
+	withCause := base
+	cause := "source_missing"
+	withCause.DeletionCause = &cause
+
+	assert.NotEqual(t,
+		duckSessionFingerprintFields(base, base.Machine),
+		duckSessionFingerprintFields(withCause, withCause.Machine),
+	)
+}
+
 func TestSyncPushContinuesAfterSessionError(t *testing.T) {
 	ctx := context.Background()
 	local := newLocalDB(t)

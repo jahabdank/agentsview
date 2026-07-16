@@ -5322,6 +5322,41 @@ func TestSoftDeleteSessions(t *testing.T) {
 	assert.Equal(t, 0, n, "empty: rows=")
 }
 
+func TestSoftDeleteConvertsSourceMissingTombstonesToUserTrash(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	paths := map[string]string{
+		"single": filepath.Join(t.TempDir(), "single.jsonl"),
+		"batch":  filepath.Join(t.TempDir(), "batch.jsonl"),
+	}
+	for id, path := range paths {
+		insertSession(t, d, id, "proj", func(s *Session) {
+			s.Agent = "claude"
+			s.FilePath = &path
+		})
+		baselineSessionSource(t, d, defaultMachine, "claude", path)
+		changed, err := d.SoftDeleteSessionSourceOwnership(
+			ctx, defaultMachine, "claude", id, path,
+		)
+		require.NoError(t, err)
+		require.True(t, changed)
+	}
+
+	require.NoError(t, d.SoftDeleteSession("single"))
+	count, err := d.SoftDeleteSessions([]string{"batch"})
+	require.NoError(t, err)
+	assert.Equal(t, 1, count)
+
+	for id := range paths {
+		full, err := d.GetSessionFull(ctx, id)
+		require.NoError(t, err)
+		require.NotNil(t, full)
+		assert.Nil(t, full.DeletionCause,
+			"an explicit user deletion must replace the recoverable source tombstone")
+		assert.True(t, d.IsSessionTrashed(id))
+	}
+}
+
 func TestMetadataQueriesExcludeTrashed(t *testing.T) {
 	d := testDB(t)
 	ctx := context.Background()

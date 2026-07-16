@@ -142,6 +142,7 @@ func TestEnsureSchemaAddsMissingColumnsNonDestructively(t *testing.T) {
 	require.NoError(t, EnsureSchema(ctx, db), "EnsureSchema")
 
 	assert.True(t, columnExists(t, db, "sessions", "ended_at"))
+	assert.True(t, columnExists(t, db, "sessions", "deletion_cause"))
 	var project string
 	require.NoError(t, db.QueryRowContext(ctx,
 		`SELECT project FROM sessions WHERE id = ?`, "kept",
@@ -157,6 +158,11 @@ func TestEnsureSchemaAddsMissingColumnsNonDestructively(t *testing.T) {
 	assert.Equal(t, 0, messageCount)
 	assert.Equal(t, "", relationshipType)
 	assert.False(t, isAutomated)
+	var deletionCause *string
+	require.NoError(t, db.QueryRowContext(ctx,
+		`SELECT deletion_cause FROM sessions WHERE id = ?`, "kept",
+	).Scan(&deletionCause))
+	assert.Nil(t, deletionCause)
 }
 
 func TestEnsureSchemaMigratesMessagesIDPrimaryKey(t *testing.T) {

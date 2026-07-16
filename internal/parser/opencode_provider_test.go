@@ -3,6 +3,7 @@ package parser
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -12,6 +13,50 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestOpenCodeHybridStreamingDiscoveryPropagatesSQLiteFailure(t *testing.T) {
+	root := t.TempDir()
+	writeOpenCodeProviderStorageSession(
+		t, root, "session", "ses_storage", "project", "Storage",
+	)
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, "opencode.db"), []byte("not sqlite"), 0o600,
+	))
+	provider, ok := NewProvider(AgentOpenCode, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+
+	err := provider.(StreamingDiscoverer).DiscoverEach(
+		t.Context(), func(SourceRef) error { return nil },
+	)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "SQLite")
+}
+
+func TestOpenCodeHybridStreamingDiscoveryPropagatesNestedStorageFailure(t *testing.T) {
+	root := t.TempDir()
+	writeOpenCodeProviderStorageSession(
+		t, root, "session", "ses_storage", "project", "Storage",
+	)
+	projectDir := filepath.Join(root, "storage", "session", "global")
+	injected := errors.New("nested storage read failed")
+	ctx := withStreamingDirectoryReader(t.Context(), func(
+		ctx context.Context, dir string, yield func(os.DirEntry) error,
+	) error {
+		if samePath(dir, projectDir) {
+			return injected
+		}
+		return streamDirectoryEntriesDirect(ctx, dir, yield)
+	})
+	provider, ok := NewProvider(AgentOpenCode, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+
+	err := provider.(StreamingDiscoverer).DiscoverEach(
+		ctx, func(SourceRef) error { return nil },
+	)
+
+	assert.ErrorIs(t, err, injected)
+}
 
 func TestOpenCodeProviderStorageSourceMethods(t *testing.T) {
 
@@ -144,6 +189,22 @@ func TestOpenCodeProviderSQLiteSourceMethods(t *testing.T) {
 	require.NoError(t, err)
 	requireSourcePathsMatch(t, discovered, fixture.AllVirtualPaths)
 	requireContainsSourcePath(t, discovered, virtualPath)
+	maxBuffered := 0
+	streamed := make([]SourceRef, 0, len(fixture.AllVirtualPaths))
+	streamCtx := WithStreamingDiscoveryBufferObserver(
+		context.Background(),
+		func(buffered int) { maxBuffered = max(maxBuffered, buffered) },
+	)
+	require.NoError(t, provider.(StreamingDiscoverer).DiscoverEach(
+		streamCtx,
+		func(source SourceRef) error {
+			streamed = append(streamed, source)
+			return nil
+		},
+	))
+	requireSourcePathsMatch(t, streamed, fixture.AllVirtualPaths)
+	assert.Equal(t, 1, maxBuffered,
+		"SQLite discovery must expose one rows.Next source at a time")
 
 	changed, err := provider.SourcesForChangedPath(
 		context.Background(),
@@ -151,6 +212,13 @@ func TestOpenCodeProviderSQLiteSourceMethods(t *testing.T) {
 	)
 	require.NoError(t, err)
 	requireSourcePathsMatch(t, changed, fixture.AllVirtualPaths)
+
+	changed, err = provider.SourcesForChangedPath(
+		context.Background(),
+		ChangedPathRequest{Path: virtualPath, EventKind: "write", WatchRoot: root},
+	)
+	require.NoError(t, err)
+	requireSourcePathsMatch(t, changed, []string{virtualPath})
 
 	found, ok, err := provider.FindSource(context.Background(), FindSourceRequest{
 		FullSessionID: "host~opencode:" + fixture.TargetSessionID,
@@ -388,6 +456,19 @@ func TestOpenCodeProviderHybridDiscoveryFiltersSQLiteDuplicate(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, storagePath, found.DisplayPath)
+
+	changed, err := provider.SourcesForChangedPath(
+		context.Background(),
+		ChangedPathRequest{
+			Path:      OpenCodeSQLiteVirtualPath(dbPath, "ses_dup"),
+			EventKind: "write",
+			WatchRoot: root,
+		},
+	)
+	require.NoError(t, err)
+	require.Len(t, changed, 1)
+	assert.Equal(t, storagePath, changed[0].DisplayPath,
+		"a storage source that appears before rehydration remains canonical")
 }
 
 func TestOpenCodeProviderDiscoveryToleratesCorruptSQLiteDB(t *testing.T) {

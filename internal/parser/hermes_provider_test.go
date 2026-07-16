@@ -126,21 +126,16 @@ func TestHermesProviderStateDBSourceMethods(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.True(t, ok)
-	assert.Equal(t, stateDB, found.DisplayPath)
+	memberPath := VirtualSourcePath(stateDB, "child")
+	assert.Equal(t, memberPath, found.DisplayPath)
 
 	stateInfo, err := os.Stat(stateDB)
 	require.NoError(t, err)
-	transcriptInfo, err := os.Stat(transcriptPath)
-	require.NoError(t, err)
 	fingerprint, err := provider.Fingerprint(context.Background(), found)
 	require.NoError(t, err)
-	assert.Equal(t, stateDB, fingerprint.Key)
-	assert.Equal(t, stateInfo.Size()+transcriptInfo.Size(), fingerprint.Size)
-	assert.Equal(
-		t,
-		max(stateInfo.ModTime().UnixNano(), transcriptInfo.ModTime().UnixNano()),
-		fingerprint.MTimeNS,
-	)
+	assert.Equal(t, memberPath, fingerprint.Key)
+	assert.Equal(t, stateInfo.Size(), fingerprint.Size)
+	assert.Equal(t, stateInfo.ModTime().UnixNano(), fingerprint.MTimeNS)
 	assert.NotEmpty(t, fingerprint.Hash)
 
 	for _, tc := range []struct {
