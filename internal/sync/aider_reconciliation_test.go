@@ -6,12 +6,54 @@ import (
 	"strings"
 	"testing"
 
+	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/parser"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestReconcileWatchRootsAiderOverlappingRootsReuseStableRunIdentity(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	require.NoError(t, os.MkdirAll(repo, 0o755))
+	historyPath := filepath.Join(repo, parser.AiderHistoryFileName())
+	require.NoError(t, os.WriteFile(
+		historyPath,
+		[]byte("# aider chat started at 2026-06-09 14:01:00\n#### prompt\nanswer\n"),
+		0o644,
+	))
+	expectedRawID, ok := parser.AiderRawIDAt(historyPath, 0)
+	require.True(t, ok)
+	expectedID := "aider:" + expectedRawID
+
+	database := dbtest.OpenTestDB(t)
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentAider: {root, repo},
+		},
+		Machine: "test-machine",
+	})
+	t.Cleanup(engine.Close)
+
+	require.NoError(t, engine.ReconcileWatchRoots(t.Context(), []string{root}, false))
+
+	active, err := database.GetSession(t.Context(), expectedID)
+	require.NoError(t, err)
+	assert.NotNil(t, active, "the physical run keeps its parser-derived identity")
+	page, err := database.ListSessions(t.Context(), db.SessionFilter{
+		Agent: string(parser.AgentAider), Limit: 10,
+	})
+	require.NoError(t, err)
+	activeIDs := make([]string, 0, len(page.Sessions))
+	for _, session := range page.Sessions {
+		activeIDs = append(activeIDs, session.ID)
+	}
+	assert.Equal(t, []string{expectedID}, activeIDs,
+		"overlapping roots must produce exactly one active Aider session")
+	assert.Equal(t, 1, engine.LastReconciliationResult().Metrics.SharedContainerScans)
+}
 
 func TestReconcileWatchRootsAiderScansOneLargeContainerOnce(t *testing.T) {
 	root := t.TempDir()

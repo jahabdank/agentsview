@@ -46,6 +46,53 @@ func vsCopilotTraceLine(
 		`]}]}]}]}`
 }
 
+func TestReconcileWatchRootsPreservesVisualStudioCopilotSessionBehindSymlinkedVSRoot(
+	t *testing.T,
+) {
+	root := t.TempDir()
+	conversationID := "5bc5f6d7-9a6e-4f9c-8f3c-b7be2e7d9f20"
+	vsRoot := filepath.Join(root, ".vs")
+	sessionPath := filepath.Join(
+		vsRoot, "SampleApp", "copilot-chat", "thread", "sessions",
+		conversationID,
+	)
+	require.NoError(t, os.MkdirAll(filepath.Dir(sessionPath), 0o755))
+	require.NoError(t, os.WriteFile(sessionPath, []byte(vsCopilotTraceLine(
+		conversationID, "span", "chat gpt-5.5", "1781293600000000000",
+		"1781293610000000000", map[string]string{
+			"gen_ai.operation.name": "chat",
+			"gen_ai.input.messages": `[{"role":"user","parts":[{"type":"text","content":"Run the tests."}]}]`,
+		},
+	)+"\n"), 0o600))
+
+	database := dbtest.OpenTestDB(t)
+	engine := sync.NewEngine(database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentVSCopilot: {root}},
+		Machine:   "local",
+	})
+	t.Cleanup(engine.Close)
+
+	stats := engine.SyncAll(t.Context(), nil)
+	require.False(t, stats.Aborted)
+	require.Equal(t, 1, stats.Synced)
+	sessionID := "visualstudio-copilot:" + conversationID
+	stored, err := database.GetSession(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+
+	targetVSRoot := filepath.Join(t.TempDir(), "vs-data")
+	require.NoError(t, os.Rename(vsRoot, targetVSRoot))
+	if err := os.Symlink(targetVSRoot, vsRoot); err != nil {
+		t.Skipf("symlink not supported: %v", err)
+	}
+
+	require.NoError(t, engine.ReconcileWatchRoots(t.Context(), []string{root}, false))
+	active, err := database.GetSession(t.Context(), sessionID)
+	require.NoError(t, err)
+	assert.NotNil(t, active,
+		"authoritative reconciliation must preserve a session behind a directory symlink")
+}
+
 func TestReconcileWatchRootsVisualStudioCopilot300MembersUsesOneBoundedScan(t *testing.T) {
 	const members = 300
 	root := t.TempDir()

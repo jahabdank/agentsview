@@ -84,20 +84,11 @@ func vsCopilotDiscoverEach(
 		return index.put(ctx, id, string(encoded), true)
 	}
 	root = filepath.Clean(root)
-	err = streamDirectoryTree(ctx, root, func(path string, entry os.DirEntry) error {
-		if entry.IsDir() {
+	err = streamDirectoryEntries(ctx, root, func(entry os.DirEntry) error {
+		if entry.IsDir() || !isVisualStudioCopilotTraceFileName(entry.Name()) {
 			return nil
 		}
-		if isVisualStudioCopilotVS2026SessionPath(path) {
-			info, err := entry.Info()
-			if err != nil {
-				return err
-			}
-			return remember(canonicalVisualStudioCopilotConversationID(entry.Name()), path, info.ModTime().UnixNano())
-		}
-		if filepath.Dir(path) != root || !isVisualStudioCopilotTraceFileName(entry.Name()) {
-			return nil
-		}
+		path := filepath.Join(root, entry.Name())
 		info, err := entry.Info()
 		if err != nil {
 			return err
@@ -149,6 +140,9 @@ func vsCopilotDiscoverEach(
 	if err != nil {
 		return err
 	}
+	if err := streamVisualStudioCopilotVS2026Sessions(ctx, root, remember); err != nil {
+		return err
+	}
 	return index.forEach(ctx, func(id, value string) error {
 		var candidate vsCopilotDiskCandidate
 		if err := json.Unmarshal([]byte(value), &candidate); err != nil {
@@ -160,6 +154,156 @@ func vsCopilotDiscoverEach(
 			ProjectHint: "visualstudio", DiscoveryMTimeNS: candidate.MTimeNS,
 		})
 	})
+}
+
+// streamVisualStudioCopilotVS2026Sessions follows only the fixed VS 2026
+// layout. Expected directory symlinks are safe because traversal has a bounded
+// logical depth, and every directory is read through fixed-size batches.
+func streamVisualStudioCopilotVS2026Sessions(
+	ctx context.Context,
+	root string,
+	remember func(id, path string, mtimeNS int64) error,
+) error {
+	switch visualStudioCopilotVS2026RootKind(root) {
+	case visualStudioCopilotVS2026SessionsRoot:
+		return streamVisualStudioCopilotVS2026SessionDirectory(ctx, root, remember)
+	case visualStudioCopilotVS2026ThreadRoot:
+		return streamVisualStudioCopilotVS2026ThreadRoot(ctx, root, remember)
+	case visualStudioCopilotVS2026CopilotChatRoot:
+		return streamVisualStudioCopilotVS2026CopilotChatRoot(ctx, root, remember)
+	case visualStudioCopilotVS2026VSRoot:
+		return streamVisualStudioCopilotVS2026VSRoot(ctx, root, remember)
+	default:
+		vsRoot, ok, err := streamVisualStudioCopilotChildDir(ctx, root, ".vs")
+		if err != nil || !ok {
+			return err
+		}
+		return streamVisualStudioCopilotVS2026VSRoot(ctx, vsRoot, remember)
+	}
+}
+
+func streamVisualStudioCopilotVS2026VSRoot(
+	ctx context.Context,
+	vsRoot string,
+	remember func(id, path string, mtimeNS int64) error,
+) error {
+	return streamVisualStudioCopilotDirectoryCandidates(ctx, vsRoot, func(solutionRoot string) error {
+		copilotChatRoot, ok, err := streamVisualStudioCopilotChildDir(
+			ctx, solutionRoot, "copilot-chat",
+		)
+		if err != nil || !ok {
+			return err
+		}
+		return streamVisualStudioCopilotVS2026CopilotChatRoot(
+			ctx, copilotChatRoot, remember,
+		)
+	})
+}
+
+func streamVisualStudioCopilotVS2026CopilotChatRoot(
+	ctx context.Context,
+	copilotChatRoot string,
+	remember func(id, path string, mtimeNS int64) error,
+) error {
+	return streamVisualStudioCopilotDirectoryCandidates(ctx, copilotChatRoot, func(threadRoot string) error {
+		return streamVisualStudioCopilotVS2026ThreadRoot(ctx, threadRoot, remember)
+	})
+}
+
+func streamVisualStudioCopilotVS2026ThreadRoot(
+	ctx context.Context,
+	threadRoot string,
+	remember func(id, path string, mtimeNS int64) error,
+) error {
+	sessionsRoot, ok, err := streamVisualStudioCopilotChildDir(ctx, threadRoot, "sessions")
+	if err != nil || !ok {
+		return err
+	}
+	return streamVisualStudioCopilotVS2026SessionDirectory(ctx, sessionsRoot, remember)
+}
+
+func streamVisualStudioCopilotVS2026SessionDirectory(
+	ctx context.Context,
+	sessionsRoot string,
+	remember func(id, path string, mtimeNS int64) error,
+) error {
+	return streamDirectoryEntries(ctx, sessionsRoot, func(entry os.DirEntry) error {
+		if entry.IsDir() || !isVisualStudioCopilotVS2026SessionFileName(entry.Name()) {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		path := filepath.Join(sessionsRoot, entry.Name())
+		return remember(
+			canonicalVisualStudioCopilotConversationID(entry.Name()),
+			path,
+			info.ModTime().UnixNano(),
+		)
+	})
+}
+
+func streamVisualStudioCopilotDirectoryCandidates(
+	ctx context.Context,
+	parent string,
+	visit func(string) error,
+) error {
+	return streamDirectoryEntries(ctx, parent, func(entry os.DirEntry) error {
+		candidate, err := streamingDirOrSymlinkCandidate(entry, parent)
+		if err != nil {
+			return fmt.Errorf(
+				"stat Visual Studio Copilot directory candidate %s: %w",
+				filepath.Join(parent, entry.Name()), err,
+			)
+		}
+		if !candidate {
+			return nil
+		}
+		return visit(filepath.Join(parent, entry.Name()))
+	})
+}
+
+func streamVisualStudioCopilotChildDir(
+	ctx context.Context,
+	parent string,
+	name string,
+) (string, bool, error) {
+	var fallback string
+	err := streamDirectoryEntries(ctx, parent, func(entry os.DirEntry) error {
+		if !strings.EqualFold(entry.Name(), name) {
+			return nil
+		}
+		candidate, err := streamingDirOrSymlinkCandidate(entry, parent)
+		if err != nil {
+			return fmt.Errorf(
+				"stat Visual Studio Copilot directory %s: %w",
+				filepath.Join(parent, entry.Name()), err,
+			)
+		}
+		if !candidate {
+			return nil
+		}
+		path := filepath.Join(parent, entry.Name())
+		if entry.Name() == name {
+			fallback = path
+			return errStopStreamingDiscovery
+		}
+		if fallback == "" || path < fallback {
+			fallback = path
+		}
+		return nil
+	})
+	if errors.Is(err, errStopStreamingDiscovery) {
+		return fallback, true, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return fallback, fallback != "", nil
 }
 
 func vsCopilotCachedSpansKey(root, conversationID string) string {

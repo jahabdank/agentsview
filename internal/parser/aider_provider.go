@@ -221,9 +221,24 @@ func aiderCachedRunKey(path string, idx int) string {
 	return "aider:run:" + AiderVirtualPath(filepath.Clean(path), idx)
 }
 
+func aiderCachedRunCountKey(path string) string {
+	return "aider:run-count:" + filepath.Clean(path)
+}
+
 func streamAndCacheAiderRuns(
 	ctx context.Context, path, idPath string, yield func(int, string) error,
 ) error {
+	replayed, err := replayCachedAiderRuns(ctx, path, idPath, yield)
+	if err != nil {
+		return err
+	}
+	if replayed {
+		return nil
+	}
+	scanID, err := reconciliationCacheAddInt(ctx, "aider:scan")
+	if err != nil {
+		return err
+	}
 	file, err := os.Open(path)
 	if err != nil {
 		return err
@@ -241,7 +256,8 @@ func streamAndCacheAiderRuns(
 			return nil
 		}
 		ordinal, err := reconciliationCacheAddInt(
-			ctx, "aider:header:"+filepath.Clean(path)+"\x00"+rawHeader,
+			ctx, "aider:header:"+strconv.Itoa(scanID)+":"+
+				filepath.Clean(path)+"\x00"+rawHeader,
 		)
 		if err != nil {
 			return err
@@ -298,7 +314,58 @@ func streamAndCacheAiderRuns(
 	if err != nil {
 		return err
 	}
-	return reconciliationCachePut(ctx, aiderCachedFingerprintKey(path), string(encoded))
+	if err := reconciliationCachePut(
+		ctx, aiderCachedFingerprintKey(path), string(encoded),
+	); err != nil {
+		return err
+	}
+	return reconciliationCachePut(
+		ctx, aiderCachedRunCountKey(path), strconv.Itoa(idx+1),
+	)
+}
+
+func replayCachedAiderRuns(
+	ctx context.Context, path, idPath string, yield func(int, string) error,
+) (bool, error) {
+	encodedCount, found, err := reconciliationCacheGet(
+		ctx, aiderCachedRunCountKey(path),
+	)
+	if err != nil || !found {
+		return false, err
+	}
+	count, err := strconv.Atoi(encodedCount)
+	if err != nil || count < 0 {
+		return false, fmt.Errorf("decode cached aider run count %q", encodedCount)
+	}
+	for idx := range count {
+		encoded, runFound, err := reconciliationCacheGet(
+			ctx, aiderCachedRunKey(path, idx),
+		)
+		if err != nil {
+			return false, err
+		}
+		if !runFound {
+			return false, fmt.Errorf(
+				"cached aider run %d missing after completed scan", idx,
+			)
+		}
+		observeStreamingRetainedBytes(ctx, int64(len(encoded)))
+		var cached cachedAiderRun
+		if err := json.Unmarshal([]byte(encoded), &cached); err != nil {
+			observeStreamingRetainedBytes(ctx, -int64(len(encoded)))
+			return false, fmt.Errorf("decode cached aider run: %w", err)
+		}
+		observeStreamingDiscoveryBuffer(ctx, 1)
+		rawID := aiderRawID(
+			aiderIdentityPath(path, idPath), cached.RawHeader, cached.Ordinal,
+		)
+		err = yield(idx, rawID)
+		observeStreamingRetainedBytes(ctx, -int64(len(encoded)))
+		if err != nil {
+			return false, err
+		}
+	}
+	return true, nil
 }
 
 func aiderReconciliationIdentity(
