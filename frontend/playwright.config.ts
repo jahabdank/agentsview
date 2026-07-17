@@ -1,7 +1,26 @@
 import { defineConfig } from "@playwright/test";
 
 const isCI = process.env.CI === "true";
-const e2ePort = Number(process.env.AGENTSVIEW_E2E_PORT ?? "8090");
+
+function parseE2EPort(raw: string | undefined): number {
+  if (raw === undefined || raw === "") {
+    return 8090;
+  }
+  if (!/^[0-9]+$/.test(raw)) {
+    throw new Error(
+      `AGENTSVIEW_E2E_PORT must be an integer from 1 to 65535 (got ${JSON.stringify(raw)})`,
+    );
+  }
+  const port = Number(raw);
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
+    throw new Error(
+      `AGENTSVIEW_E2E_PORT must be an integer from 1 to 65535 (got ${JSON.stringify(raw)})`,
+    );
+  }
+  return port;
+}
+
+const e2ePort = parseE2EPort(process.env.AGENTSVIEW_E2E_PORT);
 
 export default defineConfig({
   testDir: "e2e",
