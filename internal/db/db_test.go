@@ -454,6 +454,45 @@ func Ptr[T any](v T) *T { return new(v) }
 
 // insertSession creates and upserts a session with sensible
 // defaults. Override any field via the opts functions.
+// seedOneSession inserts a single session so reader queries have a row to
+// return across a writer handoff.
+func seedOneSession(t *testing.T, d *DB) {
+	t.Helper()
+	insertSession(t, d, "writer-handoff-seed", "handoff")
+}
+
+// writeOneSession attempts a single write through the writer pool. It returns
+// the write error unchanged so callers can assert on ErrWriterClosed.
+func writeOneSession(d *DB) error {
+	return d.UpsertSession(Session{
+		ID:      "writer-handoff-write",
+		Project: "handoff",
+		Machine: defaultMachine,
+		Agent:   defaultAgent,
+	})
+}
+
+func TestCloseWriterKeepsReadersServing(t *testing.T) {
+	database := testDB(t)
+	seedOneSession(t, database)
+
+	require.NoError(t, database.CloseWriter())
+
+	rows, err := database.ListSessionsModifiedBetween(
+		context.Background(), "", "", nil, nil,
+	)
+	assert.NoError(t, err, "readers must survive a writer handoff")
+	assert.NotEmpty(t, rows, "seeded session must still be readable")
+
+	err = writeOneSession(database)
+	require.Error(t, err, "writes must fail cleanly while the writer is closed")
+	assert.ErrorIs(t, err, ErrWriterClosed)
+
+	require.NoError(t, database.ReopenWriter())
+	assert.NoError(t, writeOneSession(database),
+		"writer must accept writes again after ReopenWriter")
+}
+
 func insertSession(
 	t *testing.T, d *DB, id, project string,
 	opts ...func(*Session),

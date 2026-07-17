@@ -6,12 +6,26 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 
 	"github.com/spf13/cobra"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/sync"
 )
+
+// syncWorkerChildEnvVar marks a process spawned as a sync-worker child by the
+// daemon's writer handoff. The daemon closes its writer and releases the write
+// lock before spawning, so the child skips the live-writable-daemon rejection
+// (the daemon is knowingly yielding); the write-owner flock remains the real
+// guard.
+const syncWorkerChildEnvVar = "AGENTSVIEW_SYNC_WORKER"
+
+// runningAsSyncWorker reports whether this process is a sync-worker child
+// spawned by a daemon that has yielded write ownership for the pass.
+func runningAsSyncWorker() bool {
+	return os.Getenv(syncWorkerChildEnvVar) == "1"
+}
 
 // workerLine is one NDJSON record on the sync-worker's stdout. Every stdout
 // line unmarshals to a workerLine; diagnostics go to stderr so the parent can
@@ -141,6 +155,9 @@ func workerResultFromStats(
 	switch {
 	case ctx.Err() != nil || stats.Aborted:
 		result.Status = "aborted"
+		// Aborted discovery is never authoritative, even if the counters
+		// happened to complete a provider listing before cancellation.
+		result.DiscoveryComplete = false
 		if ctx.Err() != nil {
 			result.Error = ctx.Err().Error()
 		}

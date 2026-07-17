@@ -329,6 +329,11 @@ const (
 // the WAL because another connection still had pages pinned.
 var ErrWALCheckpointBusy = errors.New("wal checkpoint busy")
 
+// ErrWriterClosed reports that a write was attempted while the writer pool was
+// intentionally closed for a maintenance pass (a sync-worker handoff). Readers
+// keep serving; the writer returns once ReopenWriter runs.
+var ErrWriterClosed = errors.New("writer closed for maintenance pass")
+
 // DataVersionTooNewError reports that an archive was written by a newer
 // agentsview parser than the current binary understands.
 type DataVersionTooNewError struct {
@@ -490,14 +495,18 @@ END;
 // concurrent HTTP handler goroutines can safely read while
 // Reopen/CloseConnections swap the underlying *sql.DB.
 type DB struct {
-	path      string
-	writer    atomic.Pointer[sql.DB]
-	reader    atomic.Pointer[sql.DB]
-	mu        sync.Mutex // serializes writes
-	connMu    sync.RWMutex
-	retired   []*sql.DB // old pools kept open for in-flight reads
-	readOnly  bool
-	dataStale atomic.Bool // set by Open when user_version < dataVersion
+	path     string
+	writer   atomic.Pointer[sql.DB]
+	reader   atomic.Pointer[sql.DB]
+	mu       sync.Mutex // serializes writes
+	connMu   sync.RWMutex
+	retired  []*sql.DB // old pools kept open for in-flight reads
+	readOnly bool
+	// writerClosed is set while the writer pool is intentionally closed for a
+	// worker maintenance pass (CloseWriter). It lets write attempts report
+	// ErrWriterClosed instead of the generic read-only error.
+	writerClosed atomic.Bool
+	dataStale    atomic.Bool // set by Open when user_version < dataVersion
 
 	cursorMu     sync.RWMutex
 	cursorSecret []byte
@@ -600,6 +609,9 @@ func (w *writerHandle) current() (*sql.DB, error) {
 	}
 	db := w.owner.writer.Load()
 	if db == nil {
+		if w.owner.writerClosed.Load() {
+			return nil, ErrWriterClosed
+		}
 		return nil, ErrReadOnly
 	}
 	return db, nil
@@ -3507,6 +3519,68 @@ func (db *DB) reopenLocked() error {
 			)
 		}
 	}
+	return nil
+}
+
+// CloseWriter closes the writer pool without touching the reader pool, so
+// read-only queries keep serving while a sync-worker owns the archive for a
+// maintenance pass. Writes attempted while closed return ErrWriterClosed. The
+// reader pool is mode=ro and cannot checkpoint, so it holds the WAL open across
+// the handoff; the worker attaches to the same WAL. Callers must call
+// ReopenWriter to restore write service.
+func (db *DB) CloseWriter() error {
+	if db.readOnly {
+		return ErrReadOnly
+	}
+	db.stopWALCheckpointLoop()
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	db.connMu.Lock()
+	old := db.writer.Swap(nil)
+	db.writerClosed.Store(true)
+	db.connMu.Unlock()
+
+	if old == nil {
+		return nil
+	}
+	if err := old.Close(); err != nil {
+		return fmt.Errorf("closing writer pool: %w", err)
+	}
+	return nil
+}
+
+// ReopenWriter reopens the writer pool after a worker maintenance pass. It
+// re-runs the writer-open half of Reopen (writable DSN, single connection,
+// configureWAL) and restarts the WAL checkpoint loop. The reader pool is left
+// untouched.
+func (db *DB) ReopenWriter() error {
+	if db.readOnly {
+		return ErrReadOnly
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	writer, err := sql.Open("sqlite3", makeDSN(db.path, false))
+	if err != nil {
+		return fmt.Errorf("reopening writer: %w", err)
+	}
+	writer.SetMaxOpenConns(1)
+	if err := configureWAL(writer); err != nil {
+		writer.Close()
+		return fmt.Errorf("configuring reopened wal: %w", err)
+	}
+
+	db.connMu.Lock()
+	old := db.writer.Swap(writer)
+	db.writerClosed.Store(false)
+	db.connMu.Unlock()
+
+	if old != nil {
+		if err := old.Close(); err != nil {
+			log.Printf("warning: closing stale writer pool: %v", err)
+		}
+	}
+	db.startWALCheckpointLoop()
 	return nil
 }
 

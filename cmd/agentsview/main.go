@@ -662,6 +662,14 @@ func openWriteDB(
 }
 
 func rejectLiveWritableDaemonBeforeDirectWrite(cfg config.Config) error {
+	if runningAsSyncWorker() {
+		// The daemon spawned this worker after closing its writer and
+		// releasing the write lock for the pass, so its still-live runtime
+		// record does not mean it owns the archive. The write-owner flock
+		// acquired next is the real guard: if the daemon has not actually
+		// yielded it, acquireWriteOwnerLock refuses.
+		return nil
+	}
 	dataDir := writeLockDataDir(cfg)
 	if isExternalDaemonStarting(dataDir) || isLegacyDaemonStarting(dataDir) {
 		return fmt.Errorf(
