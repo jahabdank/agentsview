@@ -51,7 +51,6 @@
   let refreshing = $state(false);
   let applyError = $state("");
   let previewTimer: ReturnType<typeof setTimeout> | undefined;
-  let suppressTargetQueryReset = false;
   let disposed = false;
   const candidatesRead = new LatestRead();
   const previewRead = new LatestRead();
@@ -136,17 +135,17 @@
 
   function selectTarget(value: string) {
     targetProject = value.trim();
-    suppressTargetQueryReset = true;
     clearAcceptedPreview();
     schedulePreview();
   }
 
   function editTargetQuery(value: string) {
-    if (suppressTargetQueryReset && value === "") {
-      suppressTargetQueryReset = false;
-      return;
-    }
-    suppressTargetQueryReset = false;
+    // Typeahead reports an empty query whenever it opens or closes, and a real
+    // browser can report the close reset more than once during focus handoff.
+    // That does not change the selected target. Non-empty edits still make an
+    // accepted preview stale immediately; selecting a value clears and
+    // reschedules the preview in selectTarget above.
+    if (value === "") return;
     clearAcceptedPreview();
   }
 

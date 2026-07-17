@@ -98,6 +98,56 @@ func TestSessionIdentity(t *testing.T) {
 	assert.Equal(t, "Agent Title", *index.Sessions[0].DisplayName)
 }
 
+func TestDuckDBSidebarIndexTotalCountsCanonicalRoots(t *testing.T) {
+	ctx := context.Background()
+	local := newLocalDB(t)
+	rootID := "sidebar-root"
+	missingParentID := "missing-parent"
+	for _, session := range []db.Session{
+		{
+			ID: rootID, Project: "alpha", Machine: "local", Agent: "claude",
+			StartedAt: new("2026-07-01T10:00:00Z"), MessageCount: 2,
+		},
+		{
+			ID: "sidebar-subagent", Project: "child-source", Machine: "local",
+			Agent: "claude", StartedAt: new("2026-07-01T10:01:00Z"),
+			MessageCount: 2, ParentSessionID: &rootID, RelationshipType: "subagent",
+		},
+		{
+			ID: "sidebar-fork", Project: "child-source", Machine: "local",
+			Agent: "claude", StartedAt: new("2026-07-01T10:02:00Z"),
+			MessageCount: 2, ParentSessionID: &rootID, RelationshipType: "fork",
+		},
+		{
+			ID: "sidebar-orphan", Project: "alpha", Machine: "local",
+			Agent: "claude", StartedAt: new("2026-07-01T10:03:00Z"),
+			MessageCount: 2, ParentSessionID: &missingParentID,
+			RelationshipType: "subagent",
+		},
+	} {
+		require.NoError(t, local.UpsertSession(session), "upsert %s", session.ID)
+	}
+
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
+	_, err := syncer.Push(ctx, true, nil)
+	require.NoError(t, err, "push to DuckDB")
+	store := NewStoreFromDB(syncer.DB())
+
+	index, err := store.GetSidebarSessionIndex(ctx, db.SessionFilter{
+		Project: "alpha",
+	})
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{
+		rootID,
+		"sidebar-subagent",
+		"sidebar-fork",
+		"sidebar-orphan",
+	}, duckSidebarSessionIDs(index.Sessions),
+		"the sidebar needs descendants to build each canonical root tree")
+	assert.Equal(t, 2, index.Total,
+		"only the root and the orphan are canonical roots")
+}
+
 func TestDuckDBStoreContract(t *testing.T) {
 	store, fixture := newSyncedStore(t)
 	tests := []struct {

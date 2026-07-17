@@ -189,6 +189,33 @@ describe("ProjectReclassificationModal", () => {
     ).toHaveProperty("disabled", true);
   });
 
+  it("keeps the selected target preview across repeated empty query resets", async () => {
+    render();
+    await flush();
+    await fireEvent.click(screen.getByTitle("Target project"));
+    await fireEvent.input(screen.getByRole("combobox"), {
+      target: { value: "new-project" },
+    });
+    await fireEvent.mouseDown(
+      screen.getByRole("option", { name: 'Use project "new-project"' }),
+    );
+    await flush();
+
+    // Typeahead reports an empty query while closing after selection, then
+    // again when it reopens and closes without a new selection. Those resets
+    // do not change the selected target and must not cancel its preview.
+    await fireEvent.click(screen.getByTitle("Target project"));
+    await fireEvent.keyDown(screen.getByRole("combobox"), { key: "Escape" });
+    await vi.advanceTimersByTimeAsync(300);
+    await flush();
+
+    expect(api.preview).toHaveBeenCalledTimes(1);
+    expect(api.preview.mock.calls[0]![0].requestBody.project).toBe("new-project");
+    expect(
+      screen.getByRole("button", { name: "Apply reclassification" }) as HTMLButtonElement,
+    ).toHaveProperty("disabled", false);
+  });
+
   it("discards a preview response superseded by a later draft", async () => {
     let resolveFirst!: (value: typeof preview) => void;
     api.preview
