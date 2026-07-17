@@ -1500,7 +1500,10 @@ func (db *DB) computeOutcomeStats(
 	since := from.UTC().Format(time.RFC3339)
 	until := to.UTC().Format(time.RFC3339)
 	var cache *git.Cache
-	if db.ReadOnly() {
+	// While the writer is closed for a worker maintenance pass rawWriter() is
+	// nil, so fall back to the read-only cache: analytics keep computing from
+	// the reader without persisting git stats, instead of nil-dereferencing.
+	if db.ReadOnly() || db.writerClosed.Load() {
 		cache = git.NewReadOnlyCache(db.rawReader())
 	} else {
 		cache = git.NewCache(db.rawWriter())

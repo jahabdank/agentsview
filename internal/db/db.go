@@ -3448,10 +3448,12 @@ func (db *DB) CloseConnections() error {
 	for _, p := range db.retired {
 		errs = append(errs, p.Close())
 	}
-	errs = append(errs,
-		db.rawReader().Close(),
-		db.rawWriter().Close(),
-	)
+	errs = append(errs, db.rawReader().Close())
+	// The writer pool is nil when a worker maintenance pass has it closed.
+	// Guard the close so this lifecycle path can never nil-deref.
+	if w := db.rawWriter(); w != nil {
+		errs = append(errs, w.Close())
+	}
 	db.retired = nil
 	return errors.Join(errs...)
 }
@@ -3528,6 +3530,12 @@ func (db *DB) reopenLocked() error {
 // reader pool is mode=ro and cannot checkpoint, so it holds the WAL open across
 // the handoff; the worker attaches to the same WAL. Callers must call
 // ReopenWriter to restore write service.
+//
+// Failure posture: the writer pointer is swapped to nil (marking the barrier
+// active) before the old pool is closed, so if Close itself errors the daemon
+// stays writer-closed and the caller keeps the flock rather than reopening. A
+// possible double-writer racing the worker over the same archive is worse than
+// staying read-only until the daemon restarts.
 func (db *DB) CloseWriter() error {
 	if db.readOnly {
 		return ErrReadOnly
@@ -3591,6 +3599,12 @@ func (db *DB) Update(fn func(tx *sql.Tx) error) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
+	// Fail fast before handing out a raw *sql.Tx: while the writer is closed
+	// for a worker maintenance pass the pool pointer is nil, and a caller must
+	// see ErrWriterClosed rather than a transaction from a torn-down pool.
+	if db.writerClosed.Load() {
+		return ErrWriterClosed
+	}
 	tx, err := db.getWriter().Begin()
 	if err != nil {
 		return fmt.Errorf("beginning transaction: %w", err)

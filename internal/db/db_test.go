@@ -493,6 +493,44 @@ func TestCloseWriterKeepsReadersServing(t *testing.T) {
 		"writer must accept writes again after ReopenWriter")
 }
 
+// TestCloseWriterFailsEveryWritePathCleanly proves the write barrier covers
+// every writer access, not just the writerHandle facade: the Update transaction
+// path and the real star/delete session mutations must all return
+// ErrWriterClosed without panicking while the writer is closed.
+func TestCloseWriterFailsEveryWritePathCleanly(t *testing.T) {
+	database := testDB(t)
+	insertSession(t, database, "barrier-session", "handoff")
+
+	require.NoError(t, database.CloseWriter())
+	t.Cleanup(func() { require.NoError(t, database.ReopenWriter()) })
+
+	t.Run("Update", func(t *testing.T) {
+		err := database.Update(func(tx *sql.Tx) error {
+			_, execErr := tx.Exec(
+				"UPDATE sessions SET first_message = ? WHERE id = ?",
+				"x", "barrier-session",
+			)
+			return execErr
+		})
+		require.ErrorIs(t, err, ErrWriterClosed)
+	})
+
+	t.Run("StarSession", func(t *testing.T) {
+		_, err := database.StarSession("barrier-session")
+		require.ErrorIs(t, err, ErrWriterClosed)
+	})
+
+	t.Run("DeleteSession", func(t *testing.T) {
+		err := database.DeleteSession("barrier-session")
+		require.ErrorIs(t, err, ErrWriterClosed)
+	})
+
+	t.Run("RestoreSession", func(t *testing.T) {
+		_, err := database.RestoreSession("barrier-session")
+		require.ErrorIs(t, err, ErrWriterClosed)
+	})
+}
+
 func insertSession(
 	t *testing.T, d *DB, id, project string,
 	opts ...func(*Session),
