@@ -2483,6 +2483,179 @@ func (f usageParityFactory) NewProvider(parser.ProviderConfig) parser.Provider {
 	return f.provider
 }
 
+type mappingLifecycleProvider struct {
+	parser.ProviderBase
+	source  parser.SourceRef
+	results []parser.ParseResult
+}
+
+func (p *mappingLifecycleProvider) Discover(context.Context) ([]parser.SourceRef, error) {
+	return []parser.SourceRef{p.source}, nil
+}
+
+func (p *mappingLifecycleProvider) Fingerprint(
+	context.Context, parser.SourceRef,
+) (parser.SourceFingerprint, error) {
+	return parser.SourceFingerprint{
+		Key: p.source.FingerprintKey, Size: 256,
+		MTimeNS: 1_700_000_000_000_000_000,
+	}, nil
+}
+
+func (p *mappingLifecycleProvider) Parse(
+	context.Context, parser.ParseRequest,
+) (parser.ParseOutcome, error) {
+	outcomes := make([]parser.ParseResultOutcome, 0, len(p.results))
+	for _, result := range p.results {
+		outcomes = append(outcomes, parser.ParseResultOutcome{Result: result})
+	}
+	return parser.ParseOutcome{Results: outcomes, ResultSetComplete: true}, nil
+}
+
+type mappingLifecycleFactory struct{ provider *mappingLifecycleProvider }
+
+func (f mappingLifecycleFactory) Definition() parser.AgentDef {
+	return f.provider.Definition()
+}
+
+func (f mappingLifecycleFactory) Capabilities() parser.Capabilities {
+	return f.provider.Capabilities()
+}
+
+func (f mappingLifecycleFactory) NewProvider(parser.ProviderConfig) parser.Provider {
+	return f.provider
+}
+
+func TestReclassificationSurvivesRemoteResyncLifecycle(t *testing.T) {
+	const (
+		machine       = "remote-example-host"
+		sourceProject = "source_project"
+		targetProject = "target_project"
+		root          = "/srv/custom-worktrees/sample-branch"
+	)
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name           string
+		disableMapping bool
+		wantLive       string
+	}{
+		{name: "enabled mapping reclassifies reparsed live session", wantLive: targetProject},
+		{name: "disabled mapping lets live session revert", disableMapping: true, wantLive: sourceProject},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sourcePath := filepath.Join(t.TempDir(), "mapping-lifecycle.fixture")
+			dbtest.WriteTestFile(t, sourcePath, []byte("fixture"))
+			newResult := func(id, cwd string) parser.ParseResult {
+				return parser.ParseResult{Session: parser.ParsedSession{
+					ID: id, Project: sourceProject, Machine: machine,
+					Agent: parser.AgentCowork, Cwd: cwd,
+					StartedAt:    time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC),
+					FirstMessage: "lifecycle fixture", MessageCount: 1,
+					UserMessageCount: 1,
+					File: parser.FileInfo{
+						Path: sourcePath, Size: 256,
+						Mtime: 1_700_000_000_000_000_000,
+					},
+				}, Messages: []parser.ParsedMessage{{
+					Ordinal: 0, Role: parser.RoleUser, Content: "lifecycle fixture",
+					Timestamp: time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC),
+				}}}
+			}
+			provider := &mappingLifecycleProvider{
+				ProviderBase: parser.ProviderBase{
+					Def: parser.AgentDef{Type: parser.AgentCowork, FileBased: true},
+					Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+						DiscoverSources:      parser.CapabilitySupported,
+						CompositeFingerprint: parser.CapabilitySupported,
+					}},
+				},
+				source: parser.SourceRef{
+					Provider: parser.AgentCowork, Key: sourcePath,
+					DisplayPath: sourcePath, FingerprintKey: sourcePath,
+				},
+				results: []parser.ParseResult{
+					newResult("live-empty-cwd", ""),
+					newResult("live-evidence", root),
+					newResult("orphaned", root),
+				},
+			}
+			database := dbtest.OpenTestDB(t)
+			remoteConfig := sync.EngineConfig{
+				AgentDirs: map[parser.AgentType][]string{parser.AgentCowork: {filepath.Dir(sourcePath)}},
+				Machine:   machine, IDPrefix: machine + "~", Ephemeral: true,
+				ProviderFactories: []parser.ProviderFactory{
+					mappingLifecycleFactory{provider: provider},
+				},
+				ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+					parser.AgentCowork: parser.ProviderMigrationProviderAuthoritative,
+				},
+			}
+			remoteEngine := sync.NewEngine(database, remoteConfig)
+			require.Equal(t, 3, remoteEngine.SyncAll(ctx, nil).Synced)
+			remoteEngine.Close()
+
+			mapping, err := database.CreateWorktreeProjectMapping(
+				ctx, db.WorktreeProjectMapping{
+					Machine: machine, PathPrefix: "/srv/custom-worktrees",
+					Layout: db.WorktreeMappingLayoutExplicit, Project: targetProject,
+					OriginalProject: sourceProject, Enabled: true,
+				},
+			)
+			require.NoError(t, err)
+			applied, err := database.ApplyWorktreeProjectMappings(ctx, machine)
+			require.NoError(t, err)
+			require.Equal(t, 3, applied.UpdatedSessions)
+			if tc.disableMapping {
+				mapping.Enabled = false
+				_, err = database.UpdateWorktreeProjectMapping(ctx, machine, mapping.ID, mapping)
+				require.NoError(t, err)
+			}
+
+			provider.results = []parser.ParseResult{
+				newResult("live-empty-cwd", ""),
+				newResult("live-evidence", root),
+			}
+			engine := sync.NewEngine(database, sync.EngineConfig{Machine: "local"})
+			t.Cleanup(engine.Close)
+			stats, err := engine.ResyncAllWithOptions(ctx, nil,
+				sync.RebuildOptions{Contributors: []sync.RebuildContributor{{
+					Name: "remote-example", Config: remoteConfig,
+				}}},
+			)
+			require.NoError(t, err)
+			require.False(t, stats.Aborted, "resync aborted: %+v", stats)
+			assert.Equal(t, 1, stats.OrphanedCopied)
+			for id, wantProject := range map[string]string{
+				machine + "~live-empty-cwd": tc.wantLive,
+				machine + "~orphaned":       targetProject,
+			} {
+				session, getErr := database.GetSession(ctx, id)
+				require.NoError(t, getErr)
+				require.NotNil(t, session, id)
+				assert.Equal(t, wantProject, session.Project, id)
+			}
+			snapshots, err := database.ListSessionProjectIdentitySnapshots(ctx)
+			require.NoError(t, err)
+			for _, snapshot := range snapshots {
+				assert.Equal(t, sourceProject, snapshot.Project, snapshot.SessionID)
+			}
+			if !tc.disableMapping {
+				targetObservations, listErr := database.ListProjectIdentityObservations(
+					ctx, []string{targetProject},
+				)
+				require.NoError(t, listErr)
+				assert.NotEmpty(t, targetObservations)
+				sourceObservations, listErr := database.ListProjectIdentityObservations(
+					ctx, []string{sourceProject},
+				)
+				require.NoError(t, listErr)
+				assert.Empty(t, sourceObservations,
+					"former aggregate evidence must be tombstoned after every live row moves")
+			}
+		})
+	}
+}
+
 func newUsageParityProvider(sourcePath, machine string) *usageParityProvider {
 	const rawID = "usage-equivalent"
 	messageOrdinal := 0

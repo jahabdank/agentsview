@@ -2027,6 +2027,125 @@ func TestSyncProjectFiltersMatchPushScope(t *testing.T) {
 	assertDuckDBCountWhere(t, exclude.DB(), "sessions", "project = ?", "beta", 1)
 }
 
+func TestPushProjectMoveReconcilesFilteredScope(t *testing.T) {
+	const (
+		sessionID     = "duck-project-move"
+		sourceProject = "source_project"
+		targetProject = "target_project"
+		root          = "/srv/custom-worktrees/sample-branch"
+	)
+	ctx := context.Background()
+	tests := []struct {
+		name            string
+		projects        []string
+		excludeProjects []string
+		seedUnfiltered  bool
+		wantSession     bool
+		wantTargetObs   bool
+		wantSnapshot    bool
+	}{
+		{name: "unfiltered", wantSession: true, wantTargetObs: true, wantSnapshot: true},
+		{name: "include former", projects: []string{sourceProject}, wantSnapshot: true},
+		{name: "include target", projects: []string{targetProject}, seedUnfiltered: true, wantSession: true, wantTargetObs: true, wantSnapshot: true},
+		{name: "exclude former", excludeProjects: []string{sourceProject}, seedUnfiltered: true, wantSession: true, wantTargetObs: true, wantSnapshot: true},
+		{name: "exclude target", excludeProjects: []string{targetProject}, wantSnapshot: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			local := newLocalDB(t)
+			session := syncSession(
+				sessionID, sourceProject, "project move",
+				"2026-07-16T12:00:00.000Z", 1,
+			)
+			session.Cwd = root
+			_, err := local.WriteSessionBatchAtomic([]db.SessionBatchWrite{{
+				Session: session,
+				Messages: []db.Message{syncMessage(
+					sessionID, 0, "user", "project move",
+					"2026-07-16T12:00:00.000Z",
+				)},
+				IdentityObservation: export.ProjectIdentityObservation{
+					SessionID: sessionID, Project: sourceProject, Machine: "local",
+					RootPath:   root,
+					ObservedAt: time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC),
+				},
+				DataVersion: 1, ReplaceMessages: true,
+			}})
+			require.NoError(t, err)
+			target := filepath.Join(t.TempDir(), "project-move.duckdb")
+			opts := SyncOptions{
+				Projects: tc.projects, ExcludeProjects: tc.excludeProjects,
+			}
+			if tc.seedUnfiltered {
+				initial, openErr := New(target, local, "test-machine", SyncOptions{})
+				require.NoError(t, openErr)
+				require.NoError(t, local.SetSyncState(
+					initial.transcriptRevisionBackfillKey(), "1",
+				))
+				_, pushErr := initial.Push(ctx, true, nil)
+				require.NoError(t, pushErr)
+				require.NoError(t, initial.Close())
+			}
+			syncer := newTestSync(t, target, local, opts)
+			if !tc.seedUnfiltered {
+				_, err = syncer.Push(ctx, true, nil)
+				require.NoError(t, err)
+			}
+			insertOtherMachineDuckSession(t, syncer.DB())
+
+			_, err = local.CreateWorktreeProjectMapping(ctx, db.WorktreeProjectMapping{
+				Machine: "local", PathPrefix: "/srv/custom-worktrees",
+				Layout: db.WorktreeMappingLayoutExplicit, Project: targetProject,
+				OriginalProject: sourceProject, Enabled: true,
+			})
+			require.NoError(t, err)
+			applied, err := local.ApplyWorktreeProjectMappings(ctx, "local")
+			require.NoError(t, err)
+			require.Equal(t, 1, applied.UpdatedSessions)
+
+			_, err = syncer.Push(ctx, false, nil)
+			require.NoError(t, err)
+			wantCount := 0
+			if tc.wantSession {
+				wantCount = 1
+			}
+			assertDuckDBCountWhere(t, syncer.DB(), "sessions", "id = ?", sessionID, wantCount)
+			if tc.wantSession {
+				var project string
+				require.NoError(t, syncer.DB().QueryRowContext(ctx,
+					`SELECT project FROM sessions WHERE id = ?`, sessionID,
+				).Scan(&project))
+				assert.Equal(t, targetProject, project)
+			}
+			assertDuckDBCountWhere(t, syncer.DB(), "sessions", "id = ?", "other-session", 1)
+			targetObsCount := 0
+			if tc.wantTargetObs {
+				targetObsCount = 1
+			}
+			assertDuckDBCountWhere(t, syncer.DB(),
+				"source_project_identity_observations", "project = ?",
+				targetProject, targetObsCount,
+			)
+			assertDuckDBCountWhere(t, syncer.DB(),
+				"source_project_identity_observations", "project = ?",
+				sourceProject, 0,
+			)
+			snapshotCount := 0
+			if tc.wantSnapshot {
+				snapshotCount = 1
+			}
+			assertDuckDBCountWhere(t, syncer.DB(),
+				"source_session_project_identity_snapshots", "project = ?",
+				sourceProject, snapshotCount,
+			)
+			assertDuckDBCountWhere(t, syncer.DB(),
+				"source_session_project_identity_snapshots", "project = ?",
+				targetProject, 0,
+			)
+		})
+	}
+}
+
 func TestSyncFilteredFullClearsGlobalWatermarkForLaterUnfilteredPush(t *testing.T) {
 	ctx := context.Background()
 	local := newLocalDB(t)

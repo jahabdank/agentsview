@@ -5,6 +5,7 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -174,6 +175,144 @@ func TestFilteredThenUnfilteredIdentityPublicationIncludesExcludedProject(
 		SELECT COUNT(*) FROM source_session_project_identity_snapshots
 		WHERE project = $1`, "beta").Scan(&betaSnapshots))
 	assert.Equal(t, 1, betaSnapshots)
+}
+
+func TestPushProjectMoveReconcilesFilteredScope(t *testing.T) {
+	const (
+		sessionID     = "pg-project-move"
+		sourceProject = "source_project"
+		targetProject = "target_project"
+		root          = "/srv/custom-worktrees/sample-branch"
+	)
+	tests := []struct {
+		name            string
+		projects        []string
+		excludeProjects []string
+		seedUnfiltered  bool
+		wantSession     bool
+		wantTargetObs   bool
+		wantSnapshot    bool
+	}{
+		{name: "unfiltered", wantSession: true, wantTargetObs: true, wantSnapshot: true},
+		{name: "include former", projects: []string{sourceProject}, wantSnapshot: true},
+		{name: "include target", projects: []string{targetProject}, seedUnfiltered: true, wantSession: true, wantTargetObs: true, wantSnapshot: true},
+		{name: "exclude former", excludeProjects: []string{sourceProject}, seedUnfiltered: true, wantSession: true, wantTargetObs: true, wantSnapshot: true},
+		{name: "exclude target", excludeProjects: []string{targetProject}, wantSnapshot: true},
+	}
+	pgURL := testPGURL(t)
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			schema := fmt.Sprintf("agentsview_project_move_%d", i)
+			cleanNamedPGSchema(t, pgURL, schema)
+			t.Cleanup(func() { cleanNamedPGSchema(t, pgURL, schema) })
+			ctx := context.Background()
+			local, err := db.Open(filepath.Join(t.TempDir(), "local.db"))
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, local.Close()) })
+			startedAt := "2026-07-16T12:00:00.000Z"
+			localModifiedAt := startedAt
+			require.NoError(t, local.UpsertSession(db.Session{
+				ID: sessionID, Project: sourceProject, Machine: "local",
+				Agent: "claude", Cwd: root, StartedAt: &startedAt,
+				LocalModifiedAt: &localModifiedAt, MessageCount: 1,
+				UserMessageCount: 1,
+			}))
+			require.NoError(t, local.InsertMessages([]db.Message{{
+				SessionID: sessionID, Ordinal: 0, Role: "user",
+				Content: "project move", ContentLength: len("project move"),
+				Timestamp: startedAt,
+			}}))
+			require.NoError(t, local.UpsertProjectIdentityObservation(ctx,
+				export.ProjectIdentityObservation{
+					SessionID: sessionID, Project: sourceProject, Machine: "local",
+					RootPath:   root,
+					ObservedAt: time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC),
+				},
+			))
+			if tc.seedUnfiltered {
+				initial, openErr := New(
+					pgURL, schema, local, "test-machine", true, SyncOptions{},
+				)
+				require.NoError(t, openErr)
+				_, pushErr := initial.Push(ctx, true, nil)
+				require.NoError(t, pushErr)
+				require.NoError(t, initial.Close())
+			}
+			syncer, err := New(pgURL, schema, local, "test-machine", true, SyncOptions{
+				Projects: tc.projects, ExcludeProjects: tc.excludeProjects,
+			})
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, syncer.Close()) })
+			if !tc.seedUnfiltered {
+				_, err = syncer.Push(ctx, true, nil)
+				require.NoError(t, err)
+			}
+			_, err = syncer.pg.ExecContext(ctx, `
+				INSERT INTO sessions (
+					id, machine, owner_marker, project, agent, created_at
+				) VALUES ($1, $2, $3, $4, $5, NOW())`,
+				"other-owner-session", "other-machine", "other-owner-marker",
+				"unrelated_project", "claude",
+			)
+			require.NoError(t, err)
+
+			_, err = local.CreateWorktreeProjectMapping(ctx, db.WorktreeProjectMapping{
+				Machine: "local", PathPrefix: "/srv/custom-worktrees",
+				Layout: db.WorktreeMappingLayoutExplicit, Project: targetProject,
+				OriginalProject: sourceProject, Enabled: true,
+			})
+			require.NoError(t, err)
+			applied, err := local.ApplyWorktreeProjectMappings(ctx, "local")
+			require.NoError(t, err)
+			require.Equal(t, 1, applied.UpdatedSessions)
+
+			_, err = syncer.Push(ctx, false, nil)
+			require.NoError(t, err)
+			var count int
+			require.NoError(t, syncer.pg.QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM sessions WHERE id = $1`, sessionID,
+			).Scan(&count))
+			if tc.wantSession {
+				assert.Equal(t, 1, count)
+				var project string
+				require.NoError(t, syncer.pg.QueryRowContext(ctx,
+					`SELECT project FROM sessions WHERE id = $1`, sessionID,
+				).Scan(&project))
+				assert.Equal(t, targetProject, project)
+			} else {
+				assert.Zero(t, count)
+			}
+			require.NoError(t, syncer.pg.QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM sessions WHERE id = $1`, "other-owner-session",
+			).Scan(&count))
+			assert.Equal(t, 1, count, "reconciliation must preserve another archive owner")
+
+			targetObsCount := 0
+			if tc.wantTargetObs {
+				targetObsCount = 1
+			}
+			require.NoError(t, syncer.pg.QueryRowContext(ctx, `
+				SELECT COUNT(*) FROM source_project_identity_observations
+				WHERE project = $1`, targetProject).Scan(&count))
+			assert.Equal(t, targetObsCount, count)
+			require.NoError(t, syncer.pg.QueryRowContext(ctx, `
+				SELECT COUNT(*) FROM source_project_identity_observations
+				WHERE project = $1`, sourceProject).Scan(&count))
+			assert.Zero(t, count, "former aggregate observation must be tombstoned")
+			snapshotCount := 0
+			if tc.wantSnapshot {
+				snapshotCount = 1
+			}
+			require.NoError(t, syncer.pg.QueryRowContext(ctx, `
+				SELECT COUNT(*) FROM source_session_project_identity_snapshots
+				WHERE project = $1`, sourceProject).Scan(&count))
+			assert.Equal(t, snapshotCount, count)
+			require.NoError(t, syncer.pg.QueryRowContext(ctx, `
+				SELECT COUNT(*) FROM source_session_project_identity_snapshots
+				WHERE project = $1`, targetProject).Scan(&count))
+			assert.Zero(t, count, "immutable snapshot must remain source-labelled")
+		})
+	}
 }
 
 func TestIdentityPublicationUpdatesOnlyChangedRowsAndAppliesTombstones(

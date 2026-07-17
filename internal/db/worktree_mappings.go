@@ -390,6 +390,36 @@ func (db *DB) ListWorktreeProjectMappingMachines(
 	return machines, nil
 }
 
+// ListActiveWorktreeProjectMappingMachines returns the distinct machines with
+// at least one enabled mapping. Resync uses this narrower set so applying
+// persistent rules does not scan machines that have no active rules.
+func (db *DB) ListActiveWorktreeProjectMappingMachines(
+	ctx context.Context,
+) ([]string, error) {
+	rows, err := db.getReader().QueryContext(ctx, `
+		SELECT DISTINCT machine
+		FROM worktree_project_mappings
+		WHERE enabled = 1 AND machine != ''
+		ORDER BY machine`)
+	if err != nil {
+		return nil, fmt.Errorf("listing active worktree mapping machines: %w", err)
+	}
+	defer rows.Close()
+
+	machines := []string{}
+	for rows.Next() {
+		var machine string
+		if err := rows.Scan(&machine); err != nil {
+			return nil, fmt.Errorf("scanning active worktree mapping machine: %w", err)
+		}
+		machines = append(machines, machine)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating active worktree mapping machines: %w", err)
+	}
+	return machines, nil
+}
+
 func (db *DB) ResolveWorktreeProjectMapping(
 	ctx context.Context,
 	machine string,
@@ -875,6 +905,7 @@ func (db *DB) applyWorktreeProjectMappings(
 	result := ApplyWorktreeProjectMappingsResult{
 		MatchedSessions: evaluation.matched,
 	}
+	affected := map[string]struct{}{}
 	for _, update := range evaluation.updates {
 		changed, err := updateSessionProjectTx(
 			ctx, tx, update, bumpLocalModifiedAt,
@@ -883,6 +914,17 @@ func (db *DB) applyWorktreeProjectMappings(
 			return result, err
 		}
 		result.UpdatedSessions += changed
+		if changed > 0 {
+			affected[update.currentProject] = struct{}{}
+			affected[update.nextProject] = struct{}{}
+		}
+	}
+	if len(affected) > 0 {
+		if err := rebuildProjectIdentityAggregatesTx(
+			ctx, tx, machine, sortedSetKeys(affected),
+		); err != nil {
+			return result, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return result, fmt.Errorf("committing worktree mapping apply: %w", err)
@@ -966,6 +1008,15 @@ func (db *DB) applyWorktreeProjectMappingToSession(
 	)
 	if err != nil {
 		return false, err
+	}
+	if changed > 0 {
+		update := evaluation.updates[0]
+		if err := rebuildProjectIdentityAggregatesTx(ctx, tx, machine, []string{
+			update.currentProject,
+			update.nextProject,
+		}); err != nil {
+			return false, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf(

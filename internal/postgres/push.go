@@ -177,6 +177,7 @@ func (s *Sync) Push(
 	legacyMarkerMachines := pushMarkerLegacyMachines(
 		markerMachine, markerMachineAliases,
 	)
+	var reconciledScopeMoveIDs []string
 	// Keep the backfill marker scoped to target only; all other push
 	// state remains scoped by full effective sync state (including filter
 	// fingerprint when present).
@@ -262,6 +263,23 @@ func (s *Sync) Push(
 			}
 		}
 	}
+	if s.isFiltered() {
+		currentScopeSessions, scopeErr := s.local.ListSessionsModifiedBetween(
+			ctx, "", "", s.projects, s.excludeProjects,
+		)
+		if scopeErr != nil {
+			return result, fmt.Errorf(
+				"listing current filtered session scope: %w", scopeErr,
+			)
+		}
+		reconciledScopeMoveIDs, scopeErr = reconcilePGProjectScopeMoves(
+			ctx, s.pg, markerID, currentScopeSessions,
+			s.projects, s.excludeProjects,
+		)
+		if scopeErr != nil {
+			return result, scopeErr
+		}
+	}
 	if err := timedPushSetupStep("model pricing sync",
 		func() error { return s.syncModelPricing(ctx) }); err != nil {
 		return result, err
@@ -298,6 +316,9 @@ func (s *Sync) Push(
 		if bErr != nil {
 			return result, bErr
 		}
+	}
+	for _, id := range reconciledScopeMoveIDs {
+		delete(priorFingerprints, id)
 	}
 
 	if lastPush != "" {
@@ -654,6 +675,21 @@ func (s *Sync) syncProjectIdentityObservations(
 		snapshots = filterProjectIdentityObservations(
 			snapshots, s.projects, s.excludeProjects,
 		)
+		if s.isFiltered() {
+			// A newly selected filter has no publication cursor, so this is a
+			// full scoped publication even when the mirror already contains
+			// rows from another scope. Carry every known tombstone to remove
+			// stale former-project evidence without rewriting live evidence
+			// outside the selected scope.
+			allChanges, loadErr := s.local.LoadProjectIdentityPublicationDelta(
+				ctx, 0, revision, nil, nil,
+			)
+			if loadErr != nil {
+				return loadErr
+			}
+			delta.ObservationDeletes = allChanges.ObservationDeletes
+			delta.SnapshotDeletes = allChanges.SnapshotDeletes
+		}
 	} else {
 		delta, err = s.local.LoadProjectIdentityPublicationDelta(
 			ctx, publishedRevision, revision, s.projects, s.excludeProjects,
@@ -692,6 +728,14 @@ func (s *Sync) syncProjectIdentityObservations(
 			ctx, tx, archiveID, s.projects, s.excludeProjects,
 		); err != nil {
 			return err
+		}
+		if s.isFiltered() {
+			if err := deleteProjectIdentityDelta(
+				ctx, tx, archiveID, databaseGeneration,
+				delta.ObservationDeletes, delta.SnapshotDeletes,
+			); err != nil {
+				return err
+			}
 		}
 	} else if err := deleteProjectIdentityDelta(
 		ctx, tx, archiveID, databaseGeneration,
@@ -1554,6 +1598,66 @@ func purgePGExcludedPushSessions(
 		return err
 	}
 	return deletePGExcludedSessionRows(ctx, pg, purgeIDs)
+}
+
+func reconcilePGProjectScopeMoves(
+	ctx context.Context,
+	pg *sql.DB,
+	ownerMarker string,
+	localSessions []db.Session,
+	projects []string,
+	excludeProjects []string,
+) ([]string, error) {
+	localIDs := make(map[string]struct{}, len(localSessions))
+	for _, session := range localSessions {
+		localIDs[session.ID] = struct{}{}
+	}
+	rows, err := pg.QueryContext(ctx, `
+		SELECT id, project
+		FROM sessions
+		WHERE owner_marker = $1`, ownerMarker)
+	if err != nil {
+		return nil, fmt.Errorf("listing owned pg sessions for scope reconciliation: %w", err)
+	}
+	defer rows.Close()
+
+	staleIDs := []string{}
+	for rows.Next() {
+		var id, project string
+		if err := rows.Scan(&id, &project); err != nil {
+			return nil, fmt.Errorf("scanning owned pg session for scope reconciliation: %w", err)
+		}
+		if !projectInPGSyncScope(project, projects, excludeProjects) {
+			continue
+		}
+		if _, ok := localIDs[id]; !ok {
+			staleIDs = append(staleIDs, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating owned pg sessions for scope reconciliation: %w", err)
+	}
+	if len(staleIDs) == 0 {
+		return nil, nil
+	}
+	sort.Strings(staleIDs)
+	if _, err := pg.ExecContext(ctx, `
+		DELETE FROM sessions
+		WHERE owner_marker = $1 AND id = ANY($2)`, ownerMarker, staleIDs); err != nil {
+		return nil, fmt.Errorf("deleting pg sessions that moved out of scope: %w", err)
+	}
+	return staleIDs, nil
+}
+
+func projectInPGSyncScope(
+	project string,
+	projects []string,
+	excludeProjects []string,
+) bool {
+	if len(projects) > 0 && !slices.Contains(projects, project) {
+		return false
+	}
+	return !slices.Contains(excludeProjects, project)
 }
 
 func hasPGExcludedSessionID(

@@ -1815,10 +1815,26 @@ func (e *Engine) resyncAllWithOptionsLocked(
 		e.mu.Unlock()
 		return stats, err
 	}
-	if _, err := newDB.ApplyWorktreeProjectMappingsFromSync(
-		context.Background(), e.machine,
-	); err != nil {
-		log.Printf("resync: apply worktree mappings: %v", err)
+	mappingMachines, err := newDB.ListActiveWorktreeProjectMappingMachines(
+		context.Background(),
+	)
+	if err != nil {
+		warning := "worktree mapping machine discovery failed: " + err.Error()
+		log.Printf("resync: %s", warning)
+		stats.Warnings = append(stats.Warnings, warning)
+	} else {
+		for _, machine := range mappingMachines {
+			if _, applyErr := newDB.ApplyWorktreeProjectMappingsFromSync(
+				context.Background(), machine,
+			); applyErr != nil {
+				warning := fmt.Sprintf(
+					"worktree mapping apply failed for machine %q: %v",
+					machine, applyErr,
+				)
+				log.Printf("resync: %s", warning)
+				stats.Warnings = append(stats.Warnings, warning)
+			}
+		}
 	}
 
 	// Reclassify is_automated across every row. Orphan-copied
@@ -8340,14 +8356,27 @@ func (e *Engine) writeIncremental(
 	); err != nil {
 		return err
 	}
+	persisted, err := e.db.GetSession(context.Background(), inc.sessionID)
+	if err != nil {
+		return fmt.Errorf(
+			"reload incrementally written session %s: %w",
+			inc.sessionID, err,
+		)
+	}
+	identitySession := db.Session{
+		ID:      inc.sessionID,
+		Project: inc.project,
+		Machine: inc.machine,
+		Cwd:     inc.cwd,
+	}
+	if persisted != nil {
+		identitySession.Project = persisted.Project
+		identitySession.Machine = persisted.Machine
+		identitySession.Cwd = persisted.Cwd
+	}
 	if err := e.writeProjectIdentityObservation(
 		context.Background(),
-		db.Session{
-			ID:      inc.sessionID,
-			Project: inc.project,
-			Machine: inc.machine,
-			Cwd:     inc.cwd,
-		},
+		identitySession,
 	); err != nil {
 		log.Printf(
 			"incremental project identity observation %s: %v",

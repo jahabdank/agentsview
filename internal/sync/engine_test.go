@@ -1751,6 +1751,61 @@ func TestProjectIdentityIncrementalAppendPersistsObservation(t *testing.T) {
 	assert.Equal(t, "github.com/acme/inc", observations[0].NormalizedRemote)
 }
 
+func TestProjectIdentityIncrementalAppendUsesPersistedMappedProject(t *testing.T) {
+	database := openTestDB(t)
+	ctx := context.Background()
+	const (
+		sessionID     = "mapped-incremental"
+		sourceProject = "source_project"
+		targetProject = "target_project"
+		machine       = "remote-example-host"
+		root          = "/srv/custom-worktrees/sample-branch"
+	)
+	recordedAt := time.Date(2026, 7, 16, 10, 0, 0, 0, time.UTC)
+	require.NoError(t, database.UpsertSession(db.Session{
+		ID: sessionID, Project: sourceProject, Machine: machine,
+		Agent: "claude", Cwd: root, MessageCount: 1,
+	}))
+	require.NoError(t, database.UpsertProjectIdentityObservation(ctx,
+		export.ProjectIdentityObservation{
+			SessionID: sessionID, Project: sourceProject, Machine: machine,
+			RootPath: root, ObservedAt: recordedAt,
+		},
+	))
+	_, err := database.CreateWorktreeProjectMapping(ctx, db.WorktreeProjectMapping{
+		Machine: machine, PathPrefix: "/srv/custom-worktrees",
+		Layout: db.WorktreeMappingLayoutExplicit, Project: targetProject,
+		Enabled: true,
+	})
+	require.NoError(t, err)
+
+	e := NewEngine(database, EngineConfig{Machine: machine})
+	require.NoError(t, e.writeIncremental(&incrementalUpdate{
+		sessionID: sessionID, project: sourceProject, machine: machine, cwd: root,
+		msgs: []parser.ParsedMessage{{
+			Role: parser.RoleAssistant, Content: "delta", Ordinal: 1,
+		}},
+		msgCount: 2, userMsgCount: 1,
+		fileSize: 100, fileMtime: recordedAt.Add(time.Minute).UnixNano(),
+	}))
+
+	persisted, err := database.GetSession(ctx, sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, targetProject, persisted.Project)
+	targetObservations, err := database.ListProjectIdentityObservations(
+		ctx, []string{targetProject},
+	)
+	require.NoError(t, err)
+	require.Len(t, targetObservations, 1)
+	assert.Equal(t, root, targetObservations[0].RootPath)
+	snapshots, err := database.ListSessionProjectIdentitySnapshots(ctx)
+	require.NoError(t, err)
+	require.Len(t, snapshots, 1)
+	assert.Equal(t, sourceProject, snapshots[0].Project,
+		"immutable snapshot must retain parser-time project evidence")
+}
+
 func TestProjectIdentityIncrementalRemoteAppendSkipsLiveDiscovery(t *testing.T) {
 	database := openTestDB(t)
 	e := NewEngine(database, EngineConfig{

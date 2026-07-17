@@ -270,6 +270,21 @@ func (s *Sync) syncProjectIdentityObservations(
 			}
 			snapshots = out
 		}
+		if s.isFiltered() {
+			// A newly selected filter has no publication cursor, so this is a
+			// full scoped publication even when the mirror already contains
+			// rows from another scope. Carry every known tombstone to remove
+			// stale former-project evidence without rewriting live evidence
+			// outside the selected scope.
+			allChanges, loadErr := s.local.LoadProjectIdentityPublicationDelta(
+				ctx, 0, revision, nil, nil,
+			)
+			if loadErr != nil {
+				return loadErr
+			}
+			delta.ObservationDeletes = allChanges.ObservationDeletes
+			delta.SnapshotDeletes = allChanges.SnapshotDeletes
+		}
 	} else {
 		delta, err = s.local.LoadProjectIdentityPublicationDelta(
 			ctx, publishedRevision, revision, s.projects, s.excludeProjects,
@@ -310,6 +325,14 @@ func (s *Sync) syncProjectIdentityObservations(
 			execDelta, archiveID, s.projects, s.excludeProjects,
 		); err != nil {
 			return err
+		}
+		if s.isFiltered() {
+			if err := deleteProjectIdentityDelta(
+				execDelta, archiveID, databaseGeneration,
+				delta.ObservationDeletes, delta.SnapshotDeletes,
+			); err != nil {
+				return err
+			}
 		}
 	} else if err := deleteProjectIdentityDelta(
 		execDelta, archiveID, databaseGeneration,
