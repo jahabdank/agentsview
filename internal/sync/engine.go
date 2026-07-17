@@ -40,7 +40,42 @@ const (
 var errSessionPreserved = errors.New("session preserved")
 
 type reconciliationMetricsContextKey struct{}
+type reconciliationBaselineContextKey struct{}
 type deferGlobalLinkContextKey struct{}
+
+type reconciliationBaselineTracker struct {
+	sources map[db.SessionSourcePath]struct{}
+}
+
+func newReconciliationBaselineTracker() *reconciliationBaselineTracker {
+	return &reconciliationBaselineTracker{
+		sources: make(map[db.SessionSourcePath]struct{}, reconciliationPageSize),
+	}
+}
+
+func reconciliationBaselineTrackerFor(
+	ctx context.Context,
+) *reconciliationBaselineTracker {
+	tracker, _ := ctx.Value(reconciliationBaselineContextKey{}).(*reconciliationBaselineTracker)
+	return tracker
+}
+
+func (tracker *reconciliationBaselineTracker) add(
+	source db.SessionSourcePath,
+) {
+	if source.Agent == "" || source.FilePath == "" {
+		return
+	}
+	tracker.sources[source] = struct{}{}
+}
+
+func (tracker *reconciliationBaselineTracker) list() []db.SessionSourcePath {
+	sources := make([]db.SessionSourcePath, 0, len(tracker.sources))
+	for source := range tracker.sources {
+		sources = append(sources, source)
+	}
+	return sources
+}
 
 type reconciliationRuntimeMetrics struct {
 	mu                       gosync.Mutex
@@ -2802,8 +2837,12 @@ func (e *Engine) reconcileWatchRootsStreamed(
 		if verifiedPass != 0 {
 			e.markVerifiedDiscoveredSources(files)
 		}
+		baselineTracker := newReconciliationBaselineTracker()
+		pageCtx := context.WithValue(
+			ctx, reconciliationBaselineContextKey{}, baselineTracker,
+		)
 		pageStats := e.collectAndBatch(
-			ctx, e.startWorkers(ctx, files), len(files), len(files), nil,
+			pageCtx, e.startWorkers(pageCtx, files), len(files), len(files), nil,
 			syncWriteDefault,
 		)
 		mergeReconciliationSyncStats(&stats, pageStats)
@@ -2815,7 +2854,9 @@ func (e *Engine) reconcileWatchRootsStreamed(
 			)
 			break
 		}
-		if err := e.baselineReconciliationCandidates(ctx, page); err != nil {
+		if err := e.baselineReconciliationCandidates(
+			ctx, page, baselineTracker.list(),
+		); err != nil {
 			stats.RecordFailed()
 			stats.Aborted = true
 			retErr = err
@@ -2904,7 +2945,9 @@ func (e *Engine) tombstoneCompletedReconciliationScopesLocked(
 }
 
 func (e *Engine) baselineReconciliationCandidates(
-	ctx context.Context, candidates []reconciliationCandidate,
+	ctx context.Context,
+	candidates []reconciliationCandidate,
+	admitted []db.SessionSourcePath,
 ) error {
 	sources := make([]db.SessionSourcePath, 0, len(candidates))
 	for _, candidate := range candidates {
@@ -2913,8 +2956,10 @@ func (e *Engine) baselineReconciliationCandidates(
 			FilePath: e.effectiveSourcePath(candidate.Path),
 		})
 	}
-	if err := e.db.BaselineActiveSessionSourcePaths(ctx, e.machine, sources); err != nil {
-		return fmt.Errorf("baseline reconciliation source page: %w", err)
+	if err := e.db.ReplaceActiveSessionSourceBaselines(
+		ctx, e.machine, sources, admitted,
+	); err != nil {
+		return fmt.Errorf("reconcile source baseline page: %w", err)
 	}
 	return nil
 }
@@ -5313,16 +5358,17 @@ func (e *Engine) collectAndBatch(
 		clear(baselineSeen)
 	}
 	baselineSuccessfulSource := func(job syncJob) {
-		// Forced reconciliation baselines its complete candidate page after all
-		// writes succeed. Keep that path authoritative so non-write results do not
-		// add a second baseline pass inside the same bounded page.
-		if runtimeMetrics != nil {
-			return
-		}
 		source := db.SessionSourcePath{
 			Agent: string(job.agent), FilePath: e.effectiveSourcePath(job.path),
 		}
 		if source.Agent == "" || source.FilePath == "" {
+			return
+		}
+		if tracker := reconciliationBaselineTrackerFor(ctx); tracker != nil {
+			tracker.add(source)
+			return
+		}
+		if runtimeMetrics != nil {
 			return
 		}
 		if _, duplicate := baselineSeen[source]; duplicate {
@@ -5360,13 +5406,11 @@ func (e *Engine) collectAndBatch(
 			} else {
 				outcome = e.writeBatchWithOutcome(pending, writeMode, false)
 			}
-			if runtimeMetrics == nil {
-				if err := e.baselinePendingWriteSources(
-					ctx, pending, outcome.written,
-				); err != nil {
-					log.Printf("baseline parsed session sources: %v", err)
-					outcome.failedSessions++
-				}
+			if err := e.baselinePendingWriteSources(
+				ctx, pending, outcome.written,
+			); err != nil {
+				log.Printf("baseline parsed session sources: %v", err)
+				outcome.failedSessions++
 			}
 			stats.RecordSynced(outcome.writtenSessions)
 			for range outcome.failedSessions {
@@ -5641,6 +5685,10 @@ func (e *Engine) baselinePendingWriteSources(
 	}
 	for source, ok := range eligible {
 		if !ok {
+			continue
+		}
+		if tracker := reconciliationBaselineTrackerFor(ctx); tracker != nil {
+			tracker.add(source)
 			continue
 		}
 		sources = append(sources, source)
@@ -8438,14 +8486,12 @@ func (e *Engine) writeBatchWithOutcome(
 			stale = true
 		}
 
-		// UpsertSession first: the session row must exist
-		// before messages can be inserted (FK constraint).
-		// This is safe because writeBatch runs full parses
-		// that always recompute all columns. For
-		// incremental updates (writeIncremental), messages
-		// are written first since the session already
-		// exists.
-		if err := e.db.UpsertSession(s); err != nil {
+		// The session row must exist before messages can be inserted (FK
+		// constraint), but a source-missing row stays tombstoned until every
+		// dependent write succeeds below. For incremental updates
+		// (writeIncremental), messages are written first since the session
+		// already exists.
+		if err := e.db.UpsertSessionPendingContent(s); err != nil {
 			if isIntentionalSessionSkip(err) {
 				if pw.sess.File.Path != "" {
 					e.cacheSkip(
@@ -8500,17 +8546,18 @@ func (e *Engine) writeBatchWithOutcome(
 			continue
 		}
 
-		// Advance data_version only after the message write
-		// succeeded. UpsertSession deliberately does not
-		// touch this column so a transient write failure
-		// won't leave the session marked at the current
-		// parser version with stale messages.
+		// Advance data_version only after the message and usage writes
+		// succeeded. The pending upsert deliberately does not touch this
+		// column, and the source-missing tombstone is cleared only after this
+		// succeeds, so an old current version cannot hide a failed rewrite.
 		if err := e.db.SetSessionDataVersion(
 			s.ID, dataVersionForWrite(pw),
 		); err != nil {
 			log.Printf(
 				"set data_version for %s: %v", s.ID, err,
 			)
+			outcome.failedSessions++
+			continue
 		}
 
 		if !replaceMessages {
@@ -8525,6 +8572,11 @@ func (e *Engine) writeBatchWithOutcome(
 			} else if err := e.db.UpdateSessionSignals(s.ID, update); err != nil {
 				log.Printf("signals: update %s: %v", s.ID, err)
 			}
+		}
+		if err := e.db.ReviveSourceMissingSession(s.ID); err != nil {
+			log.Printf("revive source-missing session %s: %v", s.ID, err)
+			outcome.failedSessions++
+			continue
 		}
 		outcome.writtenSessions++
 		outcome.writtenMessages += len(msgs)
@@ -10025,7 +10077,7 @@ func (e *Engine) writeSessionFullWithResolver(
 	if verdict != sessionWriteOK {
 		return errSessionPreserved
 	}
-	if err := e.db.UpsertSession(s); err != nil {
+	if err := e.db.UpsertSessionPendingContent(s); err != nil {
 		if isIntentionalSessionSkip(err) {
 			if pw.sess.File.Path != "" {
 				e.cacheSkip(
@@ -10065,6 +10117,11 @@ func (e *Engine) writeSessionFullWithResolver(
 		log.Printf(
 			"set data_version for %s: %v", s.ID, err,
 		)
+		return err
+	}
+	if err := e.db.ReviveSourceMissingSession(s.ID); err != nil {
+		log.Printf("revive source-missing session %s: %v", s.ID, err)
+		return err
 	}
 
 	return nil

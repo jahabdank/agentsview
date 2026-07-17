@@ -2287,7 +2287,7 @@ func TestReconciliationSourceBaselineUsesStoredPathRewrite(t *testing.T) {
 	require.NoError(t, engine.baselineReconciliationCandidates(
 		t.Context(), []reconciliationCandidate{{
 			Provider: parser.AgentClaude, Identity: "session", Path: localPath,
-		}},
+		}}, []db.SessionSourcePath{{Agent: "claude", FilePath: storedPath}},
 	))
 	changed, err := database.SoftDeleteSessionSourceOwnership(
 		t.Context(), "host", "claude", "session", storedPath,
@@ -4420,6 +4420,93 @@ func TestWriteBatchQwenPawReplacesMessages(t *testing.T) {
 	require.Len(t, msgs, 1, "rewrite must replace, not append")
 	assert.Equal(t, "new content", msgs[0].Content,
 		"rewritten content must reach existing message rows")
+}
+
+func TestWriteBatchFailedReplacementKeepsSourceMissingSessionRetryable(t *testing.T) {
+	database := openTestDB(t)
+	e := &Engine{db: database}
+	path := filepath.Join(t.TempDir(), "session.json")
+	ts := time.Unix(1700000000, 0).UTC()
+	mkWrite := func(content, hash string, mtime int64) pendingWrite {
+		return pendingWrite{
+			sess: parser.ParsedSession{
+				ID: "qwenpaw:retry-revival", Project: "default", Machine: "local",
+				Agent: parser.AgentQwenPaw, StartedAt: ts, EndedAt: ts,
+				MessageCount: 1,
+				File: parser.FileInfo{
+					Path: path, Size: int64(len(content)), Mtime: mtime, Hash: hash,
+				},
+			},
+			msgs: []parser.ParsedMessage{{
+				Ordinal: 0, Role: parser.RoleUser, Content: content, Timestamp: ts,
+			}},
+		}
+	}
+
+	initial := mkWrite("old content", "old-hash", 1)
+	written, _, failed, _ := e.writeBatch(
+		[]pendingWrite{initial}, syncWriteDefault, false,
+	)
+	require.Equal(t, 1, written)
+	require.Zero(t, failed)
+	require.NoError(t, database.BaselineActiveSessionSourcePaths(
+		t.Context(), "local", []db.SessionSourcePath{{
+			Agent: string(parser.AgentQwenPaw), FilePath: path,
+		}},
+	))
+	changed, err := database.SoftDeleteSessionSourceOwnership(
+		t.Context(), "local", string(parser.AgentQwenPaw),
+		"qwenpaw:retry-revival", path,
+	)
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	raw, err := sql.Open("sqlite3", database.Path())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, raw.Close()) })
+	_, err = raw.Exec(`
+		CREATE TRIGGER fail_retry_revival_message
+		BEFORE INSERT ON messages
+		WHEN NEW.session_id = 'qwenpaw:retry-revival'
+		BEGIN
+			SELECT RAISE(FAIL, 'injected replacement failure');
+		END;
+	`)
+	require.NoError(t, err)
+
+	retry := mkWrite("new content", "new-hash", 2)
+	written, _, failed, _ = e.writeBatch(
+		[]pendingWrite{retry}, syncWriteDefault, false,
+	)
+	assert.Zero(t, written)
+	assert.Equal(t, 1, failed)
+	active, err := database.GetSession(t.Context(), "qwenpaw:retry-revival")
+	require.NoError(t, err)
+	assert.Nil(t, active,
+		"a failed content replacement must not revive the source-missing row")
+	info := fakeSnapshotInfo{
+		fName: filepath.Base(path), fSize: int64(len("new content")), fMtime: 2,
+	}
+	assert.False(t, e.shouldSkipFileWithPrefix(
+		"", "qwenpaw:retry-revival", info, "new-hash",
+	), "the failed replacement must remain eligible for an unchanged retry")
+
+	_, err = raw.Exec("DROP TRIGGER fail_retry_revival_message")
+	require.NoError(t, err)
+	written, _, failed, _ = e.writeBatch(
+		[]pendingWrite{retry}, syncWriteDefault, false,
+	)
+	require.Equal(t, 1, written)
+	require.Zero(t, failed)
+	active, err = database.GetSession(t.Context(), "qwenpaw:retry-revival")
+	require.NoError(t, err)
+	require.NotNil(t, active)
+	messages, err := database.GetMessages(
+		t.Context(), "qwenpaw:retry-revival", 0, 10, true,
+	)
+	require.NoError(t, err)
+	require.Len(t, messages, 1)
+	assert.Equal(t, "new content", messages[0].Content)
 }
 
 // TestSyncSingleSession_QwenPawPreservesWorkspaceFromDB covers the

@@ -1303,7 +1303,7 @@ const insertSessionSQL = `
 const insertSessionIfAbsentSQL = insertSessionSQL + `
 		ON CONFLICT(id) DO NOTHING`
 
-const upsertSessionSQL = insertSessionSQL + `
+const upsertSessionBaseSQL = insertSessionSQL + `
 		ON CONFLICT(id) DO UPDATE SET
 			project = excluded.project,
 			machine = excluded.machine,
@@ -1349,7 +1349,9 @@ const upsertSessionSQL = insertSessionSQL + `
 			last_entry_uuid = excluded.last_entry_uuid,
 			file_inode = excluded.file_inode,
 			file_device = excluded.file_device,
-			file_hash = excluded.file_hash,
+			file_hash = excluded.file_hash`
+
+const upsertSessionSQL = upsertSessionBaseSQL + `,
 			deleted_at = CASE
 				WHEN sessions.deletion_cause = 'source_missing' THEN NULL
 				ELSE sessions.deleted_at
@@ -1396,6 +1398,17 @@ func upsertSessionArgs(s Session) []any {
 // Sessions that were permanently deleted (in excluded_sessions)
 // or currently in the trash are rejected.
 func (db *DB) UpsertSession(s Session) error {
+	return db.upsertSession(s, true)
+}
+
+// UpsertSessionPendingContent inserts or updates the session row without
+// reviving a source-missing tombstone. Full content writers call
+// ReviveSourceMissingSession only after every required dependent write lands.
+func (db *DB) UpsertSessionPendingContent(s Session) error {
+	return db.upsertSession(s, false)
+}
+
+func (db *DB) upsertSession(s Session, reviveSourceMissing bool) error {
 	_ = ValidateAndSanitize(&s, nil, nil)
 
 	db.mu.Lock()
@@ -1429,12 +1442,31 @@ func (db *DB) UpsertSession(s Session) error {
 	// up-to-date and starve the rewrite on the next sync.
 	// New rows are seeded with 0 (the default) and bumped to
 	// the current version once their messages land.
-	_, err = db.getWriter().Exec(
-		upsertSessionSQL,
-		upsertSessionArgs(s)...,
-	)
+	query := upsertSessionBaseSQL
+	if reviveSourceMissing {
+		query = upsertSessionSQL
+	}
+	_, err = db.getWriter().Exec(query, upsertSessionArgs(s)...)
 	if err != nil {
 		return fmt.Errorf("upserting session %s: %w", s.ID, err)
+	}
+	return nil
+}
+
+// ReviveSourceMissingSession makes a watcher-tombstoned session visible after
+// its replacement session row, messages, usage events, and data version have
+// all been persisted successfully. User trash is never affected.
+func (db *DB) ReviveSourceMissingSession(id string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	_, err := db.getWriter().Exec(`
+		UPDATE sessions
+		SET deleted_at = NULL,
+		    deletion_cause = NULL,
+		    local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		WHERE id = ? AND deletion_cause = ?`, id, deletionCauseSourceMissing)
+	if err != nil {
+		return fmt.Errorf("reviving source-missing session %s: %w", id, err)
 	}
 	return nil
 }
@@ -2400,6 +2432,74 @@ func (db *DB) BaselineActiveSessionSourcePaths(
 		return fmt.Errorf("starting source baseline transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := baselineActiveSessionSourcePathsTx(
+		ctx, tx, machine, sources,
+	); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing source baseline transaction: %w", err)
+	}
+	return nil
+}
+
+// ReplaceActiveSessionSourceBaselines makes admitted the exact subset of a
+// bounded candidate page that carries deletion proof. Existing proof for
+// rejected candidates is removed in the same transaction that admits the
+// successful candidates.
+func (db *DB) ReplaceActiveSessionSourceBaselines(
+	ctx context.Context,
+	machine string,
+	candidates []SessionSourcePath,
+	admitted []SessionSourcePath,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if machine == "" || len(candidates) == 0 {
+		return nil
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	tx, err := db.getWriter().BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("starting source baseline replacement transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	stmt, err := tx.PrepareContext(ctx, `
+		DELETE FROM local_session_source_baselines
+		WHERE machine = ? AND agent = ? AND file_path = ?`)
+	if err != nil {
+		return fmt.Errorf("preparing source baseline removal: %w", err)
+	}
+	defer stmt.Close()
+	for _, source := range candidates {
+		if source.Agent == "" || source.FilePath == "" {
+			continue
+		}
+		if _, err := stmt.ExecContext(
+			ctx, machine, source.Agent, source.FilePath,
+		); err != nil {
+			return fmt.Errorf("removing active session source baseline: %w", err)
+		}
+	}
+	if err := baselineActiveSessionSourcePathsTx(
+		ctx, tx, machine, admitted,
+	); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing source baseline replacement: %w", err)
+	}
+	return nil
+}
+
+func baselineActiveSessionSourcePathsTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	machine string,
+	sources []SessionSourcePath,
+) error {
 	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO local_session_source_baselines
 			(session_id, machine, agent, file_path)
@@ -2427,9 +2527,6 @@ func (db *DB) BaselineActiveSessionSourcePaths(
 		); err != nil {
 			return fmt.Errorf("baselining active session source path: %w", err)
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("committing source baseline transaction: %w", err)
 	}
 	return nil
 }
