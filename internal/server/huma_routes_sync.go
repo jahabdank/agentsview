@@ -220,6 +220,17 @@ func (s *Server) runSyncWithResyncFallback(
 	ctx context.Context, engine *syncpkg.Engine,
 	progress func(syncpkg.Progress),
 ) syncpkg.SyncStats {
+	if s.localSyncRunner != nil {
+		// The worker-backed runner mirrors SyncThenRun's stale-archive routing
+		// internally (worker "sync" mode runs the resync branch). It only
+		// returns an error when the worker ran and reported failure; the stats
+		// still carry that outcome, so log and return them.
+		stats, err := s.localSyncRunner(ctx, progress)
+		if err != nil && ctx.Err() == nil {
+			log.Printf("foreground local sync: %v", err)
+		}
+		return stats
+	}
 	stats, _ := engine.SyncThenRun(
 		ctx, false, progress, func(bool) error { return nil },
 	)

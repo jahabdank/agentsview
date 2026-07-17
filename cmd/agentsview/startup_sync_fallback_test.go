@@ -8,6 +8,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/dbtest"
 	syncpkg "go.kenn.io/agentsview/internal/sync"
 )
@@ -26,8 +27,10 @@ func TestRunDeferredStartupSyncFallbackPerformsSkippedSync(t *testing.T) {
 	timeout := make(chan time.Time, 1)
 	timeout <- time.Now()
 
+	// Under a test binary the worker path is skipped (testing.Testing()), so
+	// the fallback runs the in-process sync; database/lock stay unused.
 	ran, err := runDeferredStartupSyncFallback(
-		t.Context(), engine, nil, timeout,
+		t.Context(), config.Config{}, engine, database, nil, nil, timeout,
 	)
 
 	require.NoError(t, err)

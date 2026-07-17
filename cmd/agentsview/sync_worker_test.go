@@ -122,7 +122,7 @@ func TestSyncWorkerRejectsUnknownMode(t *testing.T) {
 
 func TestSyncWorkerReportsNotImplementedModes(t *testing.T) {
 	cfg := testConfigWithClaudeFixture(t)
-	for _, mode := range []string{"sync", "resync-build", "audit"} {
+	for _, mode := range []string{"resync-build", "audit"} {
 		t.Run(mode, func(t *testing.T) {
 			var out bytes.Buffer
 			err := runSyncWorker(cfg, mode, &out)
@@ -130,4 +130,14 @@ func TestSyncWorkerReportsNotImplementedModes(t *testing.T) {
 			assert.ErrorContains(t, err, "not implemented")
 		})
 	}
+}
+
+func TestSyncWorkerSyncModeSyncsLikeStartup(t *testing.T) {
+	cfg := testConfigWithClaudeFixture(t)
+	var out bytes.Buffer
+	require.NoError(t, runSyncWorker(cfg, "sync", &out))
+	result := decodeSingleResult(t, &out)
+	assert.Equal(t, "ok", result.Status)
+	assert.True(t, result.DiscoveryComplete)
+	assert.Equal(t, 3, result.Synced)
 }

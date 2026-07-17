@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strings"
 	"syscall"
+	"testing"
 	"time"
 	_ "time/tzdata"
 
@@ -138,8 +139,38 @@ func runServe(cfg config.Config, opts serveOptions) {
 	MarkDaemonStarting(cfg.DataDir)
 	defer UnmarkDaemonStarting(cfg.DataDir)
 	startupProgress := newStartupStateWriter(cfg.DataDir, time.Now)
-	startupProgress.SetPhase("opening database")
 
+	// The signal context is created before the startup worker so SIGTERM can
+	// interrupt the worker pass. The server is fully drained by
+	// waitForServerRuntime before defers unwind, so registering stop here
+	// (rather than after the DB defer) does not affect shutdown ordering.
+	ctx, stop := signal.NotifyContext(
+		context.Background(), os.Interrupt, syscall.SIGTERM,
+	)
+	defer stop()
+
+	// Run the archive-scale startup sync in a short-lived worker process before
+	// taking the write lock, so its allocation high-water returns to the OS
+	// instead of pinning the daemon. The daemon then opens the DB, starts the
+	// watcher, and closes the worker-to-watcher event gap below. The worker
+	// acquires the write lock the daemon has not taken yet; on any failure the
+	// daemon falls back to its in-process initial sync.
+	var workerStartupResult workerResult
+	workerSyncDone := false
+	if !opts.SkipInitialSync && !cfg.NoSync && !testing.Testing() {
+		startupProgress.SetPhase("initial sync")
+		result, syncErr := runStartupSyncViaWorker(ctx, cfg, startupProgress)
+		if syncErr != nil {
+			log.Printf(
+				"startup sync worker: %v (falling back to in-process)", syncErr,
+			)
+		} else {
+			workerStartupResult = result
+			workerSyncDone = true
+		}
+	}
+
+	startupProgress.SetPhase("opening database")
 	database, writeLock := mustOpenWriteDB(context.Background(), cfg)
 	runtimeRecordDataDir := ""
 	defer func() {
@@ -166,10 +197,6 @@ func runServe(cfg config.Config, opts serveOptions) {
 	// Remove stale temp DB from a prior crashed resync.
 	cleanResyncTemp(cfg.DBPath)
 
-	ctx, stop := signal.NotifyContext(
-		context.Background(), os.Interrupt, syscall.SIGTERM,
-	)
-	defer stop()
 	idleTracker := newDaemonIdleTracker(cfg, stop)
 
 	telemetryReporter := telemetry.NewReporterOrDisabled(telemetry.Options{
@@ -259,7 +286,22 @@ func runServe(cfg config.Config, opts serveOptions) {
 		)
 
 		if !opts.SkipInitialSync {
-			if database.NeedsResync() {
+			if workerSyncDone {
+				// The worker already ran the full startup pass out of process.
+				// Close the worker-to-watcher event gap with a bounded streaming
+				// reconciliation over all watch roots (warm: the worker
+				// persisted skip state into the archive, which the engine loaded
+				// at init), then acknowledge startup. Without this the daemon's
+				// engine never runs an in-process sync, so OnStartupReconciled
+				// would never fire and the watcher would stay in collecting mode
+				// forever.
+				gapErr := engine.ReconcileWatchRoots(
+					ctx, reconcileRootPaths(cfg), true,
+				)
+				engine.RecordStartupReconciled(
+					statsFromWorkerResult(workerStartupResult), gapErr,
+				)
+			} else if database.NeedsResync() {
 				startupProgress.SetPhase("full resync")
 				signalsCovered, _ := runInitialResync(ctx, engine, startupProgress)
 				if ctx.Err() == nil {
@@ -352,6 +394,11 @@ func runServe(cfg config.Config, opts serveOptions) {
 	if src := newVectorPushSource(cfg); src != nil {
 		srvOpts = append(srvOpts, server.WithVectorPushSource(src))
 	}
+	if engine != nil {
+		srvOpts = append(srvOpts, server.WithLocalSyncRunner(
+			newForegroundSyncRunner(cfg, engine, database, writeLock),
+		))
+	}
 	srv := server.New(cfg, database, engine, srvOpts...)
 
 	startupProgress.SetPhase("starting HTTP server")
@@ -391,7 +438,7 @@ func runServe(cfg config.Config, opts serveOptions) {
 			timer := time.NewTimer(deferredStartupSyncGracePeriod)
 			defer timer.Stop()
 			ran, fallbackErr := runDeferredStartupSyncFallback(
-				ctx, engine, idleTracker, timer.C,
+				ctx, cfg, engine, database, writeLock, idleTracker, timer.C,
 			)
 			if fallbackErr != nil && ctx.Err() == nil {
 				log.Printf("deferred startup sync: %v", fallbackErr)
@@ -435,7 +482,10 @@ func runServe(cfg config.Config, opts serveOptions) {
 
 func runDeferredStartupSyncFallback(
 	ctx context.Context,
+	cfg config.Config,
 	engine *sync.Engine,
+	database *db.DB,
+	lock *writeOwnerLock,
 	idleTracker *server.IdleTracker,
 	timeout <-chan time.Time,
 ) (bool, error) {
@@ -450,8 +500,120 @@ func runDeferredStartupSyncFallback(
 		return false, nil
 	}
 	defer done()
+
+	// Route the skipped startup sync through the worker so it does not run at
+	// archive scale in the daemon. Only a spawn failure (or a test binary) falls
+	// back to the in-process path; a worker that ran and reported failure is
+	// surfaced without re-running. Both paths acknowledge startup so the watcher
+	// leaves collecting mode.
+	if !testing.Testing() {
+		result, err := runWorkerWritePass(
+			ctx, cfg, engine, database, lock, "sync", nil,
+		)
+		if err == nil {
+			engine.RecordStartupReconciled(statsFromWorkerResult(result), nil)
+			return true, nil
+		}
+		if !errors.Is(err, errWorkerSpawn) {
+			engine.RecordStartupReconciled(statsFromWorkerResult(result), err)
+			return true, err
+		}
+		log.Printf(
+			"deferred startup sync worker spawn failed: %v "+
+				"(falling back in-process)", err,
+		)
+	}
+
 	_, ran, err := engine.RunStartupSyncFallback(ctx, nil)
 	return ran, err
+}
+
+// runStartupSyncViaWorker runs the daemon's startup sync in a short-lived
+// worker process, relaying its progress phases into the startup-state writer so
+// `serve status` reports live phases. It must run before the daemon takes the
+// write lock so the worker can acquire it. It returns the worker's terminal
+// result (used to acknowledge startup) and any launch/protocol error.
+//
+// The brief specifies a plain error return; it returns the result too so the
+// caller can pass the worker's discovery outcome to RecordStartupReconciled.
+func runStartupSyncViaWorker(
+	ctx context.Context, cfg config.Config, progress *startupStateWriter,
+) (workerResult, error) {
+	onLine := func(l workerLine) {
+		if l.Progress == nil {
+			return
+		}
+		p := *l.Progress
+		// Resync progress maps onto the "full resync" phase; the plain initial
+		// sync keeps the "initial sync" phase set before this call.
+		if p.Resync {
+			progress.SetPhase("full resync")
+		}
+		progress.SetDetail(startupProgressDetail(p))
+	}
+	return launchSyncWorker(ctx, cfg, "startup", onLine)
+}
+
+// statsFromWorkerResult maps a worker terminal result onto SyncStats for
+// RecordStartupReconciled. Only AuthoritativeDiscoveryComplete() is consulted by
+// the OnStartupReconciled consumer, so Aborted mirrors the worker's
+// DiscoveryComplete; the counts are carried for reporting parity.
+func statsFromWorkerResult(r workerResult) sync.SyncStats {
+	return sync.SyncStats{
+		Synced:  r.Synced,
+		Skipped: r.Skipped,
+		Failed:  r.Failed,
+		Aborted: !r.DiscoveryComplete,
+	}
+}
+
+// reconcileRootPaths returns the watch-root paths for the gap reconciliation.
+// A full reconciliation reconciles every configured agent source regardless of
+// these paths; they are passed for parity with the watcher registration.
+func reconcileRootPaths(cfg config.Config) []string {
+	roots, _ := collectWatchRoots(cfg)
+	paths := make([]string, 0, len(roots))
+	for _, r := range roots {
+		paths = append(paths, r.path)
+	}
+	return paths
+}
+
+// newForegroundSyncRunner builds the daemon's foreground local-sync runner used
+// by the sync HTTP handler. It routes through the worker so a foreground
+// `agentsview sync` never runs the archive-scale pass in the daemon. A spawn
+// failure (or a test binary) falls back to the in-process SyncThenRun; a worker
+// that ran and reported failure is surfaced without re-running.
+func newForegroundSyncRunner(
+	cfg config.Config, engine *sync.Engine, database *db.DB, lock *writeOwnerLock,
+) server.LocalSyncRunner {
+	return func(
+		ctx context.Context, progress func(sync.Progress),
+	) (sync.SyncStats, error) {
+		if !testing.Testing() {
+			onLine := func(l workerLine) {
+				if l.Progress != nil && progress != nil {
+					progress(*l.Progress)
+				}
+			}
+			result, err := runWorkerWritePass(
+				ctx, cfg, engine, database, lock, "sync", onLine,
+			)
+			if err == nil {
+				return statsFromWorkerResult(result), nil
+			}
+			if !errors.Is(err, errWorkerSpawn) {
+				return statsFromWorkerResult(result), err
+			}
+			log.Printf(
+				"foreground sync worker spawn failed: %v "+
+					"(falling back in-process)", err,
+			)
+		}
+		return engine.SyncThenRun(
+			ctx, false, progress, func(bool) error { return nil },
+		)
+	}
 }
 
 func newStartupReconciliationHandler(

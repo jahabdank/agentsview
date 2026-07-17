@@ -2555,6 +2555,25 @@ func startupReconciliationSucceeded(
 		stats.AuthoritativeDiscoveryComplete()
 }
 
+// RecordStartupReconciled acknowledges a startup pass performed out of process
+// by a sync worker. The daemon calls it after opening the archive, starting the
+// watcher in collecting mode, and running the bounded gap reconciliation, so it
+// reproduces the in-process path's completion semantics: it records the attempt
+// (unblocking the OnStartupReconciled gate), releases startup maintenance, and
+// fires the OnStartupReconciled callback that transitions the watcher out of
+// collecting mode.
+//
+// stats carries the worker's discovery outcome (Aborted false means discovery
+// was authoritative); err is the gap reconciliation error, nil when the gap
+// pass completed. All three underlying steps are sync.Once-guarded, so calling
+// this after — or concurrently with — an in-process fallback that already
+// acknowledged startup is a no-op rather than a double-release.
+func (e *Engine) RecordStartupReconciled(stats SyncStats, err error) {
+	e.recordStartupReconciled(context.Background(), stats, err)
+	e.ReleaseStartupMaintenance()
+	e.notifyStartupReconciled()
+}
+
 // AuthoritativeDiscoveryComplete reports whether a full discovery pass
 // completed without cancellation, safety abort, or provider listing failure.
 // Individual parser warnings do not make discovery incomplete.

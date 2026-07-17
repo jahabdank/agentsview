@@ -121,6 +121,10 @@ type Server struct {
 	// push phase skipped, e.g. when [vector] is disabled.
 	vectorPushSource postgres.VectorPushSource
 
+	// localSyncRunner, when set, backs the foreground local-sync HTTP handler
+	// with the worker-backed pass instead of running SyncThenRun in process.
+	localSyncRunner LocalSyncRunner
+
 	ensurePricing func(context.Context, *db.DB) error
 }
 
@@ -303,6 +307,20 @@ func WithIdleTracker(t *IdleTracker) Option {
 // /debug/pprof/ for live profiling of a running daemon.
 func WithPprof(enabled bool) Option {
 	return func(s *Server) { s.pprofEnabled = enabled }
+}
+
+// LocalSyncRunner runs the daemon's foreground local sync, streaming progress
+// to the optional callback and returning the resulting stats. When injected,
+// the sync HTTP handler routes through it (the worker-backed path) instead of
+// running the archive-scale sync in the daemon process.
+type LocalSyncRunner func(
+	ctx context.Context, progress func(sync.Progress),
+) (sync.SyncStats, error)
+
+// WithLocalSyncRunner injects the worker-backed foreground sync runner. Nil (the
+// default) keeps the in-process SyncThenRun path, which server tests rely on.
+func WithLocalSyncRunner(r LocalSyncRunner) Option {
+	return func(s *Server) { s.localSyncRunner = r }
 }
 
 func (s *Server) humaConfig() huma.Config {

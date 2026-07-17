@@ -60,7 +60,10 @@ func newSyncWorkerCommand() *cobra.Command {
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := config.LoadMinimal()
+			// Load config the same flag-aware way `serve` does so config flags
+			// the daemon forwarded into the child argv (see syncWorkerChildArgs)
+			// override env/config.toml identically to a serve --background child.
+			cfg, err := config.LoadPFlags(cmd.Flags())
 			if err != nil {
 				return fmt.Errorf("sync-worker: loading config: %w", err)
 			}
@@ -74,6 +77,8 @@ func newSyncWorkerCommand() *cobra.Command {
 	if err := cmd.MarkFlagRequired("mode"); err != nil {
 		panic(err)
 	}
+	// Register the serve config flags so forwarded overrides parse and apply.
+	config.RegisterServePFlags(cmd.Flags())
 	return cmd
 }
 
@@ -92,22 +97,27 @@ func runSyncWorkerContext(
 	emit := func(line workerLine) { _ = enc.Encode(line) }
 	onProgress := func(p sync.Progress) { emit(workerLine{Progress: &p}) }
 	switch mode {
-	case "startup":
-		return runSyncWorkerStartup(ctx, cfg, emit, onProgress)
-	case "sync", "resync-build", "audit":
+	case "startup", "sync":
+		// "sync" is the live-archive foreground pass; its body is identical to
+		// "startup" (including the NeedsResync branch for a stale-version
+		// archive). Only the daemon-side orchestration differs: "startup" runs
+		// before the daemon opens the DB, "sync" runs inside a writer handoff.
+		return runSyncWorkerStartup(ctx, cfg, mode, emit, onProgress)
+	case "resync-build", "audit":
 		return fmt.Errorf("sync-worker mode %q not implemented yet", mode)
 	default:
 		return fmt.Errorf("unknown sync-worker mode %q", mode)
 	}
 }
 
-// runSyncWorkerStartup performs the daemon's startup sync (or full resync when
-// the data version changed) as a self-contained pass, then emits the terminal
-// result. It mirrors the sync/resync branch in runServe minus daemon-only
-// wiring (watcher, emitter, backfills).
+// runSyncWorkerStartup performs a full sync (or full resync when the data
+// version changed) as a self-contained pass, then emits the terminal result. It
+// mirrors the sync/resync branch in runServe minus daemon-only wiring (watcher,
+// emitter, backfills). mode only labels the terminal error.
 func runSyncWorkerStartup(
 	ctx context.Context,
 	cfg config.Config,
+	mode string,
 	emit func(workerLine),
 	onProgress func(sync.Progress),
 ) error {
@@ -135,7 +145,7 @@ func runSyncWorkerStartup(
 	result := workerResultFromStats(ctx, stats)
 	emit(workerLine{Result: &result})
 	if result.Status != "ok" || !result.DiscoveryComplete {
-		return fmt.Errorf("sync worker startup: %s", result.Status)
+		return fmt.Errorf("sync worker %s: %s", mode, result.Status)
 	}
 	return nil
 }

@@ -5,11 +5,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 
+	"github.com/spf13/pflag"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/sync"
@@ -19,6 +21,12 @@ import (
 // unbounded line is a protocol failure, not a reason to grow memory without
 // limit.
 const workerLineMaxBytes = 1 << 20 // 1 MB
+
+// errWorkerSpawn marks a failure to start the worker process (locating the
+// executable, wiring stdout, or exec). Daemon call sites fall back to the
+// in-process path only on this class of error; a worker that ran and reported a
+// non-ok result is surfaced as-is rather than re-run in process.
+var errWorkerSpawn = errors.New("sync worker spawn failed")
 
 // launchSyncWorker is the worker-launch seam. Production self-execs the binary;
 // tests stub it to exercise runWorkerWritePass without spawning a process.
@@ -79,12 +87,16 @@ func launchSyncWorkerProcess(
 ) (workerResult, error) {
 	exe, err := os.Executable()
 	if err != nil {
-		return workerResult{}, fmt.Errorf("finding executable: %w", err)
+		return workerResult{}, fmt.Errorf(
+			"%w: finding executable: %v", errWorkerSpawn, err,
+		)
 	}
 
-	cmd := exec.CommandContext(ctx, exe, "sync-worker", "--mode", mode)
-	// Config forwarding mirrors startServeBackgroundProcess: the child reloads
-	// config itself and only needs the data dir plus the worker marker.
+	cmd := exec.CommandContext(ctx, exe, syncWorkerChildArgs(os.Args[1:], mode)...)
+	// Config forwarding mirrors startServeBackgroundProcess: the child inherits
+	// the parent environment (per-agent dir overrides, AGENTSVIEW_* vars), plus
+	// the worker marker and the resolved data dir. syncWorkerChildArgs forwards
+	// the parent's serve config flags so CLI overrides also reach the child.
 	cmd.Env = append(os.Environ(), syncWorkerChildEnvVar+"=1")
 	if cfg.DataDir != "" {
 		cmd.Env = append(cmd.Env, "AGENTSVIEW_DATA_DIR="+cfg.DataDir)
@@ -93,10 +105,14 @@ func launchSyncWorkerProcess(
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return workerResult{}, fmt.Errorf("sync worker stdout pipe: %w", err)
+		return workerResult{}, fmt.Errorf(
+			"%w: stdout pipe: %v", errWorkerSpawn, err,
+		)
 	}
 	if err := cmd.Start(); err != nil {
-		return workerResult{}, fmt.Errorf("starting sync worker: %w", err)
+		return workerResult{}, fmt.Errorf(
+			"%w: starting process: %v", errWorkerSpawn, err,
+		)
 	}
 
 	// Drain stdout fully before Wait so the child never blocks on a full pipe.
@@ -164,4 +180,25 @@ func readWorkerResult(
 		)
 	}
 	return result, nil
+}
+
+// syncWorkerChildArgs builds the child argv for the sync worker. It always
+// carries the mode, and forwards the serve config flags the parent daemon was
+// invoked with so CLI overrides reach the child identically to a serve
+// --background child. Re-emitting the parsed flags (rather than copying raw
+// tokens) drops serve-only lifecycle flags the worker does not accept and
+// normalizes every value to an unambiguous --name=value form.
+func syncWorkerChildArgs(parentArgs []string, mode string) []string {
+	args := []string{"sync-worker", "--mode", mode}
+	fs := pflag.NewFlagSet("sync-worker-forward", pflag.ContinueOnError)
+	fs.ParseErrorsAllowlist.UnknownFlags = true
+	config.RegisterServePFlags(fs)
+	// Parse ignores the leading `serve` subcommand token (a positional) and any
+	// serve-only flags (whitelisted as unknown); a parse error only means fewer
+	// forwarded flags, never a failed spawn.
+	_ = fs.Parse(parentArgs)
+	fs.Visit(func(f *pflag.Flag) {
+		args = append(args, "--"+f.Name+"="+f.Value.String())
+	})
+	return args
 }
