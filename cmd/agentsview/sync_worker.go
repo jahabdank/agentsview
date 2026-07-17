@@ -94,8 +94,18 @@ func runSyncWorkerContext(
 	ctx context.Context, cfg config.Config, mode string, out io.Writer,
 ) error {
 	enc := json.NewEncoder(out)
-	emit := func(line workerLine) { _ = enc.Encode(line) }
+	// Retain the first encode error: a dropped terminal-result line means the
+	// parent never sees the outcome, so the worker must exit non-zero even if the
+	// pass itself succeeded. The parent also treats a missing result as a
+	// protocol failure, but the worker's own exit contract must not lie.
+	var encErr error
+	emit := func(line workerLine) {
+		if err := enc.Encode(line); err != nil && encErr == nil {
+			encErr = err
+		}
+	}
 	onProgress := func(p sync.Progress) { emit(workerLine{Progress: &p}) }
+	var err error
 	switch mode {
 	case "startup", "sync", "audit":
 		// All three share the sync body. Only "startup" may resync-and-swap: it
@@ -105,12 +115,19 @@ func runSyncWorkerContext(
 		// they must refuse a stale-version archive rather than swap it out from
 		// under those readers; the real resync path is the resync-build flow,
 		// which swaps and resets caches daemon-side.
-		return runSyncWorkerStartup(ctx, cfg, mode, emit, onProgress)
+		err = runSyncWorkerStartup(ctx, cfg, mode, emit, onProgress)
 	case "resync-build":
-		return runSyncWorkerResyncBuild(ctx, cfg, mode, emit, onProgress)
+		err = runSyncWorkerResyncBuild(ctx, cfg, mode, emit, onProgress)
 	default:
 		return fmt.Errorf("unknown sync-worker mode %q", mode)
 	}
+	if err != nil {
+		return err
+	}
+	if encErr != nil {
+		return fmt.Errorf("sync worker %s: writing terminal result: %w", mode, encErr)
+	}
+	return nil
 }
 
 // runSyncWorkerStartup performs a full sync (or full resync when the data

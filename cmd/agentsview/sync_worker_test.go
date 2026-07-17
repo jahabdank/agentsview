@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -192,6 +193,30 @@ func TestSyncWorkerRefusesResyncForLiveArchiveModes(t *testing.T) {
 				"a refused pass must not stage a replacement archive")
 		})
 	}
+}
+
+// failOnResultWriter fails the Write that carries the terminal result line so a
+// test can exercise a dropped terminal-result emit on an otherwise-ok pass.
+type failOnResultWriter struct{ attempted bool }
+
+func (w *failOnResultWriter) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte(`"result"`)) {
+		w.attempted = true
+		return 0, errors.New("terminal write failed")
+	}
+	return len(p), nil
+}
+
+// TestSyncWorkerNonZeroWhenTerminalResultWriteFails pins the exit contract: a
+// pass that succeeds but whose terminal result cannot be written must still
+// return a non-nil error so the child exits non-zero.
+func TestSyncWorkerNonZeroWhenTerminalResultWriteFails(t *testing.T) {
+	cfg := testConfigWithClaudeFixture(t)
+	w := &failOnResultWriter{}
+	err := runSyncWorkerContext(context.Background(), cfg, "startup", w)
+	require.Error(t, err, "a dropped terminal result must fail the worker")
+	assert.True(t, w.attempted, "the terminal result write was attempted")
+	assert.ErrorContains(t, err, "terminal result")
 }
 
 func TestSyncWorkerSyncModeSyncsLikeStartup(t *testing.T) {
