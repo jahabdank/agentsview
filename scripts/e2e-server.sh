@@ -9,6 +9,7 @@ DB_PATH="$TMPDIR/sessions.db"
 DUCKDB_PATH="$TMPDIR/sessions.duckdb"
 EMPTY_DIR="$TMPDIR/empty"
 BACKEND="${AGENTSVIEW_E2E_BACKEND:-sqlite}"
+E2E_PORT="${AGENTSVIEW_E2E_PORT:-8090}"
 mkdir -p "$EMPTY_DIR"
 
 # Use pre-built binaries if available (CI sets these),
@@ -80,17 +81,17 @@ fi
 
 case "$BACKEND" in
   sqlite)
-    echo "Starting sqlite e2e server on :8090..."
+    echo "Starting sqlite e2e server on :$E2E_PORT..."
     exec env "${agent_env[@]}" "$SERVER" serve \
-      --port 8090 \
+      --port "$E2E_PORT" \
       --no-browser
     ;;
   duckdb)
-    echo "Starting duckdb e2e server on :8090..."
+    echo "Starting duckdb e2e server on :$E2E_PORT..."
     exec env "${agent_env[@]}" \
       AGENTSVIEW_DUCKDB_PATH="$DUCKDB_PATH" \
       "$SERVER" duckdb serve \
-      --port 8090 \
+      --port "$E2E_PORT" \
       --no-browser
     ;;
   *)
