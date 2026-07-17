@@ -1752,8 +1752,6 @@ func TestProjectIdentityIncrementalAppendPersistsObservation(t *testing.T) {
 }
 
 func TestProjectIdentityIncrementalAppendUsesPersistedMappedProject(t *testing.T) {
-	database := openTestDB(t)
-	ctx := context.Background()
 	const (
 		sessionID     = "mapped-incremental"
 		sourceProject = "source_project"
@@ -1761,49 +1759,71 @@ func TestProjectIdentityIncrementalAppendUsesPersistedMappedProject(t *testing.T
 		machine       = "remote-example-host"
 		root          = "/srv/custom-worktrees/sample-branch"
 	)
-	recordedAt := time.Date(2026, 7, 16, 10, 0, 0, 0, time.UTC)
-	require.NoError(t, database.UpsertSession(db.Session{
-		ID: sessionID, Project: sourceProject, Machine: machine,
-		Agent: "claude", Cwd: root, MessageCount: 1,
-	}))
-	require.NoError(t, database.UpsertProjectIdentityObservation(ctx,
-		export.ProjectIdentityObservation{
-			SessionID: sessionID, Project: sourceProject, Machine: machine,
-			RootPath: root, ObservedAt: recordedAt,
-		},
-	))
-	_, err := database.CreateWorktreeProjectMapping(ctx, db.WorktreeProjectMapping{
-		Machine: machine, PathPrefix: "/srv/custom-worktrees",
-		Layout: db.WorktreeMappingLayoutExplicit, Project: targetProject,
-		Enabled: true,
-	})
-	require.NoError(t, err)
+	for _, tc := range []struct {
+		name           string
+		removeSnapshot bool
+	}{
+		{name: "absent snapshot", removeSnapshot: true},
+		{name: "weak empty-key snapshot"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			path := filepath.Join(t.TempDir(), "incremental-identity.db")
+			database, err := db.Open(path)
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, database.Close()) })
+			recordedAt := time.Date(2026, 7, 16, 10, 0, 0, 0, time.UTC)
+			require.NoError(t, database.UpsertSession(db.Session{
+				ID: sessionID, Project: sourceProject, Machine: machine,
+				Agent: "claude", Cwd: root, MessageCount: 1,
+			}))
+			if tc.removeSnapshot {
+				raw, openErr := sql.Open("sqlite3", path)
+				require.NoError(t, openErr)
+				_, deleteErr := raw.ExecContext(ctx,
+					`DELETE FROM session_project_identity_snapshots WHERE session_id = ?`,
+					sessionID,
+				)
+				require.NoError(t, deleteErr)
+				require.NoError(t, raw.Close())
+			}
+			_, err = database.CreateWorktreeProjectMapping(ctx, db.WorktreeProjectMapping{
+				Machine: machine, PathPrefix: "/srv/custom-worktrees",
+				Layout: db.WorktreeMappingLayoutExplicit, Project: targetProject,
+				Enabled: true,
+			})
+			require.NoError(t, err)
 
-	e := NewEngine(database, EngineConfig{Machine: machine})
-	require.NoError(t, e.writeIncremental(&incrementalUpdate{
-		sessionID: sessionID, project: sourceProject, machine: machine, cwd: root,
-		msgs: []parser.ParsedMessage{{
-			Role: parser.RoleAssistant, Content: "delta", Ordinal: 1,
-		}},
-		msgCount: 2, userMsgCount: 1,
-		fileSize: 100, fileMtime: recordedAt.Add(time.Minute).UnixNano(),
-	}))
+			e := NewEngine(database, EngineConfig{Machine: machine})
+			t.Cleanup(e.Close)
+			require.NoError(t, e.writeIncremental(&incrementalUpdate{
+				sessionID: sessionID, project: sourceProject, machine: machine, cwd: root,
+				msgs: []parser.ParsedMessage{{
+					Role: parser.RoleAssistant, Content: "delta", Ordinal: 1,
+				}},
+				msgCount: 2, userMsgCount: 1,
+				fileSize: 100, fileMtime: recordedAt.Add(time.Minute).UnixNano(),
+			}))
 
-	persisted, err := database.GetSession(ctx, sessionID)
-	require.NoError(t, err)
-	require.NotNil(t, persisted)
-	assert.Equal(t, targetProject, persisted.Project)
-	targetObservations, err := database.ListProjectIdentityObservations(
-		ctx, []string{targetProject},
-	)
-	require.NoError(t, err)
-	require.Len(t, targetObservations, 1)
-	assert.Equal(t, root, targetObservations[0].RootPath)
-	snapshots, err := database.ListSessionProjectIdentitySnapshots(ctx)
-	require.NoError(t, err)
-	require.Len(t, snapshots, 1)
-	assert.Equal(t, sourceProject, snapshots[0].Project,
-		"immutable snapshot must retain parser-time project evidence")
+			persisted, err := database.GetSession(ctx, sessionID)
+			require.NoError(t, err)
+			require.NotNil(t, persisted)
+			assert.Equal(t, targetProject, persisted.Project)
+			targetObservations, err := database.ListProjectIdentityObservations(
+				ctx, []string{targetProject},
+			)
+			require.NoError(t, err)
+			require.Len(t, targetObservations, 1)
+			assert.Equal(t, root, targetObservations[0].RootPath)
+			snapshots, err := database.ListSessionProjectIdentitySnapshots(ctx)
+			require.NoError(t, err)
+			require.Len(t, snapshots, 1)
+			assert.Equal(t, sourceProject, snapshots[0].Project,
+				"new or upgraded snapshot must retain parser-time project evidence")
+			assert.NotEmpty(t, snapshots[0].Key,
+				"incremental evidence must create or upgrade the weak snapshot")
+		})
+	}
 }
 
 func TestProjectIdentityIncrementalRemoteAppendSkipsLiveDiscovery(t *testing.T) {

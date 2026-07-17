@@ -659,6 +659,20 @@ func (db *DB) UpsertProjectIdentityObservation(
 	ctx context.Context,
 	obs export.ProjectIdentityObservation,
 ) error {
+	return db.UpsertProjectIdentityObservationWithSnapshotProject(
+		ctx, obs, obs.Project,
+	)
+}
+
+// UpsertProjectIdentityObservationWithSnapshotProject publishes current
+// aggregate evidence while preserving a separately labelled parser-time
+// snapshot. Only the project label may differ, so both rows retain identical
+// source evidence.
+func (db *DB) UpsertProjectIdentityObservationWithSnapshotProject(
+	ctx context.Context,
+	obs export.ProjectIdentityObservation,
+	snapshotProject string,
+) error {
 	if err := db.requireWritable(); err != nil {
 		return err
 	}
@@ -666,6 +680,12 @@ func (db *DB) UpsertProjectIdentityObservation(
 		ctx = context.Background()
 	}
 	obs, err := normalizeProjectIdentityObservation(obs)
+	if err != nil {
+		return err
+	}
+	snapshot := obs
+	snapshot.Project = snapshotProject
+	snapshot, err = normalizeProjectIdentityObservation(snapshot)
 	if err != nil {
 		return err
 	}
@@ -677,7 +697,22 @@ func (db *DB) UpsertProjectIdentityObservation(
 		return fmt.Errorf("beginning project identity observation upsert: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := upsertProjectIdentityObservationTx(tx, obs); err != nil {
+	if err := upsertProjectIdentityObservationExec(
+		ctx, tx,
+		func(ctx context.Context, query string, args ...any) rowScanner {
+			return tx.QueryRowContext(ctx, query, args...)
+		},
+		obs,
+	); err != nil {
+		return err
+	}
+	if err := upsertSessionProjectIdentitySnapshotExec(
+		ctx, tx,
+		func(ctx context.Context, query string, args ...any) rowScanner {
+			return tx.QueryRowContext(ctx, query, args...)
+		},
+		snapshot,
+	); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {

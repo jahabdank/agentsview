@@ -7966,11 +7966,24 @@ func (e *Engine) cachedProjectIdentity(machine, rootPath string) projectIdentity
 func (e *Engine) writeProjectIdentityObservation(
 	ctx context.Context, s db.Session,
 ) error {
+	return e.writeProjectIdentityObservationWithSnapshotProject(
+		ctx, s, s.Project,
+	)
+}
+
+func (e *Engine) writeProjectIdentityObservationWithSnapshotProject(
+	ctx context.Context,
+	s db.Session,
+	snapshotProject string,
+) error {
 	obs, ok := e.projectIdentityObservation(s)
 	if !ok {
 		return nil
 	}
-	fingerprint := projectIdentityObservationFingerprint(obs)
+	snapshot := obs
+	snapshot.Project = snapshotProject
+	fingerprint := projectIdentityObservationFingerprint(obs) + "\x00" +
+		projectIdentityObservationFingerprint(snapshot)
 	e.projectIdentityMu.Lock()
 	if e.projectIdentityWritten == nil {
 		e.projectIdentityWritten = make(map[string]struct{})
@@ -7981,7 +7994,9 @@ func (e *Engine) writeProjectIdentityObservation(
 	}
 	e.projectIdentityMu.Unlock()
 
-	if err := e.db.UpsertProjectIdentityObservation(ctx, obs); err != nil {
+	if err := e.db.UpsertProjectIdentityObservationWithSnapshotProject(
+		ctx, obs, snapshotProject,
+	); err != nil {
 		return err
 	}
 
@@ -8374,9 +8389,10 @@ func (e *Engine) writeIncremental(
 		identitySession.Machine = persisted.Machine
 		identitySession.Cwd = persisted.Cwd
 	}
-	if err := e.writeProjectIdentityObservation(
+	if err := e.writeProjectIdentityObservationWithSnapshotProject(
 		context.Background(),
 		identitySession,
+		inc.project,
 	); err != nil {
 		log.Printf(
 			"incremental project identity observation %s: %v",

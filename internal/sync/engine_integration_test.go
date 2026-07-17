@@ -2535,12 +2535,13 @@ func TestReclassificationSurvivesRemoteResyncLifecycle(t *testing.T) {
 	)
 	ctx := context.Background()
 	for _, tc := range []struct {
-		name           string
-		disableMapping bool
-		wantLive       string
+		name          string
+		mappingAction string
+		wantLive      string
 	}{
 		{name: "enabled mapping reclassifies reparsed live session", wantLive: targetProject},
-		{name: "disabled mapping lets live session revert", disableMapping: true, wantLive: sourceProject},
+		{name: "disabled mapping lets live session revert", mappingAction: "disable", wantLive: sourceProject},
+		{name: "deleted mapping lets live session revert", mappingAction: "delete", wantLive: sourceProject},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			sourcePath := filepath.Join(t.TempDir(), "mapping-lifecycle.fixture")
@@ -2605,10 +2606,15 @@ func TestReclassificationSurvivesRemoteResyncLifecycle(t *testing.T) {
 			applied, err := database.ApplyWorktreeProjectMappings(ctx, machine)
 			require.NoError(t, err)
 			require.Equal(t, 3, applied.UpdatedSessions)
-			if tc.disableMapping {
+			switch tc.mappingAction {
+			case "disable":
 				mapping.Enabled = false
 				_, err = database.UpdateWorktreeProjectMapping(ctx, machine, mapping.ID, mapping)
 				require.NoError(t, err)
+			case "delete":
+				require.NoError(t, database.DeleteWorktreeProjectMapping(
+					ctx, machine, mapping.ID,
+				))
 			}
 
 			provider.results = []parser.ParseResult{
@@ -2639,7 +2645,7 @@ func TestReclassificationSurvivesRemoteResyncLifecycle(t *testing.T) {
 			for _, snapshot := range snapshots {
 				assert.Equal(t, sourceProject, snapshot.Project, snapshot.SessionID)
 			}
-			if !tc.disableMapping {
+			if tc.mappingAction == "" {
 				targetObservations, listErr := database.ListProjectIdentityObservations(
 					ctx, []string{targetProject},
 				)
