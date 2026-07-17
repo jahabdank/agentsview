@@ -113,6 +113,61 @@ func TestOpenCodeHybridStreamingIncompleteRootContinuesLaterRoots(t *testing.T) 
 	})
 }
 
+func TestOpenCodeStreamingPartialSQLiteFailureContinuesLaterRoots(t *testing.T) {
+	partialRoot := t.TempDir()
+	partialDB := filepath.Join(partialRoot, "opencode.db")
+	require.NoError(t, os.WriteFile(partialDB, []byte("streamed by test"), 0o600))
+	healthyRoot := t.TempDir()
+	healthyDB := filepath.Join(healthyRoot, "opencode.db")
+	require.NoError(t, os.WriteFile(healthyDB, []byte("streamed by test"), 0o600))
+	partialPath := OpenCodeSQLiteVirtualPath(partialDB, "ses_partial")
+	healthyPath := OpenCodeSQLiteVirtualPath(healthyDB, "ses_healthy")
+	sentinel := errors.New("SQLite row stream failed")
+	var streamedDBs []string
+	spec := openCodeProviderSpecForAgent(AgentOpenCode)
+	spec.streamSQLite = func(
+		_ context.Context,
+		dbPath string,
+		yield func(OpenCodeSessionMeta) error,
+	) error {
+		streamedDBs = append(streamedDBs, dbPath)
+		switch {
+		case samePath(dbPath, partialDB):
+			if err := yield(OpenCodeSessionMeta{
+				SessionID: "ses_partial", VirtualPath: partialPath,
+			}); err != nil {
+				return err
+			}
+			return sentinel
+		case samePath(dbPath, healthyDB):
+			return yield(OpenCodeSessionMeta{
+				SessionID: "ses_healthy", VirtualPath: healthyPath,
+			})
+		default:
+			return fmt.Errorf("unexpected SQLite path %q", dbPath)
+		}
+	}
+	sources := newOpenCodeFormatSourceSet(
+		[]string{partialRoot, healthyRoot}, spec,
+	)
+	var paths []string
+
+	err := sources.DiscoverEach(t.Context(), func(source SourceRef) error {
+		paths = append(paths, source.DisplayPath)
+		return nil
+	})
+
+	require.Error(t, err)
+	require.ErrorIs(t, err, sentinel)
+	var incomplete DiscoveryIncompleteError
+	require.ErrorAs(t, err, &incomplete)
+	assert.Equal(t, AgentOpenCode, incomplete.Provider)
+	assert.Equal(t, []string{partialPath, healthyPath}, paths,
+		"a partial row stream must retain its yield and continue later roots")
+	assert.Equal(t, []string{partialDB, healthyDB}, streamedDBs,
+		"the later configured root must still be traversed")
+}
+
 func TestOpenCodeStreamingStorageFailureContinuesLaterRoots(t *testing.T) {
 	failedRoot := t.TempDir()
 	writeOpenCodeProviderStorageSession(

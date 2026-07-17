@@ -144,14 +144,17 @@ func WriteHermesSessionJSONL(
 			rawSessionID, os.ErrNotExist,
 		)
 	}
-	path, ok := hp.sources.pathFromSource(source)
+	src, ok := hp.sources.sourceFromRef(source)
 	if !ok {
 		return fmt.Errorf("hermes source path unavailable")
 	}
-	if filepath.Base(path) == "state.db" {
-		return writeHermesStateSessionJSONL(w, path, rawSessionID)
+	if src.StateDB != "" && src.SessionID != "" {
+		return writeHermesStateSessionJSONL(w, src.StateDB, src.SessionID)
 	}
-	return copyHermesTranscriptFile(w, path)
+	if filepath.Base(src.Path) == "state.db" {
+		return writeHermesStateSessionJSONL(w, src.Path, rawSessionID)
+	}
+	return copyHermesTranscriptFile(w, src.Path)
 }
 
 func (p *hermesProvider) Parse(
@@ -683,11 +686,6 @@ func (s hermesSourceSet) Fingerprint(
 		MTimeNS: info.ModTime().UnixNano(),
 		Hash:    hash,
 	}, nil
-}
-
-func (s hermesSourceSet) pathFromSource(source SourceRef) (string, bool) {
-	src, ok := s.sourceFromRef(source)
-	return src.Path, ok
 }
 
 func (s hermesSourceSet) sourceFromRef(source SourceRef) (hermesSource, bool) {
