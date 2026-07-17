@@ -15,7 +15,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestOpenCodeHybridStreamingDiscoveryToleratesSQLiteFailure(t *testing.T) {
+func TestOpenCodeHybridStreamingDiscoveryReportsIncompleteSQLiteFailure(
+	t *testing.T,
+) {
 	root := t.TempDir()
 	storagePath := writeOpenCodeProviderStorageSession(
 		t, root, "session", "ses_storage", "project", "Storage",
@@ -36,10 +38,161 @@ func TestOpenCodeHybridStreamingDiscoveryToleratesSQLiteFailure(t *testing.T) {
 			return nil
 		},
 	)
-	require.NoError(t, err)
+	require.Error(t, err)
+	var incomplete DiscoveryIncompleteError
+	require.ErrorAs(t, err, &incomplete)
+	assert.Equal(t, AgentOpenCode, incomplete.Provider)
+	assert.ErrorContains(t, err, "SQLite")
 	requireSourcePathsMatch(t, streamed, []string{storagePath})
 	assert.Equal(t, discovered, streamed,
-		"slice and streaming discovery must expose the same surviving sources")
+		"incomplete streaming discovery must still expose valid storage sources")
+}
+
+func TestOpenCodeHybridStreamingIncompleteRootContinuesLaterRoots(t *testing.T) {
+	setup := func(t *testing.T) (Provider, string, string) {
+		t.Helper()
+		incompleteRoot := t.TempDir()
+		storagePath := writeOpenCodeProviderStorageSession(
+			t, incompleteRoot, "session", "ses_storage", "project", "Storage",
+		)
+		require.NoError(t, os.WriteFile(
+			filepath.Join(incompleteRoot, "opencode.db"), []byte("not sqlite"), 0o600,
+		))
+		healthyRoot := t.TempDir()
+		dbPath, seeder, db := newTestDBAt(
+			t, filepath.Join(healthyRoot, "opencode.db"),
+		)
+		t.Cleanup(func() { require.NoError(t, db.Close()) })
+		seeder.AddProject("prj_1", "/workspace/healthy")
+		seeder.AddSession(
+			"ses_healthy", "prj_1", "", "Healthy", 1700000000000, 1700000010000,
+		)
+		provider, ok := NewProvider(AgentOpenCode, ProviderConfig{
+			Roots: []string{incompleteRoot, healthyRoot},
+		})
+		require.True(t, ok)
+		return provider, storagePath,
+			OpenCodeSQLiteVirtualPath(dbPath, "ses_healthy")
+	}
+
+	t.Run("returns accumulated incomplete error after later success", func(t *testing.T) {
+		provider, storagePath, healthyPath := setup(t)
+		var paths []string
+
+		err := provider.(StreamingDiscoverer).DiscoverEach(
+			t.Context(), func(source SourceRef) error {
+				paths = append(paths, source.DisplayPath)
+				return nil
+			},
+		)
+
+		require.Error(t, err)
+		var incomplete DiscoveryIncompleteError
+		require.ErrorAs(t, err, &incomplete)
+		assert.Equal(t, []string{storagePath, healthyPath}, paths)
+	})
+
+	t.Run("later callback error takes precedence", func(t *testing.T) {
+		provider, storagePath, healthyPath := setup(t)
+		sentinel := errors.New("stop on later root")
+		var paths []string
+
+		err := provider.(StreamingDiscoverer).DiscoverEach(
+			t.Context(), func(source SourceRef) error {
+				paths = append(paths, source.DisplayPath)
+				if source.DisplayPath == healthyPath {
+					return sentinel
+				}
+				return nil
+			},
+		)
+
+		assert.Equal(t, sentinel, err,
+			"a later callback error must replace accumulated incompleteness")
+		assert.Equal(t, []string{storagePath, healthyPath}, paths)
+	})
+}
+
+func TestOpenCodeStreamingStorageFailureContinuesLaterRoots(t *testing.T) {
+	failedRoot := t.TempDir()
+	writeOpenCodeProviderStorageSession(
+		t, failedRoot, "session", "ses_failed", "project", "Failed",
+	)
+	failedStorageRoot := filepath.Join(failedRoot, "storage", "session")
+	healthyRoot := t.TempDir()
+	dbPath, seeder, db := newTestDBAt(
+		t, filepath.Join(healthyRoot, "opencode.db"),
+	)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	seeder.AddProject("prj_1", "/workspace/healthy")
+	seeder.AddSession(
+		"ses_healthy", "prj_1", "", "Healthy", 1700000000000, 1700000010000,
+	)
+	healthyPath := OpenCodeSQLiteVirtualPath(dbPath, "ses_healthy")
+	discoveryErr := errors.New("read failed storage root")
+	ctx := withStreamingDirectoryReader(t.Context(), func(
+		ctx context.Context, dir string, yield func(os.DirEntry) error,
+	) error {
+		if samePath(dir, failedStorageRoot) {
+			return discoveryErr
+		}
+		return streamDirectoryEntriesDirect(ctx, dir, yield)
+	})
+	provider, ok := NewProvider(AgentOpenCode, ProviderConfig{
+		Roots: []string{failedRoot, healthyRoot},
+	})
+	require.True(t, ok)
+	var paths []string
+
+	err := provider.(StreamingDiscoverer).DiscoverEach(
+		ctx, func(source SourceRef) error {
+			paths = append(paths, source.DisplayPath)
+			return nil
+		},
+	)
+
+	require.ErrorIs(t, err, discoveryErr)
+	var incomplete DiscoveryIncompleteError
+	require.ErrorAs(t, err, &incomplete)
+	assert.Equal(t, AgentOpenCode, incomplete.Provider)
+	assert.Equal(t, []string{healthyPath}, paths,
+		"a root-local storage failure must not starve later roots")
+}
+
+func TestOpenCodeStreamingSQLiteOnlyFailureContinuesLaterRoots(t *testing.T) {
+	failedRoot := t.TempDir()
+	failedDB := filepath.Join(failedRoot, "opencode.db")
+	require.NoError(t, os.WriteFile(failedDB, []byte("not sqlite"), 0o600))
+	healthyRoot := t.TempDir()
+	dbPath, seeder, db := newTestDBAt(
+		t, filepath.Join(healthyRoot, "opencode.db"),
+	)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	seeder.AddProject("prj_1", "/workspace/healthy")
+	seeder.AddSession(
+		"ses_healthy", "prj_1", "", "Healthy", 1700000000000, 1700000010000,
+	)
+	healthyPath := OpenCodeSQLiteVirtualPath(dbPath, "ses_healthy")
+	provider, ok := NewProvider(AgentOpenCode, ProviderConfig{
+		Roots: []string{failedRoot, healthyRoot},
+	})
+	require.True(t, ok)
+	var paths []string
+
+	err := provider.(StreamingDiscoverer).DiscoverEach(
+		t.Context(), func(source SourceRef) error {
+			paths = append(paths, source.DisplayPath)
+			return nil
+		},
+	)
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "file is not a database")
+	var incomplete DiscoveryIncompleteError
+	require.ErrorAs(t, err, &incomplete)
+	assert.Equal(t, AgentOpenCode, incomplete.Provider)
+	assert.Equal(t, []string{healthyPath}, paths,
+		"a root-local SQLite failure must not starve later roots")
 }
 
 func TestOpenCodeSQLiteOnlyStreamingDiscoveryPropagatesSQLiteFailure(t *testing.T) {

@@ -456,6 +456,69 @@ func TestReconcileHermesDefaultSessionsRootPreservesMissingStateDBArchive(t *tes
 		"a missing persistent state.db cannot prove its archived members were deleted")
 }
 
+func TestReconcileHermesUnreadableStateDBSyncsTranscriptsWithoutTombstones(
+	t *testing.T,
+) {
+	root := t.TempDir()
+	stateDB := writeHermesArchiveStateDB(t, root)
+	sessionsDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.MkdirAll(sessionsDir, 0o755))
+
+	database := dbtest.OpenTestDB(t)
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentHermes: {sessionsDir},
+		},
+		Machine: "local",
+	})
+	t.Cleanup(engine.Close)
+	require.NoError(t, engine.ReconcileWatchRootsAfterLostEvents(
+		t.Context(), []string{sessionsDir}, false,
+	))
+	stored, err := database.GetSession(t.Context(), "hermes:child")
+	require.NoError(t, err)
+	require.NotNil(t, stored, "initial reconciliation must store the state member")
+
+	require.NoError(t, os.WriteFile(stateDB, []byte("not a sqlite database"), 0o600))
+	jsonlPath := filepath.Join(sessionsDir, "orphan.jsonl")
+	require.NoError(t, os.WriteFile(jsonlPath, []byte(
+		`{"role":"session_meta","platform":"cli","timestamp":"2026-05-14T10:00:00Z"}`+"\n"+
+			`{"role":"user","content":"fallback transcript","timestamp":"2026-05-14T10:01:00Z"}`+"\n"+
+			`{"role":"assistant","content":"Done.","timestamp":"2026-05-14T10:02:00Z"}`+"\n",
+	), 0o600))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(sessionsDir, "session_orphan.json"),
+		[]byte(`{
+			"platform":"cli",
+			"session_start":"2026-05-14T10:00:00Z",
+			"last_updated":"2026-05-14T10:02:00Z",
+			"messages":[
+				{"role":"user","content":"duplicate legacy transcript","timestamp":"2026-05-14T10:01:00Z"}
+			]
+		}`),
+		0o600,
+	))
+
+	err = engine.ReconcileWatchRootsAfterLostEvents(
+		t.Context(), []string{sessionsDir}, false,
+	)
+
+	require.Error(t, err, "unreadable state discovery must keep the scope incomplete")
+	result := engine.LastReconciliationResult()
+	assert.False(t, result.Complete)
+	assert.Equal(t, 1, result.ProviderFailures)
+	stored, getErr := database.GetSession(t.Context(), "hermes:child")
+	require.NoError(t, getErr)
+	assert.NotNil(t, stored,
+		"incomplete state discovery must not tombstone archived state-only sessions")
+	fallback, getErr := database.GetSession(t.Context(), "hermes:orphan")
+	require.NoError(t, getErr)
+	require.NotNil(t, fallback,
+		"transcript fallback candidates must still be processed before retry")
+	assert.Equal(t, jsonlPath, database.GetSessionFilePath("hermes:orphan"),
+		"JSONL must remain canonical when a legacy JSON duplicate exists")
+}
+
 func TestReconcileHermesScopedRootPreservesStateMemberMovedToAnotherRoot(t *testing.T) {
 	firstRoot := t.TempDir()
 	secondRoot := t.TempDir()

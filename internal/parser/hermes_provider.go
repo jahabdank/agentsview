@@ -294,6 +294,27 @@ func (s hermesSourceSet) Discover(ctx context.Context) ([]SourceRef, error) {
 }
 
 func (s hermesSourceSet) DiscoverEach(ctx context.Context, yield func(SourceRef) error) error {
+	var discoveryErr error
+	appendDiscoveryErr := func(err error) {
+		err = incompleteDiscoveryError(
+			AgentHermes, "stream configured root", err,
+		)
+		if discoveryErr == nil {
+			discoveryErr = err
+			return
+		}
+		discoveryErr = errors.Join(discoveryErr, err)
+	}
+	discoverTranscripts := func(root, sessionsDir, stateDB string) error {
+		return s.discoverTranscriptEach(
+			ctx, root, sessionsDir, stateDB, func(source SourceRef) error {
+				if err := yield(source); err != nil {
+					return discoveryYieldError{cause: err}
+				}
+				return nil
+			},
+		)
+	}
 	for _, root := range s.roots {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -305,31 +326,56 @@ func (s hermesSourceSet) DiscoverEach(ctx context.Context, yield func(SourceRef)
 					return cause
 				}
 				if yieldedAny || ctx.Err() != nil {
-					return err
+					if ctxErr := ctx.Err(); ctxErr != nil {
+						return ctxErr
+					}
+					appendDiscoveryErr(err)
+					continue
 				}
 				log.Printf(
 					"hermes: state db discovery failed for %s: %v; "+
 						"falling back to transcripts",
 					stateDB, err,
 				)
-				if err := s.discoverTranscriptEach(
-					ctx, root, sessionsDir, "", yield,
-				); err != nil {
-					return err
+				stateErr := err
+				fallbackErr := discoverTranscripts(root, sessionsDir, "")
+				if cause, ok := discoveryYieldCause(fallbackErr); ok {
+					return cause
+				}
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return ctxErr
+				}
+				appendDiscoveryErr(stateErr)
+				if fallbackErr != nil {
+					appendDiscoveryErr(fallbackErr)
 				}
 				continue
 			}
-			if err := s.discoverTranscriptEach(ctx, root, sessionsDir, stateDB, yield); err != nil {
-				return err
+			if err := discoverTranscripts(root, sessionsDir, stateDB); err != nil {
+				if cause, ok := discoveryYieldCause(err); ok {
+					return cause
+				}
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return ctxErr
+				}
+				appendDiscoveryErr(err)
+				continue
 			}
 			continue
 		}
 		transcriptRoot := hermesTranscriptRoot(root)
-		if err := s.discoverTranscriptEach(ctx, root, transcriptRoot, "", yield); err != nil {
-			return err
+		if err := discoverTranscripts(root, transcriptRoot, ""); err != nil {
+			if cause, ok := discoveryYieldCause(err); ok {
+				return cause
+			}
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			appendDiscoveryErr(err)
+			continue
 		}
 	}
-	return nil
+	return discoveryErr
 }
 
 func (s hermesSourceSet) discoverStateEach(

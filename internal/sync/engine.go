@@ -2812,6 +2812,10 @@ func (e *Engine) reconcileWatchRootsStreamed(
 		cleaned = true
 		return stats, metrics, 0, err
 	}
+	baselineEligibleProviders := make(map[parser.AgentType]struct{}, len(completedScopes))
+	for _, completed := range completedScopes {
+		baselineEligibleProviders[completed.agent] = struct{}{}
+	}
 	e.beginStreamingSQLiteContainerPass(preContainerStates)
 	e.finishStreamingSQLiteContainerDiscovery()
 	defer func() {
@@ -2881,8 +2885,11 @@ func (e *Engine) reconcileWatchRootsStreamed(
 			)
 			break
 		}
+		baselineCandidates, baselineAdmitted := eligibleReconciliationBaselines(
+			page, baselineTracker.list(), baselineEligibleProviders,
+		)
 		if err := e.baselineReconciliationCandidates(
-			ctx, page, baselineTracker.list(),
+			ctx, baselineCandidates, baselineAdmitted,
 		); err != nil {
 			stats.RecordFailed()
 			stats.Aborted = true
@@ -2892,12 +2899,26 @@ func (e *Engine) reconcileWatchRootsStreamed(
 		cursor = page[len(page)-1].Cursor()
 	}
 
-	if retErr == nil && stats.providerFailures > 0 {
-		retErr = &incompleteReconciliationError{
-			failures:  stats.providerFailures,
-			roots:     failedRoots,
+	canTombstoneCompletedScopes := retErr == nil && failures > 0
+	if failures > 0 {
+		retryRoots := append([]string(nil), failedRoots...)
+		if retErr != nil {
+			for _, completed := range completedScopes {
+				retryRoots = append(retryRoots, completed.roots...)
+			}
+			slices.Sort(retryRoots)
+			retryRoots = slices.Compact(retryRoots)
+		}
+		incomplete := &incompleteReconciliationError{
+			failures:  failures,
+			roots:     retryRoots,
 			completed: completedScopes,
 			cause:     discoveryErr,
+		}
+		if retErr == nil {
+			retErr = incomplete
+		} else {
+			retErr = errors.Join(incomplete, retErr)
 		}
 	}
 	if retErr == nil && stats.Failed > 0 {
@@ -2926,7 +2947,8 @@ func (e *Engine) reconcileWatchRootsStreamed(
 		tombstoned, retErr = e.tombstoneMissingWatchSourcesLocked(
 			ctx, roots, spool,
 		)
-	} else if ctx.Err() == nil && !stats.Aborted && stats.Failed == 0 {
+	} else if canTombstoneCompletedScopes && ctx.Err() == nil &&
+		!stats.Aborted && stats.Failed == 0 {
 		var incomplete *incompleteReconciliationError
 		if errors.As(retErr, &incomplete) && len(incomplete.completed) > 0 {
 			tombstoned, retErr = e.tombstoneCompletedReconciliationScopesLocked(
@@ -2989,6 +3011,27 @@ func (e *Engine) baselineReconciliationCandidates(
 		return fmt.Errorf("reconcile source baseline page: %w", err)
 	}
 	return nil
+}
+
+func eligibleReconciliationBaselines(
+	candidates []reconciliationCandidate,
+	admitted []db.SessionSourcePath,
+	eligibleProviders map[parser.AgentType]struct{},
+) ([]reconciliationCandidate, []db.SessionSourcePath) {
+	eligibleCandidates := make([]reconciliationCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		if _, eligible := eligibleProviders[candidate.Provider]; !eligible {
+			continue
+		}
+		eligibleCandidates = append(eligibleCandidates, candidate)
+	}
+	eligibleAdmitted := make([]db.SessionSourcePath, 0, len(admitted))
+	for _, source := range admitted {
+		if _, eligible := eligibleProviders[parser.AgentType(source.Agent)]; eligible {
+			eligibleAdmitted = append(eligibleAdmitted, source)
+		}
+	}
+	return eligibleCandidates, eligibleAdmitted
 }
 
 func (e *Engine) streamReconciliationCandidates(

@@ -19,6 +19,44 @@ type reconciliationRetryRootError interface {
 	ReconciliationRetryRoots() []string
 }
 
+type partialFailureStreamingProvider struct {
+	*directStreamingProvider
+	discoveryErr error
+}
+
+func (provider *partialFailureStreamingProvider) DiscoverEach(
+	ctx context.Context, yield func(parser.SourceRef) error,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if provider.source != nil {
+		if err := yield(*provider.source); err != nil {
+			return err
+		}
+	}
+	return provider.discoveryErr
+}
+
+type partialFailureStreamingFactory struct {
+	provider *partialFailureStreamingProvider
+}
+
+func (factory partialFailureStreamingFactory) Definition() parser.AgentDef {
+	return factory.provider.Definition()
+}
+
+func (factory partialFailureStreamingFactory) Capabilities() parser.Capabilities {
+	return factory.provider.Capabilities()
+}
+
+func (factory partialFailureStreamingFactory) NewProvider(
+	cfg parser.ProviderConfig,
+) parser.Provider {
+	factory.provider.Config = cfg.Clone()
+	return factory.provider
+}
+
 type fingerprintCountingProvider struct {
 	*directStreamingProvider
 	fingerprintCalls int
@@ -332,6 +370,193 @@ func TestReconcileWatchRootsCommitsHealthyProvidersAndScopesFailedRetry(t *testi
 	var retryErr reconciliationRetryRootError
 	require.ErrorAs(t, err, &retryErr)
 	assert.Equal(t, []string{failedRoot}, retryErr.ReconciliationRetryRoots())
+}
+
+func TestReconcileWatchRootsRetainsPartialFailedProviderWithoutDeletionProof(t *testing.T) {
+	database := openTestDB(t)
+	failedRoot := t.TempDir()
+	healthyRoot := t.TempDir()
+	failedPath := filepath.Join(failedRoot, "partial.jsonl")
+	failedMissingPath := filepath.Join(failedRoot, "missing.jsonl")
+	healthyPath := filepath.Join(healthyRoot, "session.jsonl")
+	healthyMissingPath := filepath.Join(healthyRoot, "missing.jsonl")
+	for _, path := range []string{failedPath, healthyPath} {
+		require.NoError(t, os.WriteFile(path, []byte("{}\n"), 0o600))
+	}
+	for _, session := range []db.Session{
+		{
+			ID: "failed-missing", Agent: "partial-failure", Project: "project",
+			Machine: "local", FilePath: &failedMissingPath,
+		},
+		{
+			ID: "healthy-missing", Agent: "partial-healthy", Project: "project",
+			Machine: "local", FilePath: &healthyMissingPath,
+		},
+	} {
+		require.NoError(t, database.UpsertSession(session))
+	}
+	require.NoError(t, database.BaselineActiveSessionSourcePaths(
+		t.Context(), "local", []db.SessionSourcePath{
+			{Agent: "partial-failure", FilePath: failedMissingPath},
+			{Agent: "partial-healthy", FilePath: healthyMissingPath},
+		},
+	))
+
+	started := time.Unix(1704067200, 0)
+	newProvider := func(agent parser.AgentType, path, id string) *directStreamingProvider {
+		source := parser.SourceRef{
+			Provider: agent, Key: path, DisplayPath: path, FingerprintKey: path,
+		}
+		return &directStreamingProvider{
+			ProviderBase: parser.ProviderBase{
+				Def: parser.AgentDef{Type: agent, FileBased: true},
+				Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+					DiscoverSources:    parser.CapabilitySupported,
+					StreamingDiscovery: parser.CapabilitySupported,
+					WatchSources:       parser.CapabilitySupported,
+					FindSource:         parser.CapabilitySupported,
+				}},
+			},
+			source: &source,
+			parseOutcome: parser.ParseOutcome{
+				Results: []parser.ParseResultOutcome{{
+					Result: parser.ParseResult{Session: parser.ParsedSession{
+						ID: id, Agent: agent, Project: "project", Machine: "local",
+						StartedAt: started, EndedAt: started,
+						File: parser.FileInfo{Path: path},
+					}},
+					DataVersion: parser.DataVersionCurrent,
+				}},
+				ResultSetComplete: true,
+			},
+		}
+	}
+	discoveryErr := errors.New("partial provider discovery failed")
+	failed := &partialFailureStreamingProvider{
+		directStreamingProvider: newProvider("partial-failure", failedPath, "partial-session"),
+		discoveryErr:            discoveryErr,
+	}
+	healthy := newProvider("partial-healthy", healthyPath, "healthy-session")
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			"partial-failure": {failedRoot},
+			"partial-healthy": {healthyRoot},
+		},
+		Machine: "local",
+		ProviderFactories: []parser.ProviderFactory{
+			partialFailureStreamingFactory{provider: failed},
+			directStreamingFactory{provider: healthy},
+		},
+		ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+			"partial-failure": parser.ProviderMigrationProviderAuthoritative,
+			"partial-healthy": parser.ProviderMigrationProviderAuthoritative,
+		},
+	})
+	t.Cleanup(engine.Close)
+
+	err := engine.ReconcileWatchRoots(t.Context(), nil, true)
+
+	require.ErrorIs(t, err, discoveryErr)
+	var retryErr reconciliationRetryRootError
+	require.ErrorAs(t, err, &retryErr)
+	assert.Equal(t, []string{failedRoot}, retryErr.ReconciliationRetryRoots())
+	partial, getErr := database.GetSession(t.Context(), "partial-session")
+	require.NoError(t, getErr)
+	assert.NotNil(t, partial, "a valid source yielded before discovery failure must persist")
+	failedMissing, getErr := database.GetSessionFull(t.Context(), "failed-missing")
+	require.NoError(t, getErr)
+	require.NotNil(t, failedMissing)
+	assert.Nil(t, failedMissing.DeletionCause,
+		"an incomplete provider scope must not tombstone missing sources")
+	failedOwnership, listErr := database.ListActiveSessionSourceOwnershipPage(
+		t.Context(), "local", "partial-failure", failedRoot, db.SessionSourceCursor{},
+	)
+	require.NoError(t, listErr)
+	require.Len(t, failedOwnership, 1,
+		"an incomplete provider scope must neither add nor remove deletion proof")
+	assert.Equal(t, failedMissingPath, failedOwnership[0].FilePath)
+
+	healthyStored, getErr := database.GetSession(t.Context(), "healthy-session")
+	require.NoError(t, getErr)
+	assert.NotNil(t, healthyStored)
+	healthyMissing, getErr := database.GetSessionFull(t.Context(), "healthy-missing")
+	require.NoError(t, getErr)
+	require.NotNil(t, healthyMissing)
+	require.NotNil(t, healthyMissing.DeletionCause)
+	assert.Equal(t, "source_missing", *healthyMissing.DeletionCause,
+		"an independent completed scope must retain deletion coverage")
+	healthyOwnership, listErr := database.ListActiveSessionSourceOwnershipPage(
+		t.Context(), "local", "partial-healthy", healthyRoot, db.SessionSourceCursor{},
+	)
+	require.NoError(t, listErr)
+	require.Len(t, healthyOwnership, 1)
+	assert.Equal(t, healthyPath, healthyOwnership[0].FilePath,
+		"an independent completed scope must baseline its admitted source")
+}
+
+func TestReconcileWatchRootsJoinsProviderAndLaterProcessingFailures(t *testing.T) {
+	database := openTestDB(t)
+	failedRoot := t.TempDir()
+	healthyRoot := t.TempDir()
+	healthyPath := filepath.Join(healthyRoot, "session.jsonl")
+	require.NoError(t, os.WriteFile(healthyPath, []byte("{}\n"), 0o600))
+	discoveryErr := errors.New("provider discovery failed")
+	laterErr := errors.New("reconciliation page failed")
+	failed := &failingDBBackedProvider{
+		ProviderBase: parser.ProviderBase{Def: parser.AgentDef{
+			Type: "join-failed", FileBased: true,
+		}},
+		err: discoveryErr, failOnCall: 1,
+	}
+	healthySource := parser.SourceRef{
+		Provider: "join-healthy", Key: healthyPath,
+		DisplayPath: healthyPath, FingerprintKey: healthyPath,
+	}
+	healthy := &directStreamingProvider{
+		ProviderBase: parser.ProviderBase{
+			Def: parser.AgentDef{Type: "join-healthy", FileBased: true},
+			Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+				StreamingDiscovery: parser.CapabilitySupported,
+			}},
+		},
+		source: &healthySource,
+	}
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			"join-failed":  {failedRoot},
+			"join-healthy": {healthyRoot},
+		},
+		Machine: "local",
+		ProviderFactories: []parser.ProviderFactory{
+			failingDBBackedFactory{provider: failed},
+			directStreamingFactory{provider: healthy},
+		},
+		ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+			"join-failed":  parser.ProviderMigrationProviderAuthoritative,
+			"join-healthy": parser.ProviderMigrationProviderAuthoritative,
+		},
+	})
+	t.Cleanup(engine.Close)
+	engine.reconciliationSpoolFactory = func(path string) (reconciliationSpoolStore, error) {
+		spool, err := newReconciliationSpool(path)
+		if err != nil {
+			return nil, err
+		}
+		return &failingReconciliationSpool{
+			reconciliationSpoolStore: spool,
+			err:                      laterErr,
+		}, nil
+	}
+
+	err := engine.ReconcileWatchRoots(t.Context(), nil, true)
+
+	require.ErrorIs(t, err, discoveryErr)
+	assert.ErrorIs(t, err, laterErr)
+	var retryErr reconciliationRetryRootError
+	require.ErrorAs(t, err, &retryErr)
+	assert.ElementsMatch(t, []string{failedRoot, healthyRoot},
+		retryErr.ReconciliationRetryRoots(),
+		"a later global processing failure must retry every uncommitted provider scope")
 }
 
 func TestReconciliationCandidateDoesNotHashStableClaudeSource(t *testing.T) {

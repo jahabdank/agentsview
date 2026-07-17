@@ -1919,6 +1919,79 @@ func TestReconcileWatchRootsOpenCodeHybridPrefersCanonicalStorageSource(t *testi
 	assertMessageContent(t, env.db, "opencode:"+sessionID, "canonical storage content")
 }
 
+func TestReconcileWatchRootsOpenCodeHybridUnreadableSQLiteWithholdsTombstones(
+	t *testing.T,
+) {
+	env := setupSingleAgentTestEnv(t, parser.AgentOpenCode)
+	const priorID = "sqlite-prior"
+	sqlite := createOpenCodeDB(t, env.opencodeDir)
+	sqlite.addProject(t, "project", "/workspace/sqlite")
+	sqlite.addSession(t, priorID, "project", 1704067200000, 1704067209000)
+	sqlite.addMessage(t, "prior-message", priorID, "assistant", 1704067201000)
+	sqlite.addTextPart(
+		t, "prior-part", priorID, "prior-message", "prior sqlite content",
+		1704067201000,
+	)
+	require.NoError(t, env.engine.ReconcileWatchRoots(
+		t.Context(), []string{env.opencodeDir}, false,
+	))
+	assertMessageContent(t, env.db, "opencode:"+priorID, "prior sqlite content")
+
+	storage := createOpenCodeStorageFixture(t, env.opencodeDir)
+	const storageID = "storage-partial"
+	storagePath := storage.addSession(
+		t, "global", storageID, "/workspace/storage", "Storage partial",
+		1704067210000, 1704067215000,
+	)
+	storage.addMessage(t, storageID, "storage-message", "assistant", 1704067211000, nil)
+	storage.addTextPart(
+		t, storageID, "storage-message", "storage-part", "partial storage content",
+		1704067211000,
+	)
+	require.NoError(t, sqlite.db.Close())
+	require.NoError(t, os.WriteFile(sqlite.path, []byte("not sqlite"), 0o600))
+
+	err := env.engine.ReconcileWatchRoots(
+		t.Context(), []string{env.opencodeDir}, false,
+	)
+
+	require.Error(t, err)
+	var incomplete parser.DiscoveryIncompleteError
+	require.ErrorAs(t, err, &incomplete)
+	assert.Equal(t, parser.AgentOpenCode, incomplete.Provider)
+	result := env.engine.LastReconciliationResult()
+	assert.False(t, result.Complete)
+	assert.True(t, result.Aborted)
+	assert.Positive(t, result.ProviderFailures)
+	assert.Equal(t, storagePath, env.db.GetSessionFilePath("opencode:"+storageID),
+		"storage candidates yielded before the SQLite failure must still commit")
+	assertMessageContent(t, env.db, "opencode:"+storageID, "partial storage content")
+	prior, getErr := env.db.GetSessionFull(t.Context(), "opencode:"+priorID)
+	require.NoError(t, getErr)
+	require.NotNil(t, prior)
+	assert.Nil(t, prior.DeletionCause,
+		"incomplete SQLite discovery must withhold tombstone authority")
+	var retry interface {
+		error
+		ReconciliationRetryRoots() []string
+	}
+	require.ErrorAs(t, err, &retry)
+	assert.Equal(t, []string{env.opencodeDir}, retry.ReconciliationRetryRoots())
+
+	require.NoError(t, os.Remove(sqlite.path))
+	restored := createOpenCodeDB(t, env.opencodeDir)
+	restored.addProject(t, "project", "/workspace/sqlite")
+	require.NoError(t, env.engine.ReconcileWatchRoots(
+		t.Context(), []string{env.opencodeDir}, false,
+	))
+	prior, getErr = env.db.GetSessionFull(t.Context(), "opencode:"+priorID)
+	require.NoError(t, getErr)
+	require.NotNil(t, prior)
+	require.NotNil(t, prior.DeletionCause)
+	assert.Equal(t, "source_missing", *prior.DeletionCause,
+		"a successful retry may tombstone the now-authoritatively missing SQLite source")
+}
+
 func TestReconcileWatchRootsOpenCodeHybridCardinalityAndIdleGate(t *testing.T) {
 	const rows = 300
 	env := setupSingleAgentTestEnv(t, parser.AgentOpenCode)
