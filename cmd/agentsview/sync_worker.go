@@ -103,7 +103,9 @@ func runSyncWorkerContext(
 		// archive). Only the daemon-side orchestration differs: "startup" runs
 		// before the daemon opens the DB, "sync" runs inside a writer handoff.
 		return runSyncWorkerStartup(ctx, cfg, mode, emit, onProgress)
-	case "resync-build", "audit":
+	case "resync-build":
+		return runSyncWorkerResyncBuild(ctx, cfg, mode, emit, onProgress)
+	case "audit":
 		return fmt.Errorf("sync-worker mode %q not implemented yet", mode)
 	default:
 		return fmt.Errorf("unknown sync-worker mode %q", mode)
@@ -146,6 +148,43 @@ func runSyncWorkerStartup(
 	emit(workerLine{Result: &result})
 	if result.Status != "ok" || !result.DiscoveryComplete {
 		return fmt.Errorf("sync worker %s: %s", mode, result.Status)
+	}
+	return nil
+}
+
+// runSyncWorkerResyncBuild builds a replacement archive at the resync temp path
+// from a read-only view of the original, then emits the terminal result. The
+// daemon holds the write barrier and performs the swap, so the worker never
+// opens the live archive writable and needs no write-owner flock. It leaves the
+// built database on disk at ResyncTempPath for the daemon to install.
+func runSyncWorkerResyncBuild(
+	ctx context.Context,
+	cfg config.Config,
+	mode string,
+	emit func(workerLine),
+	onProgress func(sync.Progress),
+) error {
+	// Remove a stale temp DB from a prior crashed resync before building a fresh
+	// one, matching runServe's startup cleanup and the in-process build.
+	cleanResyncTemp(cfg.DBPath)
+
+	origRO, err := db.OpenReadOnly(cfg.DBPath)
+	if err != nil {
+		return fmt.Errorf("resync-build: open read-only archive: %w", err)
+	}
+	defer origRO.Close()
+
+	engine := sync.NewEngine(origRO, workerEngineConfig(cfg))
+	defer engine.Close()
+
+	_, stats, buildErr := engine.ResyncBuild(ctx, onProgress)
+	result := workerResultFromStats(ctx, stats)
+	emit(workerLine{Result: &result})
+	if result.Status != "ok" || !result.DiscoveryComplete {
+		return fmt.Errorf("sync worker %s: %s", mode, result.Status)
+	}
+	if buildErr != nil {
+		return fmt.Errorf("sync worker %s: %w", mode, buildErr)
 	}
 	return nil
 }

@@ -263,6 +263,17 @@ func (s *Server) runResyncWithFallback(
 	ctx context.Context, engine *syncpkg.Engine,
 	progress func(syncpkg.Progress),
 ) syncpkg.SyncStats {
+	if s.localResyncRunner != nil {
+		// The worker-backed runner builds the replacement archive in a child
+		// process behind a write barrier and swaps it in. It only returns an
+		// error when the worker ran and reported failure; the stats still carry
+		// that outcome, so log and return them.
+		stats, err := s.localResyncRunner(ctx, progress)
+		if err != nil && ctx.Err() == nil {
+			log.Printf("foreground resync: %v", err)
+		}
+		return stats
+	}
 	stats, _ := engine.SyncThenRun(
 		ctx, true, progress, func(bool) error { return nil },
 	)

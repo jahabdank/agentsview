@@ -410,6 +410,9 @@ func runServe(cfg config.Config, opts serveOptions) {
 		srvOpts = append(srvOpts, server.WithLocalSyncRunner(
 			newForegroundSyncRunner(cfg, engine, database, writeLock),
 		))
+		srvOpts = append(srvOpts, server.WithLocalResyncRunner(
+			newForegroundResyncRunner(cfg, engine, database),
+		))
 	}
 	srv := server.New(cfg, database, engine, srvOpts...)
 
@@ -668,6 +671,86 @@ func newForegroundSyncRunner(
 			ctx, false, progress, func(bool) error { return nil },
 		)
 	}
+}
+
+// newForegroundResyncRunner builds the daemon's foreground resync runner used by
+// the resync HTTP handler. It builds the replacement archive in a worker process
+// behind the write barrier, then swaps it in and resets caches. A spawn failure
+// (or a test binary) falls back to the in-process resync; a worker that ran and
+// reported failure is surfaced without re-running.
+func newForegroundResyncRunner(
+	cfg config.Config, engine *sync.Engine, database *db.DB,
+) server.LocalResyncRunner {
+	return func(
+		ctx context.Context, progress func(sync.Progress),
+	) (sync.SyncStats, error) {
+		if !testing.Testing() {
+			stats, err, spawnFailed := runWorkerResyncBuild(
+				ctx, cfg, engine, database, progress,
+			)
+			if !spawnFailed {
+				return stats, err
+			}
+			log.Printf(
+				"foreground resync worker spawn failed: %v "+
+					"(falling back in-process)", err,
+			)
+		}
+		return engine.ResyncAll(ctx, progress), nil
+	}
+}
+
+// runWorkerResyncBuild builds a resync replacement in a worker process behind the
+// write barrier, then swaps it in and resets caches. It closes the writer for the
+// whole build-and-swap window (readers keep serving, direct writes fail with
+// ErrWriterClosed) without releasing the write-owner flock: the worker never
+// opens the live archive writable. spawnFailed is true only when the worker
+// could not be launched, so the caller falls back in process.
+func runWorkerResyncBuild(
+	ctx context.Context,
+	cfg config.Config,
+	engine *sync.Engine,
+	database *db.DB,
+	progress func(sync.Progress),
+) (stats sync.SyncStats, err error, spawnFailed bool) {
+	relay := func(l workerLine) {
+		if l.Progress != nil && progress != nil {
+			progress(*l.Progress)
+		}
+	}
+	var result workerResult
+	var launchErr error
+	barrierErr := engine.RunExclusive(func() error {
+		if cerr := database.CloseWriter(); cerr != nil {
+			return fmt.Errorf("close writer for resync build: %w", cerr)
+		}
+		result, launchErr = launchSyncWorker(ctx, cfg, "resync-build", relay)
+		if launchErr != nil {
+			// The worker never swapped; restore the writer the barrier closed.
+			if rerr := database.ReopenWriter(); rerr != nil {
+				log.Printf("reopen writer after failed resync build: %v", rerr)
+			}
+			return launchErr
+		}
+		if serr := engine.SwapResyncDatabase(engine.ResyncTempPath()); serr != nil {
+			// The swap reopens the original on its recoverable failures; make
+			// sure the writer is restored regardless of where it failed.
+			if rerr := database.ReopenWriter(); rerr != nil {
+				log.Printf("reopen writer after failed resync swap: %v", rerr)
+			}
+			return fmt.Errorf("swap resync database: %w", serr)
+		}
+		// The swap's reopen restored the writer and cleared the barrier;
+		// re-baseline the caches that referenced the replaced database.
+		return engine.ResetCachesAfterSwap()
+	})
+	if barrierErr != nil {
+		if errors.Is(barrierErr, errWorkerSpawn) {
+			return sync.SyncStats{}, barrierErr, true
+		}
+		return statsFromWorkerResult(result), barrierErr, false
+	}
+	return statsFromWorkerResult(result), nil, false
 }
 
 func newStartupReconciliationHandler(

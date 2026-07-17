@@ -3503,12 +3503,25 @@ func (db *DB) reopenLocked() error {
 	retired := append([]*sql.DB(nil), db.retired...)
 	oldWriter := db.writer.Swap(writer)
 	oldReader := db.reader.Swap(reader)
+	// Reopen fully restores the writer pool, so clear any writer-closed barrier
+	// a prior CloseWriter set. Without this a resync swap that ran behind the
+	// worker write barrier would reopen the pool yet keep rejecting writes.
+	db.writerClosed.Store(false)
 
 	// Retire the just-swapped pools. Concurrent readers that
 	// loaded the old pointer before the swap may still have
 	// in-flight queries; these pools will be closed on the
-	// next Reopen, CloseConnections, or Close call.
-	db.retired = []*sql.DB{oldWriter, oldReader}
+	// next Reopen, CloseConnections, or Close call. Skip a nil
+	// old writer: a Reopen that follows CloseWriter swaps out a
+	// nil pool, and retiring it would nil-deref on the next close.
+	var freshRetired []*sql.DB
+	if oldWriter != nil {
+		freshRetired = append(freshRetired, oldWriter)
+	}
+	if oldReader != nil {
+		freshRetired = append(freshRetired, oldReader)
+	}
+	db.retired = freshRetired
 	db.connMu.Unlock()
 
 	// Close pools from earlier reopens outside connMu. database/sql

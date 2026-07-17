@@ -1563,11 +1563,44 @@ func (e *Engine) resyncAllWithOptionsAndOperations(
 	)
 }
 
+// resyncAllWithOptionsLocked rebuilds the archive in place: it builds a fresh
+// replacement at the temp path, swaps it into the live file, then re-baselines
+// the caches that referenced the old database. The caller holds syncMu. The
+// extracted methods (ResyncBuild, SwapResyncDatabase, ResetCachesAfterSwap) let
+// the daemon run the heavy build in a worker process behind a write barrier and
+// perform only the swap tail itself.
 func (e *Engine) resyncAllWithOptionsLocked(
 	ctx context.Context, onProgress ProgressFunc, opts RebuildOptions,
 	ops rebuildOperations,
 ) (stats SyncStats, retErr error) {
 	ops = ops.withDefaults()
+	stats, err := e.resyncBuildLocked(ctx, onProgress, opts, ops)
+	if err != nil || stats.Aborted {
+		return stats, err
+	}
+	if err := e.swapResyncDatabaseLocked(
+		ctx, onProgress, e.ResyncTempPath(), ops, &stats,
+	); err != nil {
+		e.setLastSyncStats(stats)
+		return stats, err
+	}
+	if err := e.ResetCachesAfterSwap(); err != nil {
+		log.Printf("resync: reset caches after swap: %v", err)
+	}
+	e.setLastSyncStats(stats)
+	return stats, nil
+}
+
+// resyncBuildLocked builds a complete replacement archive at the temp path from
+// the current sources plus any contributors, copies preserved state (orphans,
+// insights, recall, user metadata) from the original, persists the fresh skip
+// cache into the replacement, and closes it. It reads the original but never
+// closes or swaps it; the caller performs the swap. The caller holds syncMu and
+// guarantees the original receives no writes for the duration.
+func (e *Engine) resyncBuildLocked(
+	ctx context.Context, onProgress ProgressFunc, opts RebuildOptions,
+	ops rebuildOperations,
+) (stats SyncStats, retErr error) {
 	reportResyncProgress := func(p Progress) {
 		p.Resync = true
 		if p.Phase == PhaseSyncing && p.Detail == "" {
@@ -1856,9 +1889,6 @@ func (e *Engine) resyncAllWithOptionsLocked(
 				newDB.Close()
 				removeTempDB(tempPath)
 				restoreSkipCache()
-				if reopenErr := origDB.Reopen(); reopenErr != nil {
-					log.Printf("resync: contributor failure recovery reopen: %v", reopenErr)
-				}
 				stats.Aborted = true
 				stats.Warnings = append(stats.Warnings, fmt.Sprintf(
 					"resync contributor %q failed: %v",
@@ -1910,40 +1940,15 @@ func (e *Engine) resyncAllWithOptionsLocked(
 		return stats, nil
 	}
 
-	// 4. Close origDB connections first to quiesce writes,
-	// then copy insights into newDB (which is still open).
-	// This ensures no insight writes land in the old DB
-	// after the copy.
-	reportResyncPhase(
-		PhaseCopyingMetadata,
-		"Closing current database before final copy",
-		"",
-	)
-	if err := origDB.CloseConnections(); err != nil {
-		log.Printf("resync: close orig db: %v", err)
-		stats.Aborted = true
-		stats.Warnings = append(stats.Warnings,
-			"close before swap failed: "+err.Error(),
-		)
-		newDB.Close()
-		removeTempDB(tempPath)
-		restoreSkipCache()
-		// Connections may be partially closed; reopen to
-		// restore service before returning.
-		if rerr := origDB.Reopen(); rerr != nil {
-			log.Printf("resync: recovery reopen: %v", rerr)
-		}
-		e.mu.Lock()
-		e.lastSyncStats = stats
-		e.mu.Unlock()
-		return stats, err
-	}
-
-	// Re-copy excluded session IDs now that origDB is quiesced.
-	// This catches any permanent deletes that occurred during
-	// the sync window (between the pre-sync copy and now).
-	// Also purge any sessions that were synced into newDB
-	// before the exclusion was recorded.
+	// Copy preserved state from the original into the replacement. The caller
+	// guarantees the original is quiesced: the in-process swap owns the final
+	// CloseConnections, and the worker path runs behind the daemon's write
+	// barrier. These ATTACH reads therefore see a consistent committed snapshot
+	// without the build closing the original here.
+	//
+	// Re-copy excluded session IDs to catch permanent deletes recorded during
+	// the sync window, and purge any sessions synced into newDB before the
+	// exclusion was recorded.
 	reportResyncPhase(
 		PhaseCopyingMetadata,
 		"Copying sync metadata",
@@ -1964,9 +1969,6 @@ func (e *Engine) resyncAllWithOptionsLocked(
 		newDB.Close()
 		removeTempDB(tempPath)
 		restoreSkipCache()
-		if rerr := origDB.Reopen(); rerr != nil {
-			log.Printf("resync: recovery reopen: %v", rerr)
-		}
 		e.mu.Lock()
 		e.lastSyncStats = stats
 		e.mu.Unlock()
@@ -1990,9 +1992,6 @@ func (e *Engine) resyncAllWithOptionsLocked(
 		newDB.Close()
 		removeTempDB(tempPath)
 		restoreSkipCache()
-		if rerr := origDB.Reopen(); rerr != nil {
-			log.Printf("resync: recovery reopen: %v", rerr)
-		}
 		e.mu.Lock()
 		e.lastSyncStats = stats
 		e.mu.Unlock()
@@ -2041,9 +2040,6 @@ func (e *Engine) resyncAllWithOptionsLocked(
 		newDB.Close()
 		removeTempDB(tempPath)
 		restoreSkipCache()
-		if rerr := origDB.Reopen(); rerr != nil {
-			log.Printf("resync: recovery reopen: %v", rerr)
-		}
 		e.mu.Lock()
 		e.lastSyncStats = stats
 		e.mu.Unlock()
@@ -2078,9 +2074,6 @@ func (e *Engine) resyncAllWithOptionsLocked(
 		newDB.Close()
 		removeTempDB(tempPath)
 		restoreSkipCache()
-		if rerr := origDB.Reopen(); rerr != nil {
-			log.Printf("resync: recovery reopen: %v", rerr)
-		}
 		e.mu.Lock()
 		e.lastSyncStats = stats
 		e.mu.Unlock()
@@ -2106,9 +2099,6 @@ func (e *Engine) resyncAllWithOptionsLocked(
 		newDB.Close()
 		removeTempDB(tempPath)
 		restoreSkipCache()
-		if rerr := origDB.Reopen(); rerr != nil {
-			log.Printf("resync: recovery reopen: %v", rerr)
-		}
 		e.mu.Lock()
 		e.lastSyncStats = stats
 		e.mu.Unlock()
@@ -2167,14 +2157,53 @@ func (e *Engine) resyncAllWithOptionsLocked(
 		)
 	}
 
-	// 5. Close newDB and swap files, then reopen origDB.
-	reportResyncPhase(
-		PhaseSwappingDatabase,
-		"Swapping rebuilt database into place",
-		"",
-	)
+	// Persist the fresh skip state into the replacement so the post-swap engine
+	// loads warm state: this engine after an in-process swap, or the daemon
+	// after a worker build. Then close the replacement so its file is complete
+	// on disk for the caller's rename.
+	e.persistSkipCacheInto(newDB)
 	newDB.Close()
+	return stats, nil
+}
 
+// swapResyncDatabaseLocked installs a built replacement archive at tempPath over
+// the original: it closes the original's connections (quiescing and
+// checkpointing it), removes the WAL sidecars, renames the replacement into
+// place, reopens the active handle, marks data current, and checkpoints. Every
+// failure appends a warning to stats and marks it aborted; recoverable failures
+// reopen the original so it keeps serving. The caller holds syncMu.
+func (e *Engine) swapResyncDatabaseLocked(
+	ctx context.Context, onProgress ProgressFunc, tempPath string,
+	ops rebuildOperations, stats *SyncStats,
+) error {
+	ops = ops.withDefaults()
+	origDB := e.db
+	origPath := origDB.Path()
+	reportResyncPhase := func(phase Phase, detail string) {
+		e.reportProgress(onProgress, Progress{
+			Phase: phase, Detail: detail, Resync: true,
+		})
+	}
+
+	// Close the original to quiesce writes and checkpoint its WAL before the
+	// rename. The worker path already holds the daemon's write barrier; the
+	// in-process path relies on this close for the same guarantee.
+	reportResyncPhase(PhaseCopyingMetadata, "Closing current database before swap")
+	if err := origDB.CloseConnections(); err != nil {
+		log.Printf("resync: close orig db: %v", err)
+		stats.Aborted = true
+		stats.Warnings = append(stats.Warnings,
+			"close before swap failed: "+err.Error(),
+		)
+		removeTempDB(tempPath)
+		// Connections may be partially closed; reopen to restore service.
+		if rerr := origDB.Reopen(); rerr != nil {
+			log.Printf("resync: recovery reopen: %v", rerr)
+		}
+		return err
+	}
+
+	reportResyncPhase(PhaseSwappingDatabase, "Swapping rebuilt database into place")
 	removeWAL(origPath)
 
 	if err := os.Rename(tempPath, origPath); err != nil {
@@ -2184,15 +2213,11 @@ func (e *Engine) resyncAllWithOptionsLocked(
 			"resync swap failed: "+err.Error(),
 		)
 		removeTempDB(tempPath)
-		restoreSkipCache()
 		// Restore service even on rename failure.
 		if rerr := origDB.Reopen(); rerr != nil {
 			log.Printf("resync: recovery reopen: %v", rerr)
 		}
-		e.mu.Lock()
-		e.lastSyncStats = stats
-		e.mu.Unlock()
-		return stats, err
+		return err
 	}
 	removeWAL(tempPath)
 
@@ -2203,31 +2228,91 @@ func (e *Engine) resyncAllWithOptionsLocked(
 			"resync swap completed but reopening active database failed: "+
 				err.Error(),
 		)
-		e.mu.Lock()
-		e.lastSyncStats = stats
-		e.mu.Unlock()
-		return stats, err
-	} else {
-		origDB.MarkDataCurrent()
-		if err := origDB.CheckpointWALTruncateWithRetry(ctx); err != nil {
-			if errors.Is(err, db.ErrWALCheckpointBusy) {
-				log.Printf("resync: wal checkpoint busy")
-			} else {
-				log.Printf("resync: wal checkpoint: %v", err)
-			}
+		return err
+	}
+	origDB.MarkDataCurrent()
+	if err := origDB.CheckpointWALTruncateWithRetry(ctx); err != nil {
+		if errors.Is(err, db.ErrWALCheckpointBusy) {
+			log.Printf("resync: wal checkpoint busy")
+		} else {
+			log.Printf("resync: wal checkpoint: %v", err)
 		}
 	}
+	return nil
+}
 
-	// 6. Persist skip cache into the new DB.
-	e.persistSkipCache()
+// ResyncTempPath returns the path where a resync build stages its replacement
+// archive: the active database path with the resync temp suffix appended.
+func (e *Engine) ResyncTempPath() string {
+	return e.db.Path() + resyncTempSuffix
+}
 
+// ResyncBuild builds a complete replacement archive at ResyncTempPath (including
+// orphan and metadata copy phases and skip-state persistence) using read-only
+// access to the original archive. The caller must guarantee the original
+// receives no writes while it runs; the daemon holds the write barrier and the
+// worker opens the original read-only. It does not swap or reopen anything.
+func (e *Engine) ResyncBuild(
+	ctx context.Context, onProgress ProgressFunc,
+) (string, SyncStats, error) {
+	if e.refuseWriteInForceParse("ResyncBuild") {
+		return "", SyncStats{}, nil
+	}
+	e.syncMu.Lock()
+	defer e.syncMu.Unlock()
+	defer e.clearCurrentProgress()
+	stats, err := e.resyncBuildLocked(
+		ctx, onProgress, RebuildOptions{}, productionRebuildOperations,
+	)
+	return e.ResyncTempPath(), stats, err
+}
+
+// SwapResyncDatabase installs a replacement archive built at tempPath: it closes
+// connections, removes WAL sidecars, renames, reopens, marks data current, and
+// checkpoints. It is the daemon's swap tail after a worker build. The caller
+// serializes it against sync (the daemon holds the write barrier).
+func (e *Engine) SwapResyncDatabase(tempPath string) error {
+	var stats SyncStats
+	return e.swapResyncDatabaseLocked(
+		context.Background(), nil, tempPath, productionRebuildOperations, &stats,
+	)
+}
+
+// ResetCachesAfterSwap re-baselines every parent-side cache keyed to the
+// replaced database: it clears the trusted SQLite containers, trusted OpenCode
+// storage sessions, and verified sources, then reloads the skip cache from the
+// swapped archive so the engine carries warm skip state. skipFingerprints is
+// reset to empty, matching engine construction (fingerprints are recomputed on
+// the next sync, never persisted). The caller invokes it immediately after a
+// successful SwapResyncDatabase.
+func (e *Engine) ResetCachesAfterSwap() error {
+	e.clearTrustedSQLiteContainers()
+	e.clearTrustedOpenCodeStorageSessions()
+	e.clearVerifiedSources()
+
+	skipCache := make(map[string]int64)
+	if !e.ephemeral {
+		loaded, err := e.db.LoadSkippedFiles()
+		if err != nil {
+			return fmt.Errorf("reloading skip cache after swap: %w", err)
+		}
+		skipCache = loaded
+	}
+	skipHashKeys, _ := normalizeSourceHashSkipCache(skipCache, nil)
+
+	e.skipMu.Lock()
+	e.skipCache = skipCache
+	e.skipHashKeys = skipHashKeys
+	e.skipFingerprints = make(map[string]string)
+	e.skipMu.Unlock()
+	return nil
+}
+
+// setLastSyncStats records the most recent sync/resync outcome under e.mu.
+func (e *Engine) setLastSyncStats(stats SyncStats) {
 	e.mu.Lock()
 	e.lastSyncStats = stats
 	e.mu.Unlock()
-
-	// Emission happens via the deferred closure above, after
-	// syncMu is released.
-	return
 }
 
 // removeTempDB removes a temp database and its WAL/SHM files.
@@ -7298,6 +7383,13 @@ func (e *Engine) SnapshotSkipCache() map[string]int64 {
 // database so skipped files survive process restarts.
 // Returns the number of entries persisted.
 func (e *Engine) persistSkipCache() int {
+	return e.persistSkipCacheInto(e.db)
+}
+
+// persistSkipCacheInto writes the current skip cache into target. A resync build
+// persists into the replacement database (not the active one) so the post-swap
+// engine reloads warm skip state.
+func (e *Engine) persistSkipCacheInto(target *db.DB) int {
 	if e.ephemeral {
 		return 0
 	}
@@ -7306,7 +7398,7 @@ func (e *Engine) persistSkipCache() int {
 	maps.Copy(snapshot, e.skipCache)
 	e.skipMu.RUnlock()
 
-	if err := e.db.ReplaceSkippedFiles(snapshot); err != nil {
+	if err := target.ReplaceSkippedFiles(snapshot); err != nil {
 		log.Printf("persisting skip cache: %v", err)
 	}
 	return len(snapshot)

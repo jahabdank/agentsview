@@ -13,7 +13,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/sync"
 	"go.kenn.io/agentsview/internal/testjsonl"
 )
 
@@ -122,7 +124,7 @@ func TestSyncWorkerRejectsUnknownMode(t *testing.T) {
 
 func TestSyncWorkerReportsNotImplementedModes(t *testing.T) {
 	cfg := testConfigWithClaudeFixture(t)
-	for _, mode := range []string{"resync-build", "audit"} {
+	for _, mode := range []string{"audit"} {
 		t.Run(mode, func(t *testing.T) {
 			var out bytes.Buffer
 			err := runSyncWorker(cfg, mode, &out)
@@ -130,6 +132,27 @@ func TestSyncWorkerReportsNotImplementedModes(t *testing.T) {
 			assert.ErrorContains(t, err, "not implemented")
 		})
 	}
+}
+
+func TestSyncWorkerResyncBuildModeBuildsReplacement(t *testing.T) {
+	cfg := testConfigWithClaudeFixture(t)
+	// Seed the archive the worker rebuilds from, then close it so the worker
+	// opens it read-only exactly as it does under the daemon's write barrier.
+	database, err := db.Open(cfg.DBPath)
+	require.NoError(t, err)
+	engine := sync.NewEngine(database, workerEngineConfig(cfg))
+	require.Equal(t, 3, engine.SyncAll(context.Background(), nil).Synced)
+	engine.Close()
+	require.NoError(t, database.Close())
+
+	var out bytes.Buffer
+	require.NoError(t, runSyncWorker(cfg, "resync-build", &out))
+	result := decodeSingleResult(t, &out)
+	assert.Equal(t, "ok", result.Status)
+	assert.True(t, result.DiscoveryComplete)
+	assert.Equal(t, 3, result.Synced)
+	assert.FileExists(t, cfg.DBPath+"-resync",
+		"worker must leave the built replacement for the daemon to swap")
 }
 
 func TestSyncWorkerSyncModeSyncsLikeStartup(t *testing.T) {
