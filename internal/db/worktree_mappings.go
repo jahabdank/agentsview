@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"path/filepath"
+	"path"
 	"sort"
 	"strings"
 
@@ -49,16 +49,9 @@ func normalizeWorktreeMapping(
 		return WorktreeProjectMapping{}, fmt.Errorf("%w: machine is required", ErrWorktreeMappingInvalid)
 	}
 
-	pathPrefix = strings.TrimSpace(pathPrefix)
-	if pathPrefix == "" {
+	pathPrefix = normalizedMappingPath(pathPrefix)
+	if pathPrefix == "" || pathPrefix == "." {
 		return WorktreeProjectMapping{}, fmt.Errorf("%w: path_prefix is required", ErrWorktreeMappingInvalid)
-	}
-	cleanPrefix := filepath.Clean(pathPrefix)
-	if cleanPrefix == "." {
-		return WorktreeProjectMapping{}, fmt.Errorf("%w: path_prefix is required", ErrWorktreeMappingInvalid)
-	}
-	if !isFilesystemRoot(cleanPrefix) {
-		cleanPrefix = strings.TrimRight(cleanPrefix, string(filepath.Separator))
 	}
 
 	layout = strings.TrimSpace(layout)
@@ -91,32 +84,33 @@ func normalizeWorktreeMapping(
 
 	return WorktreeProjectMapping{
 		Machine:    machine,
-		PathPrefix: cleanPrefix,
+		PathPrefix: pathPrefix,
 		Layout:     layout,
 		Project:    parser.NormalizeName(project),
 	}, nil
 }
 
-func isFilesystemRoot(path string) bool {
-	volume := filepath.VolumeName(path)
-	return path == volume+string(filepath.Separator)
+func normalizedMappingPath(value string) string {
+	value = strings.TrimSpace(strings.ReplaceAll(value, `\`, "/"))
+	if value == "" {
+		return ""
+	}
+	return path.Clean(value)
 }
 
 func worktreePathMatches(prefix string, cwd string) bool {
-	cwd = strings.TrimSpace(cwd)
-	if cwd == "" {
+	prefix = normalizedMappingPath(prefix)
+	cwd = normalizedMappingPath(cwd)
+	if prefix == "" || prefix == "." || cwd == "" || cwd == "." {
 		return false
 	}
-	cleanCwd := filepath.Clean(cwd)
-	if cleanCwd == prefix {
+	if cwd == prefix {
 		return true
 	}
-	matchPrefix := prefix
-	if !isFilesystemRoot(matchPrefix) {
-		matchPrefix = strings.TrimRight(matchPrefix, string(filepath.Separator))
-		matchPrefix += string(filepath.Separator)
+	if prefix == "/" {
+		return strings.HasPrefix(cwd, "/")
 	}
-	return strings.HasPrefix(cleanCwd, matchPrefix)
+	return strings.HasPrefix(cwd, strings.TrimSuffix(prefix, "/")+"/")
 }
 
 func scanWorktreeMapping(rows *sql.Rows) (WorktreeProjectMapping, error) {
@@ -577,14 +571,16 @@ func resolveRepoDotWorktrees(
 	if cwd == "" {
 		return "", "", false
 	}
-	rel, err := filepath.Rel(pathPrefix, filepath.Clean(cwd))
-	if err != nil || rel == "." || rel == "" {
+	pathPrefix = normalizedMappingPath(pathPrefix)
+	cwd = normalizedMappingPath(cwd)
+	if !worktreePathMatches(pathPrefix, cwd) || cwd == pathPrefix {
 		return "", "", false
 	}
-	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	rel := strings.TrimPrefix(cwd, strings.TrimSuffix(pathPrefix, "/")+"/")
+	if rel == cwd || rel == "" {
 		return "", "", false
 	}
-	idx := strings.IndexRune(rel, filepath.Separator)
+	idx := strings.IndexRune(rel, '/')
 	if idx < 0 {
 		return "", "", false
 	}
@@ -596,7 +592,7 @@ func resolveRepoDotWorktrees(
 	if repo == "" {
 		return "", "", false
 	}
-	return parser.NormalizeName(repo), filepath.Join(pathPrefix, first), true
+	return parser.NormalizeName(repo), path.Join(pathPrefix, first), true
 }
 
 type worktreeMappingSessionRow struct {
@@ -846,60 +842,16 @@ func (db *DB) applyWorktreeProjectMappings(
 		)
 	}
 
-	rows, err := tx.QueryContext(ctx, `
-		SELECT id, project, cwd, file_path
-		FROM sessions
-		WHERE machine = ? AND deleted_at IS NULL`,
-		machine,
+	evaluation, err := evaluateWorktreeMappingsTx(
+		ctx, tx, machine, mappings, nil,
 	)
 	if err != nil {
-		return ApplyWorktreeProjectMappingsResult{}, fmt.Errorf(
-			"querying sessions for worktree mapping apply: %w", err,
-		)
+		return ApplyWorktreeProjectMappingsResult{}, err
 	}
-
-	rowsForMachine := []worktreeMappingSessionRow{}
-	var updates []worktreeMappingSessionUpdate
-	var result ApplyWorktreeProjectMappingsResult
-	for rows.Next() {
-		var row worktreeMappingSessionRow
-		var filePath sql.NullString
-		row.machine = machine
-		if err := rows.Scan(&row.id, &row.project, &row.cwd, &filePath); err != nil {
-			rows.Close()
-			return result, fmt.Errorf("scanning session for worktree mapping apply: %w", err)
-		}
-		if filePath.Valid {
-			row.filePath = filePath.String
-		}
-		rowsForMachine = append(rowsForMachine, row)
+	result := ApplyWorktreeProjectMappingsResult{
+		MatchedSessions: evaluation.matched,
 	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return result, fmt.Errorf("iterating sessions for worktree mapping apply: %w", err)
-	}
-	if err := rows.Close(); err != nil {
-		return result, fmt.Errorf("closing worktree mapping apply rows: %w", err)
-	}
-
-	applyWorktreeMappingMatchCwdFromSiblings(rowsForMachine, func(row worktreeMappingSessionRow) string {
-		return strings.TrimSpace(row.filePath)
-	}, func(row worktreeMappingSessionRow, cwd string) (string, bool) {
-		return ResolveWorktreeProjectFromSortedMappings(mappings, cwd, row.project)
-	})
-
-	for _, row := range rowsForMachine {
-		update, matched, shouldUpdate := applyMappingToSessionRow(mappings, row)
-		if !matched {
-			continue
-		}
-		result.MatchedSessions++
-		if shouldUpdate {
-			updates = append(updates, update)
-		}
-	}
-
-	for _, update := range updates {
+	for _, update := range evaluation.updates {
 		changed, err := updateSessionProjectTx(
 			ctx, tx, update, bumpLocalModifiedAt,
 		)

@@ -715,6 +715,72 @@ func upsertProjectIdentityObservationTx(
 	return nil
 }
 
+// rebuildProjectIdentityAggregatesTx republishes immutable per-session
+// evidence under the sessions' current project labels. Snapshot rows remain
+// source-labelled and are never modified by manual classification.
+func rebuildProjectIdentityAggregatesTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	machine string,
+	projects []string,
+) error {
+	if len(projects) == 0 {
+		return nil
+	}
+	placeholders := make([]string, len(projects))
+	args := make([]any, 0, len(projects)+1)
+	args = append(args, machine)
+	for i, project := range projects {
+		placeholders[i] = "?"
+		args = append(args, project)
+	}
+	projectSet := strings.Join(placeholders, ",")
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM project_identity_observations
+		WHERE machine = ? AND project IN (`+projectSet+`)`, args...); err != nil {
+		return fmt.Errorf("removing stale project identity aggregates: %w", err)
+	}
+
+	_, err := tx.ExecContext(ctx, `
+		WITH ranked_evidence AS (
+			SELECT s.project, snap.machine, snap.root_path, snap.git_remote,
+				snap.git_remote_name, snap.repository_path, snap.worktree_name,
+				snap.worktree_root_path, snap.worktree_relationship,
+				snap.checkout_state, snap.git_branch, snap.remote_resolution,
+				snap.remote_candidate_count, snap.observed_at,
+				snap.normalized_remote, snap.key_source, snap.key,
+				ROW_NUMBER() OVER (
+					PARTITION BY s.project, snap.machine,
+						snap.root_path, snap.git_remote
+					ORDER BY snap.observed_at DESC, snap.session_id
+				) AS evidence_rank
+			FROM session_project_identity_snapshots snap
+			JOIN sessions s ON s.id = snap.session_id
+			WHERE s.deleted_at IS NULL AND s.machine = ?
+				AND s.project IN (`+projectSet+`)
+		)
+		INSERT INTO project_identity_observations (
+			source_archive_id, source_archive_salt, project, machine,
+			root_path, git_remote, git_remote_name, repository_path,
+			worktree_name, worktree_root_path, worktree_relationship,
+			checkout_state, git_branch, remote_resolution,
+			remote_candidate_count, observed_at, normalized_remote,
+			key_source, key
+		)
+		SELECT '', '', project, machine,
+			root_path, git_remote, git_remote_name, repository_path,
+			worktree_name, worktree_root_path, worktree_relationship,
+			checkout_state, git_branch, remote_resolution,
+			remote_candidate_count, observed_at, normalized_remote,
+			key_source, key
+		FROM ranked_evidence
+		WHERE evidence_rank = 1`, args...)
+	if err != nil {
+		return fmt.Errorf("rebuilding project identity aggregates: %w", err)
+	}
+	return nil
+}
+
 func upsertSessionProjectIdentitySnapshotExec(
 	ctx context.Context,
 	exec contextExecer,

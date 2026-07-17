@@ -1933,6 +1933,57 @@ func TestSyncPathsSkippedClaudeDoesNotApplyWorktreeProjectMapping(
 	)
 }
 
+func TestRunExclusiveSerializesWorktreeReclassification(t *testing.T) {
+	database, err := db.Open(filepath.Join(t.TempDir(), "archive.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	ctx := context.Background()
+	require.NoError(t, database.UpsertSession(db.Session{
+		ID: "session", Machine: "archive.example", Agent: "claude",
+		Project: "branch", Cwd: "/worktrees/service/branch",
+	}))
+	draft := db.WorktreeReclassificationDraft{
+		Machine: "archive.example", PathPrefix: "/worktrees/service",
+		Project: "service", Enabled: true,
+	}
+	preview, err := database.PreviewWorktreeReclassification(ctx, draft)
+	require.NoError(t, err)
+	engine := sync.NewEngine(database, sync.EngineConfig{Machine: "archive.example"})
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- engine.RunExclusive(func() error {
+			close(entered)
+			<-release
+			return nil
+		})
+	}()
+	<-entered
+
+	applyDone := make(chan error, 1)
+	go func() {
+		_, _, applyErr := engine.ApplyWorktreeReclassification(
+			ctx, draft, preview.MappingToken, preview.ExistingMappingID,
+		)
+		applyDone <- applyErr
+	}()
+	select {
+	case applyErr := <-applyDone:
+		require.Failf(t, "apply overlapped exclusive work", "error: %v", applyErr)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(release)
+	require.NoError(t, <-firstDone)
+	require.NoError(t, <-applyDone)
+
+	session, err := database.GetSession(ctx, "session")
+	require.NoError(t, err)
+	require.NotNil(t, session)
+	assert.Equal(t, "service", session.Project)
+}
+
 func TestSyncSingleSessionIncrementalAppliesWorktreeProjectMapping(
 	t *testing.T,
 ) {
