@@ -1726,6 +1726,7 @@
   "activity_reclassify_project_sample_sessions": [
     { "declarations": ["input count", "local countPlural = count: plural", "local countNumber = count: number"], "selectors": ["countPlural"], "match": { "countPlural=one": "{countNumber} session", "countPlural=other": "{countNumber} sessions" } }
   ],
+  "activity_reclassify_normalized_target": "Sera enregistré sous {project}",
   "activity_reclassify_multiple_projects": "Ce préfixe touche plusieurs projets. Vérifiez l’échantillon avant d’appliquer.",
   "activity_reclassify_zero_matches": "Ce préfixe ne correspond à aucune session de l’archive.",
   "activity_reclassify_conflict": "Les correspondances ont changé depuis l’aperçu. L’impact a été actualisé ; vérifiez-le avant d’appliquer.",

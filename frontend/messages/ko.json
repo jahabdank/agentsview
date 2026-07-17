@@ -1690,6 +1690,7 @@
   "activity_reclassify_project_sample_sessions": [
     { "declarations": ["input count", "local countPlural = count: plural", "local countNumber = count: number"], "selectors": ["countPlural"], "match": { "countPlural=other": "세션 {countNumber}개" } }
   ],
+  "activity_reclassify_normalized_target": "{project}(으)로 저장됩니다",
   "activity_reclassify_multiple_projects": "이 접두사는 여러 프로젝트에 영향을 줍니다. 적용 전에 샘플을 확인하세요.",
   "activity_reclassify_zero_matches": "이 접두사와 일치하는 아카이브 세션이 없습니다.",
   "activity_reclassify_conflict": "미리 보기 이후 매핑이 변경되었습니다. 영향이 새로 고쳐졌으니 적용 전에 확인하세요.",

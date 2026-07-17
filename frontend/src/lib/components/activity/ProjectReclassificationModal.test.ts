@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { fireEvent, screen } from "@testing-library/svelte";
 import { mount, tick, unmount } from "svelte";
+import { router } from "../../stores/router.svelte.js";
 import ProjectReclassificationModal from "./ProjectReclassificationModal.svelte";
 
 const api = vi.hoisted(() => ({
@@ -145,6 +146,19 @@ describe("ProjectReclassificationModal", () => {
     expect(screen.getByText(/6 sessions will change/)).toBeTruthy();
     expect(screen.getByText(/2 projects/)).toBeTruthy();
     expect(screen.getByRole("alert").textContent).toContain("multiple projects");
+    expect(screen.queryByText(/Will be saved as/)).toBeNull();
+  });
+
+  it("shows the server-normalized target when it differs from the typed one", async () => {
+    api.preview.mockResolvedValueOnce({
+      ...preview,
+      normalized_project: "target_project",
+    });
+    render();
+    await flush();
+    await chooseTarget();
+
+    expect(screen.getByText("Will be saved as target_project")).toBeTruthy();
   });
 
   it("debounces prefix edits and never accepts an obsolete preview token", async () => {
@@ -401,6 +415,46 @@ describe("ProjectReclassificationModal", () => {
     expect(screen.getByRole("alert").textContent).toContain(
       "wrong-project (1,234 sessions)",
     );
+  });
+
+  it("distinguishes same-machine worktrees in the collapsed candidate label", async () => {
+    api.candidates.mockResolvedValue({
+      candidates: [
+        candidate,
+        {
+          ...candidate,
+          id: "candidate-2",
+          suggested_prefix: "/srv/worktrees/example/repo/other-branch",
+        },
+      ],
+    });
+    render();
+    await flush();
+
+    await fireEvent.click(screen.getByTitle("Choose a worktree"));
+    await fireEvent.mouseDown(
+      screen.getByRole("option", { name: /other-branch/ }),
+    );
+    await flush();
+
+    expect(screen.getByTitle("Choose a worktree").textContent).toContain(
+      "remote.example · repo/other-branch",
+    );
+  });
+
+  it("deep-links Open Settings to the candidate's machine", async () => {
+    const navigate = vi.spyOn(router, "navigate").mockReturnValue(true);
+    const onclose = vi.fn();
+    render({ onclose });
+    await flush();
+
+    await fireEvent.click(screen.getByRole("link", { name: "Open Settings" }));
+
+    expect(onclose).toHaveBeenCalledTimes(1);
+    expect(navigate).toHaveBeenCalledWith("settings", {
+      worktree_machine: "remote.example",
+    });
+    navigate.mockRestore();
   });
 
   it("refreshes the preview after a mapping-set conflict", async () => {

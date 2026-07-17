@@ -240,7 +240,12 @@ describe("Breakdowns", () => {
     document.body.appendChild(target);
     const component = mount(Breakdowns, {
       target,
-      props: { report: makeReport(), readOnly: true, onReclassifyProject },
+      props: {
+        report: makeReport(),
+        readOnly: true,
+        readOnlyExplained: true,
+        onReclassifyProject,
+      },
     });
     await tick();
 
@@ -254,6 +259,24 @@ describe("Breakdowns", () => {
     expect(document.activeElement).toBe(action);
     action.click();
     expect(onReclassifyProject).not.toHaveBeenCalled();
+    unmount(component);
+  });
+
+  it("does not claim read-only before the server mode is known", async () => {
+    const target = document.createElement("div");
+    document.body.appendChild(target);
+    const component = mount(Breakdowns, {
+      target,
+      props: { report: makeReport(), readOnly: true },
+    });
+    await tick();
+
+    const action = target.querySelector(
+      'button[aria-label^="Reclassify project"]',
+    ) as HTMLButtonElement;
+    expect(action.getAttribute("aria-disabled")).toBe("true");
+    expect(action.title).not.toContain("writable archive");
+    expect(action.title).toContain("Reclassify project");
     unmount(component);
   });
 });

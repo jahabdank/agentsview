@@ -8,6 +8,7 @@
   interface Props {
     report: Report;
     readOnly?: boolean;
+    readOnlyExplained?: boolean;
     onReclassifyProject?: (
       label: string,
       projectKey: string,
@@ -19,6 +20,7 @@
   let {
     report,
     readOnly = false,
+    readOnlyExplained = false,
     onReclassifyProject = undefined,
     projectHeadingRef = $bindable(),
   }: Props = $props();
@@ -189,6 +191,7 @@
               <!-- svelte-ignore a11y_no_static_element_interactions -->
               <div
                 class="bar-row"
+                class:has-action={panel.projectRows}
                 onmouseenter={(e) => showTip(e, row, total)}
                 onmouseleave={hideTip}
               >
@@ -213,7 +216,7 @@
                     <IconButton
                       size="sm"
                       ariaLabel={m.activity_reclassify_action({ project: row.key })}
-                      title={readOnly
+                      title={readOnly && readOnlyExplained
                         ? m.activity_reclassify_unavailable_read_only()
                         : m.activity_reclassify_action({ project: row.key })}
                       ariaDisabled={readOnly}
@@ -361,6 +364,12 @@
     position: relative;
   }
 
+  /* Reserve a slot for the reveal-on-hover action so it never covers the
+     value column. */
+  .bar-row.has-action {
+    padding-right: 26px;
+  }
+
   .bar-label {
     flex-shrink: 0;
     width: 96px;
@@ -403,7 +412,7 @@
 
   .project-action {
     position: absolute;
-    right: -4px;
+    right: 0;
     top: 50%;
     transform: translateY(-50%);
     opacity: 0;

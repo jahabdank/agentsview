@@ -10,6 +10,7 @@
   } from "../../api/generated/index";
   import { callGenerated, isAbortError } from "../../api/runtime.js";
   import { m } from "../../i18n/index.js";
+  import { router } from "../../stores/router.svelte.js";
   import { LatestRead } from "../../utils/latest-read.js";
   import SettingsSection from "./SettingsSection.svelte";
 
@@ -25,6 +26,10 @@
   const repoDotWorktreesLayout = "repo_dot_worktrees";
 
   let { readOnly = false }: Props = $props();
+
+  // Deep link from the Activity reclassification modal: preselect the rule's
+  // machine on first load only.
+  const requestedMachine = router.params["worktree_machine"] ?? "";
 
   let localMachine = $state("");
   let machine = $state("");
@@ -61,7 +66,7 @@
       loading = false;
       return;
     }
-    void loadMappings();
+    void loadMappings(requestedMachine || undefined);
   });
 
   async function loadMappings(requestedMachine?: string) {
@@ -505,9 +510,12 @@
     min-width: 0;
   }
 
+  /* Stacked: the long repo_dot_worktrees label does not fit two-up inside a
+     one-third-width form column. */
   .layout-options {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
     gap: 4px;
   }
 

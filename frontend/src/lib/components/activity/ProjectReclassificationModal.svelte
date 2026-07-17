@@ -62,9 +62,22 @@
     candidates.map((candidate) => ({
       name: candidate.id,
       label: `${candidate.machine} · ${candidate.suggested_prefix || m.activity_reclassify_path_unavailable()} · ${m.activity_reclassify_candidate_sessions({ count: candidate.contributing_sessions })}`,
-      displayLabel: candidate.machine,
+      displayLabel: candidateDisplayLabel(candidate),
     })),
   );
+
+  // The collapsed control shows only this label, so machine name alone cannot
+  // distinguish two worktrees on the same machine.
+  function candidateDisplayLabel(
+    candidate: DbWorktreeReclassificationCandidate,
+  ): string {
+    const tail = candidate.suggested_prefix
+      .split("/")
+      .filter(Boolean)
+      .slice(-2)
+      .join("/");
+    return tail ? `${candidate.machine} · ${tail}` : candidate.machine;
+  }
   const canApply = $derived(
     !applied &&
       !applying &&
@@ -72,7 +85,11 @@
       !!preview?.mapping_token &&
       preview.matched_sessions > 0,
   );
-  const settingsHref = $derived(`${getBasePath()}/settings`);
+  const settingsHref = $derived(
+    machine
+      ? `${getBasePath()}/settings?worktree_machine=${encodeURIComponent(machine)}`
+      : `${getBasePath()}/settings`,
+  );
 
   onMount(() => void loadCandidates());
   onDestroy(() => {
@@ -215,7 +232,6 @@
     } catch (error) {
       if (disposed) return;
       if (typeof error === "object" && error !== null && "status" in error && error.status === 409) {
-        conflict = true;
         clearAcceptedPreview();
         conflict = true;
         await loadPreview();
@@ -257,7 +273,7 @@
     event.preventDefault();
     if (applying) return;
     onclose();
-    router.navigate("settings");
+    router.navigate("settings", machine ? { worktree_machine: machine } : {});
   }
 
 </script>
@@ -366,6 +382,11 @@
         <span>{m.activity_reclassify_sessions_changing({ count: preview.updated_sessions })}</span>
         <span>{m.activity_reclassify_projects_affected({ count: preview.distinct_projects })}</span>
       </div>
+      {#if preview.normalized_project && preview.normalized_project !== targetProject.trim()}
+        <p class="normalized">
+          {m.activity_reclassify_normalized_target({ project: preview.normalized_project })}
+        </p>
+      {/if}
       {#if preview.distinct_projects > 1}
         <div class="warning" role="alert">
           {m.activity_reclassify_multiple_projects()}
@@ -414,9 +435,10 @@
   .candidate-summary, .impact { display: flex; gap: 12px; font-size: 12px; }
   .candidate-summary { justify-content: space-between; }
   .impact { flex-wrap: wrap; padding: 8px; background: var(--bg-inset); border-radius: var(--radius-sm); }
+  .normalized { color: var(--text-secondary); font-size: 12px; }
   .warning { color: var(--accent-orange); font-size: 12px; }
   .error-text { color: var(--accent-red); font-size: 12px; }
-  .warning, .error-text, .muted, .settings-note { margin: 0; }
+  .warning, .error-text, .muted, .normalized, .settings-note { margin: 0; }
   .warning ul { margin: 6px 0 0; padding-left: 18px; }
   .settings-note a { margin-left: 4px; color: var(--accent-blue); }
 </style>

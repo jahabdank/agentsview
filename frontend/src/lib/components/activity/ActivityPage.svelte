@@ -440,6 +440,7 @@
         <Breakdowns
           report={activity.report}
           readOnly={reclassificationUnavailable}
+          readOnlyExplained={sync.readOnly}
           onReclassifyProject={openReclassification}
           bind:projectHeadingRef
         />

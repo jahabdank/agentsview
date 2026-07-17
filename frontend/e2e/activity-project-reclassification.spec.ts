@@ -107,6 +107,17 @@ test.describe("Activity project reclassification", () => {
     await action.hover();
     await expectActionOpacity(page, "1");
 
+    // The revealed action occupies its own reserved slot; it must not cover
+    // the row's value column.
+    const actionBox = await action.boundingBox();
+    const valueBox = await page
+      .locator(".bar-row", { has: action })
+      .locator(".bar-value")
+      .boundingBox();
+    expect(actionBox).not.toBeNull();
+    expect(valueBox).not.toBeNull();
+    expect(actionBox!.x).toBeGreaterThanOrEqual(valueBox!.x + valueBox!.width);
+
     await page.mouse.move(0, 0);
     await tabTo(page, action);
     await expect(action).toBeFocused();

@@ -5,6 +5,7 @@ import { mount, tick, unmount } from "svelte";
 // @ts-ignore
 import WorktreeMappingSettings from "./WorktreeMappingSettings.svelte";
 import { SettingsService } from "../../api/generated/index";
+import { router } from "../../stores/router.svelte.js";
 
 vi.mock("../../api/runtime.js", async (importOriginal) => {
   const orig =
@@ -109,6 +110,22 @@ describe("WorktreeMappingSettings", () => {
     ).not.toHaveBeenCalled();
     expect(document.body.textContent).toContain("local mode");
 
+  });
+
+  it("preselects the machine named by the worktree_machine deep link", async () => {
+    router.params = { worktree_machine: "remote-host" };
+    settingsService.getApiV1SettingsWorktreeMappings.mockResolvedValue(
+      response("remote-host", [mapping()]),
+    );
+
+    component = mount(WorktreeMappingSettings, { target: document.body });
+    await flush();
+
+    expect(settingsService.getApiV1SettingsWorktreeMappings).toHaveBeenCalledWith(
+      { machine: "remote-host" },
+    );
+    expect(document.body.textContent).toContain("canonical-project");
+    router.params = {};
   });
 
   it("ignores a stale machine response after the selection changes", async () => {

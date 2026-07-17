@@ -1688,6 +1688,7 @@
   "activity_reclassify_project_sample_sessions": [
     { "declarations": ["input count", "local countPlural = count: plural", "local countNumber = count: number"], "selectors": ["countPlural"], "match": { "countPlural=other": "{countNumber} 个会话" } }
   ],
+  "activity_reclassify_normalized_target": "将保存为 {project}",
   "activity_reclassify_multiple_projects": "此前缀会影响多个项目。应用前请检查示例。",
   "activity_reclassify_zero_matches": "此前缀与存档中的任何会话都不匹配。",
   "activity_reclassify_conflict": "映射自预览后已更改。影响已刷新；应用前请检查。",

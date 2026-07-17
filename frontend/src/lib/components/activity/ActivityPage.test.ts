@@ -174,6 +174,9 @@ describe("ActivityPage project reclassification", () => {
       name: "Reclassify project wrong-project",
     });
     expect(action.getAttribute("aria-disabled")).toBe("true");
+    expect((action as HTMLButtonElement).title).toBe(
+      "Reclassify project wrong-project",
+    );
     await fireEvent.click(action);
     expect(
       ActivityService.getApiV1ActivityProjectReclassificationCandidates,
