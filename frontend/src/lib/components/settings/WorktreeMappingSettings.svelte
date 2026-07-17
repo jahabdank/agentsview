@@ -1,31 +1,34 @@
 <script lang="ts">
-  import { m } from "../../i18n/index.js";
-  import SettingsSection from "./SettingsSection.svelte";
+  import { Button, Card, Checkbox, Modal, TextInput, Typeahead } from "@kenn-io/kit-ui";
+  import { onDestroy } from "svelte";
   import {
     SettingsService,
     type ApplyWorktreeMappingsResponse,
     type DbWorktreeProjectMapping,
     type WorktreeMappingRequest,
+    type WorktreeMappingsResponse,
   } from "../../api/generated/index";
   import { callGenerated, isAbortError } from "../../api/runtime.js";
+  import { m } from "../../i18n/index.js";
   import { LatestRead } from "../../utils/latest-read.js";
-  import { onDestroy } from "svelte";
-
-  interface WorktreeMappingsResponse {
-    machine: string;
-    mappings: DbWorktreeProjectMapping[];
-  }
+  import SettingsSection from "./SettingsSection.svelte";
 
   interface Props {
     readOnly?: boolean;
   }
+
+  type Confirmation =
+    | { kind: "delete"; mapping: DbWorktreeProjectMapping }
+    | { kind: "disable"; id: number; input: WorktreeMappingRequest };
 
   const explicitLayout = "explicit";
   const repoDotWorktreesLayout = "repo_dot_worktrees";
 
   let { readOnly = false }: Props = $props();
 
+  let localMachine = $state("");
   let machine = $state("");
+  let machines: string[] = $state([]);
   let mappings: DbWorktreeProjectMapping[] = $state([]);
   let loading = $state(true);
   let saving = $state(false);
@@ -33,12 +36,23 @@
   let error = $state("");
   let applyMessage = $state("");
   let editingId: number | null = $state(null);
+  let editingWasEnabled = $state(false);
   let pathPrefix = $state("");
   let layout = $state(explicitLayout);
   let project = $state("");
   let enabled = $state(true);
+  let confirmation: Confirmation | null = $state(null);
   const mappingsRead = new LatestRead();
   let disposed = false;
+
+  const machineOptions = $derived(
+    machines.map((name) => ({ name, label: name, displayLabel: name })),
+  );
+  const isRepoDotWorktrees = $derived(layout === repoDotWorktreesLayout);
+  const canSave = $derived(
+    pathPrefix.trim() !== "" &&
+      (layout === repoDotWorktreesLayout || project.trim() !== ""),
+  );
 
   $effect(() => {
     if (readOnly) {
@@ -46,23 +60,28 @@
       loading = false;
       return;
     }
-    loadMappings();
+    void loadMappings();
   });
 
-  async function loadMappings() {
+  async function loadMappings(requestedMachine?: string) {
     if (disposed) return;
     const signal = mappingsRead.begin();
     loading = true;
     error = "";
     try {
-      const res =
-        await callGenerated(() =>
-          SettingsService.getApiV1SettingsWorktreeMappings(),
-          signal,
-        ) as unknown as WorktreeMappingsResponse;
+      const res = await callGenerated(
+        () =>
+          SettingsService.getApiV1SettingsWorktreeMappings({
+            machine: requestedMachine || undefined,
+          }),
+        signal,
+      ) as WorktreeMappingsResponse;
       if (!mappingsRead.isCurrent(signal)) return;
+      localMachine = res.local_machine;
       machine = res.machine;
-      mappings = res.mappings;
+      machines = Array.from(new Set([res.machine, ...((res.machines ?? []) as string[])]))
+        .filter(Boolean);
+      mappings = (res.mappings ?? []) as DbWorktreeProjectMapping[];
     } catch (err) {
       if (isAbortError(err) || !mappingsRead.isCurrent(signal)) return;
       error = err instanceof Error ? err.message : m.worktree_failed_load();
@@ -78,14 +97,27 @@
 
   function resetForm() {
     editingId = null;
+    editingWasEnabled = false;
     pathPrefix = "";
     layout = explicitLayout;
     project = "";
     enabled = true;
+    confirmation = null;
+  }
+
+  function selectMachine(value: string) {
+    if (!value || value === machine) return;
+    machine = value;
+    mappings = [];
+    applyMessage = "";
+    error = "";
+    resetForm();
+    void loadMappings(value);
   }
 
   function editMapping(mapping: DbWorktreeProjectMapping) {
     editingId = mapping.id;
+    editingWasEnabled = mapping.enabled;
     pathPrefix = mapping.path_prefix;
     layout = mapping.layout || explicitLayout;
     project = mapping.project;
@@ -94,59 +126,86 @@
     error = "";
   }
 
-  async function saveMapping() {
+  function mappingInput(): WorktreeMappingRequest | null {
     const input = {
+      machine,
       path_prefix: pathPrefix.trim(),
       layout,
       project: project.trim(),
       enabled,
     } satisfies WorktreeMappingRequest;
-    if (!input.path_prefix) return;
-    if (layout !== repoDotWorktreesLayout && !input.project) return;
+    if (!input.path_prefix) return null;
+    if (layout !== repoDotWorktreesLayout && !input.project) return null;
+    return input;
+  }
 
+  async function requestSave() {
+    const input = mappingInput();
+    if (!input) return;
+    if (editingId != null && editingWasEnabled && !input.enabled) {
+      confirmation = { kind: "disable", id: editingId, input };
+      return;
+    }
+    await saveMapping(input, editingId);
+  }
+
+  async function saveMapping(input: WorktreeMappingRequest, id: number | null) {
     saving = true;
     error = "";
     applyMessage = "";
     try {
-      if (editingId == null) {
+      if (id == null) {
         await callGenerated(() =>
-          SettingsService.postApiV1SettingsWorktreeMappings({
-            requestBody: input,
-          }),
+          SettingsService.postApiV1SettingsWorktreeMappings({ requestBody: input }),
         );
       } else {
         await callGenerated(() =>
           SettingsService.putApiV1SettingsWorktreeMappingsId({
-            id: String(editingId),
+            id: String(id),
             requestBody: input,
           }),
         );
       }
       resetForm();
-      await loadMappings();
-      } catch (err) {
+      await loadMappings(machine);
+    } catch (err) {
       error = err instanceof Error ? err.message : m.worktree_failed_save();
     } finally {
       saving = false;
     }
   }
 
-  async function removeMapping(id: number) {
+  function requestDelete(mapping: DbWorktreeProjectMapping) {
+    confirmation = { kind: "delete", mapping };
+  }
+
+  async function removeMapping(mapping: DbWorktreeProjectMapping) {
     saving = true;
     error = "";
     applyMessage = "";
     try {
       await callGenerated(() =>
         SettingsService.deleteApiV1SettingsWorktreeMappingsId({
-          id: String(id),
+          id: String(mapping.id),
         }),
       );
-      if (editingId === id) resetForm();
-      await loadMappings();
+      if (editingId === mapping.id) resetForm();
+      await loadMappings(machine);
     } catch (err) {
       error = err instanceof Error ? err.message : m.worktree_failed_delete();
     } finally {
       saving = false;
+    }
+  }
+
+  async function confirmChange() {
+    const pending = confirmation;
+    confirmation = null;
+    if (!pending) return;
+    if (pending.kind === "delete") {
+      await removeMapping(pending.mapping);
+    } else {
+      await saveMapping(pending.input, pending.id);
     }
   }
 
@@ -155,95 +214,126 @@
     error = "";
     applyMessage = "";
     try {
-      const res =
-        await callGenerated(() =>
-          SettingsService.postApiV1SettingsWorktreeMappingsApply(),
-        ) as ApplyWorktreeMappingsResponse;
-      applyMessage = m.worktree_apply_result({ updated: res.updated_sessions, matched: res.matched_sessions });
+      const res = await callGenerated(() =>
+        SettingsService.postApiV1SettingsWorktreeMappingsApply({
+          requestBody: { machine },
+        }),
+      ) as ApplyWorktreeMappingsResponse;
+      applyMessage = m.worktree_apply_result({
+        updated: res.updated_sessions,
+        matched: res.matched_sessions,
+      });
     } catch (err) {
       error = err instanceof Error ? err.message : m.worktree_failed_apply();
     } finally {
       applying = false;
     }
   }
-
-  let isRepoDotWorktrees = $derived(layout === repoDotWorktreesLayout);
-  let canSave = $derived(
-    pathPrefix.trim() !== "" &&
-      (layout === repoDotWorktreesLayout || project.trim() !== ""),
-  );
 </script>
 
-<SettingsSection
-  title={m.worktree_title()}
-  description={m.worktree_description()}
->
+{#snippet confirmationActions()}
+  <Button
+    label={m.worktree_cancel()}
+    tone="neutral"
+    surface="outline"
+    disabled={saving}
+    onclick={() => (confirmation = null)}
+  />
+  <Button
+    label={confirmation?.kind === "delete"
+      ? m.worktree_delete_confirm_action()
+      : m.worktree_disable_confirm_action()}
+    tone="danger"
+    surface="solid"
+    disabled={saving}
+    onclick={confirmChange}
+  />
+{/snippet}
+
+<SettingsSection title={m.worktree_title()} description={m.worktree_description()}>
   {#if readOnly}
     <div class="muted">{m.worktree_local_only()}</div>
-  {:else if loading}
+  {:else if loading && machine === ""}
     <div class="muted">{m.worktree_loading()}</div>
-  {:else if error && mappings.length === 0}
+  {:else if error && machine === ""}
     <div class="error-text">{error}</div>
   {:else}
     <div class="machine-row">
       <span class="label">{m.worktree_machine()}</span>
-      <code>{machine || "local"}</code>
+      <Typeahead
+        options={machineOptions}
+        value={machine}
+        fallbackLabel={machine || localMachine}
+        placeholder={m.worktree_select_machine()}
+        title={m.worktree_select_machine()}
+        emptyLabel={m.worktree_no_machines()}
+        onselect={selectMachine}
+      />
     </div>
 
-    <div class="mapping-list">
-        {#if mappings.length === 0}
-          <div class="empty">{m.worktree_no_mappings()}</div>
-        {:else}
-          {#each mappings as mapping (mapping.id)}
-            <div class="mapping-row" class:disabled={!mapping.enabled}>
+    <div class="mapping-list" aria-busy={loading}>
+      {#if loading}
+        <div class="muted">{m.worktree_loading()}</div>
+      {:else if mappings.length === 0}
+        <div class="empty">{m.worktree_no_mappings()}</div>
+      {:else}
+        {#each mappings as mapping (mapping.id)}
+          <Card level="inset" padding="sm">
+            <div class="mapping-row-content" class:disabled={!mapping.enabled}>
               <div class="mapping-main">
                 <div class="mapping-project">
-                  {mapping.project || (mapping.layout === repoDotWorktreesLayout ? m.worktree_layout_repo_dot_worktrees({ repo: "repo", branch: "branch" }) : m.worktree_layout_explicit({}))}
+                  {mapping.project ||
+                    (mapping.layout === repoDotWorktreesLayout
+                      ? m.worktree_layout_repo_dot_worktrees({ repo: "repo", branch: "branch" })
+                      : m.worktree_layout_explicit({}))}
                 </div>
                 <div class="mapping-path">{mapping.path_prefix}</div>
+                {#if mapping.original_project}
+                  <div class="mapping-original">
+                    {m.worktree_originally_shown_as({ project: mapping.original_project })}
+                  </div>
+                {/if}
               </div>
               <div class="mapping-actions">
                 <span class="status">{mapping.enabled ? m.worktree_on() : m.worktree_off()}</span>
-              <button class="small-btn" onclick={() => editMapping(mapping)}>
-                {m.worktree_edit()}
-              </button>
-              <button class="small-btn danger" onclick={() => removeMapping(mapping.id)}>
-                {m.worktree_delete()}
-              </button>
+                <Button size="sm" label={m.worktree_edit()} onclick={() => editMapping(mapping)} />
+                <Button
+                  size="sm"
+                  tone="danger"
+                  label={m.worktree_delete()}
+                  onclick={() => requestDelete(mapping)}
+                />
+              </div>
             </div>
-          </div>
+          </Card>
         {/each}
       {/if}
     </div>
 
     <div class="form-grid">
-      <label class="field">
+      <div class="field">
         <span>{m.worktree_layout()}</span>
         <div class="layout-options" role="group" aria-label={m.worktree_layout()}>
-          <button
-            type="button"
-            class:active={layout === explicitLayout}
+          <Button
+            label={m.worktree_layout_explicit({})}
+            tone={layout === explicitLayout ? "info" : "neutral"}
+            surface={layout === explicitLayout ? "soft" : "outline"}
             onclick={() => (layout = explicitLayout)}
-          >
-            {m.worktree_layout_explicit({})}
-          </button>
-          <button
-            type="button"
-            class:active={layout === repoDotWorktreesLayout}
+          />
+          <Button
+            label={m.worktree_layout_repo_dot_worktrees({ repo: "repo", branch: "branch" })}
+            tone={layout === repoDotWorktreesLayout ? "info" : "neutral"}
+            surface={layout === repoDotWorktreesLayout ? "soft" : "outline"}
             onclick={() => (layout = repoDotWorktreesLayout)}
-          >
-            {m.worktree_layout_repo_dot_worktrees({
-              repo: "repo",
-              branch: "branch",
-            })}
-          </button>
+          />
         </div>
-      </label>
+      </div>
       <label class="field">
         <span>{isRepoDotWorktrees ? m.worktree_parent_directory() : m.worktree_path_prefix()}</span>
-        <input
-          type="text"
+        <TextInput
           bind:value={pathPrefix}
+          block
+          ariaLabel={isRepoDotWorktrees ? m.worktree_parent_directory() : m.worktree_path_prefix()}
           placeholder={isRepoDotWorktrees ? "/Users/me" : "/Users/me/project.worktrees"}
         />
         {#if isRepoDotWorktrees}
@@ -252,9 +342,10 @@
       </label>
       <label class="field">
         <span>{m.worktree_project()}</span>
-        <input
-          type="text"
+        <TextInput
           bind:value={project}
+          block
+          ariaLabel={m.worktree_project()}
           placeholder="project-name"
           disabled={isRepoDotWorktrees}
         />
@@ -262,10 +353,7 @@
           {isRepoDotWorktrees ? m.worktree_project_derived() : m.worktree_project_required()}
         </div>
       </label>
-      <label class="enabled-toggle">
-        <input type="checkbox" bind:checked={enabled} />
-        {m.worktree_enabled()}
-      </label>
+      <Checkbox bind:checked={enabled} label={m.worktree_enabled()} />
     </div>
 
     {#if error}
@@ -276,26 +364,43 @@
     {/if}
 
     <div class="button-row">
-      <button
-        class="primary-btn"
+      <Button
+        label={saving
+          ? m.worktree_saving()
+          : editingId == null
+            ? m.worktree_add_mapping()
+            : m.worktree_save_mapping()}
+        tone="info"
+        surface="solid"
         disabled={!canSave || saving}
-        onclick={saveMapping}
-      >
-        {saving ? m.worktree_saving() : editingId == null ? m.worktree_add_mapping() : m.worktree_save_mapping()}
-      </button>
+        onclick={requestSave}
+      />
       {#if editingId != null}
-        <button class="secondary-btn" onclick={resetForm}>{m.worktree_cancel()}</button>
+        <Button label={m.worktree_cancel()} disabled={saving} onclick={resetForm} />
       {/if}
-      <button
-        class="secondary-btn"
-        disabled={applying || mappings.length === 0}
+      <Button
+        label={applying ? m.worktree_applying() : m.worktree_apply_mappings()}
+        disabled={applying || loading || mappings.length === 0}
         onclick={applyMappings}
-      >
-        {applying ? m.worktree_applying() : m.worktree_apply_mappings()}
-      </button>
+      />
     </div>
   {/if}
 </SettingsSection>
+
+{#if confirmation}
+  <Modal
+    title={confirmation.kind === "delete"
+      ? m.worktree_delete_confirm_title()
+      : m.worktree_disable_confirm_title()}
+    closeLabel={m.worktree_confirmation_close()}
+    tone="danger"
+    width="440px"
+    onclose={() => (confirmation = null)}
+    footer={confirmationActions}
+  >
+    <p class="confirmation-copy">{m.worktree_change_warning()}</p>
+  </Modal>
+{/if}
 
 <style>
   .machine-row,
@@ -312,16 +417,10 @@
   }
 
   .label,
-  .field span {
+  .field > span {
     color: var(--text-secondary);
     font-size: 12px;
     font-weight: 500;
-  }
-
-  code {
-    font-family: var(--font-mono, monospace);
-    font-size: 11px;
-    color: var(--text-muted);
   }
 
   .mapping-list {
@@ -330,19 +429,14 @@
     gap: 6px;
   }
 
-  .mapping-row {
+  .mapping-row-content {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 12px;
-    min-height: 48px;
-    padding: 8px 10px;
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-sm);
-    background: var(--bg-inset);
   }
 
-  .mapping-row.disabled {
+  .mapping-row-content.disabled {
     opacity: 0.65;
   }
 
@@ -365,9 +459,17 @@
     font-size: 11px;
   }
 
-  .status {
+  .mapping-original,
+  .status,
+  .hint,
+  .muted,
+  .empty {
     color: var(--text-muted);
     font-size: 11px;
+  }
+
+  .mapping-original {
+    margin-top: 2px;
   }
 
   .form-grid {
@@ -383,125 +485,40 @@
     min-width: 0;
   }
 
-  .field input {
-    height: 30px;
-    min-width: 0;
-    padding: 0 10px;
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-sm);
-    background: var(--bg-inset);
-    color: var(--text-primary);
-    font-size: 12px;
-  }
-
   .layout-options {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 4px;
   }
 
-  .layout-options button {
-    min-height: 30px;
-    padding: 4px 8px;
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-sm);
-    background: var(--bg-inset);
-    color: var(--text-secondary);
-    font-size: 12px;
-    cursor: pointer;
-  }
-
-  .layout-options button.active {
-    border-color: var(--accent-blue);
-    color: var(--text-primary);
-  }
-
-  .field input:focus {
-    outline: none;
-    border-color: var(--accent-blue);
-  }
-
-  .hint {
-    color: var(--text-muted);
-    font-size: 11px;
-    line-height: 1.3;
-  }
-
-  .enabled-toggle {
-    display: flex;
-    align-items: center;
-    gap: var(--space-4);
-    color: var(--text-secondary);
-    font-size: 12px;
-  }
-
-  .small-btn,
-  .primary-btn,
-  .secondary-btn {
-    height: 28px;
-    padding: 0 10px;
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-sm);
-    background: var(--bg-surface);
-    color: var(--text-secondary);
-    font-size: 12px;
-    font-weight: 500;
-    cursor: pointer;
-  }
-
-  .small-btn {
-    height: 24px;
-    font-size: 11px;
-  }
-
-  .primary-btn {
-    border-color: var(--accent-blue);
-    background: var(--accent-blue);
-    color: var(--accent-blue-foreground);
-  }
-
-  .danger {
-    color: var(--color-danger, #d14);
-  }
-
-  button:disabled {
-    cursor: default;
-    opacity: 0.55;
-  }
-
-  .muted,
-  .empty,
   .error-text,
   .success-text {
     font-size: 12px;
   }
 
-  .muted,
-  .empty {
-    color: var(--text-muted);
-  }
-
   .error-text {
-    color: var(--color-danger, #d14);
+    color: var(--accent-red);
   }
 
   .success-text {
-    color: var(--accent-green, #16834a);
+    color: var(--accent-green);
   }
 
-  @media (max-width: 640px) {
-    .mapping-row,
-    .button-row {
-      align-items: stretch;
-      flex-direction: column;
-    }
+  .confirmation-copy {
+    margin: 0;
+    color: var(--text-secondary);
+    font-size: 13px;
+    line-height: 1.5;
+  }
 
-    .mapping-actions {
-      justify-content: flex-end;
-    }
-
+  @media (max-width: 760px) {
     .form-grid {
       grid-template-columns: 1fr;
+    }
+
+    .mapping-row-content {
+      align-items: flex-start;
+      flex-direction: column;
     }
   }
 </style>
