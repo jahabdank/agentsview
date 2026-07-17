@@ -1,0 +1,180 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+
+	"github.com/spf13/cobra"
+	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/sync"
+)
+
+// workerLine is one NDJSON record on the sync-worker's stdout. Every stdout
+// line unmarshals to a workerLine; diagnostics go to stderr so the parent can
+// parse stdout strictly. A run streams zero or more Progress lines followed by
+// exactly one Result line.
+type workerLine struct {
+	Progress *sync.Progress `json:"progress,omitempty"`
+	Result   *workerResult  `json:"result,omitempty"`
+}
+
+// workerResult is the single terminal record a sync-worker run emits. Status is
+// "ok" only when the pass completed and discovery was authoritative; the parent
+// treats anything else, or a missing/duplicate result, as a failed run.
+type workerResult struct {
+	Status            string `json:"status"` // "ok" | "aborted" | "failed"
+	Synced            int    `json:"synced"`
+	Skipped           int    `json:"skipped"`
+	Failed            int    `json:"failed"`
+	DiscoveryComplete bool   `json:"discoveryComplete"`
+	Error             string `json:"error,omitempty"`
+}
+
+// newSyncWorkerCommand registers the hidden self-exec'd worker. The daemon runs
+// it as a short-lived child so archive-scale allocation high-water returns to
+// the OS when the child exits, instead of pinning the daemon's RSS.
+func newSyncWorkerCommand() *cobra.Command {
+	var mode string
+	cmd := &cobra.Command{
+		Use:          "sync-worker",
+		Short:        "Run one heavy sync pass and stream a terminal result",
+		Hidden:       true,
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cfg, err := config.LoadMinimal()
+			if err != nil {
+				return fmt.Errorf("sync-worker: loading config: %w", err)
+			}
+			return runSyncWorker(cfg, mode, cmd.OutOrStdout())
+		},
+	}
+	cmd.Flags().StringVar(
+		&mode, "mode", "",
+		"worker mode: startup, sync, resync-build, audit",
+	)
+	if err := cmd.MarkFlagRequired("mode"); err != nil {
+		panic(err)
+	}
+	return cmd
+}
+
+// runSyncWorker runs one worker pass with a background context.
+func runSyncWorker(cfg config.Config, mode string, out io.Writer) error {
+	return runSyncWorkerContext(context.Background(), cfg, mode, out)
+}
+
+// runSyncWorkerContext dispatches on mode, streaming NDJSON progress and exactly
+// one terminal result. It returns nil only when the terminal result is Status
+// "ok" with authoritative discovery; the child's exit code follows this error.
+func runSyncWorkerContext(
+	ctx context.Context, cfg config.Config, mode string, out io.Writer,
+) error {
+	enc := json.NewEncoder(out)
+	emit := func(line workerLine) { _ = enc.Encode(line) }
+	onProgress := func(p sync.Progress) { emit(workerLine{Progress: &p}) }
+	switch mode {
+	case "startup":
+		return runSyncWorkerStartup(ctx, cfg, emit, onProgress)
+	case "sync", "resync-build", "audit":
+		return fmt.Errorf("sync-worker mode %q not implemented yet", mode)
+	default:
+		return fmt.Errorf("unknown sync-worker mode %q", mode)
+	}
+}
+
+// runSyncWorkerStartup performs the daemon's startup sync (or full resync when
+// the data version changed) as a self-contained pass, then emits the terminal
+// result. It mirrors the sync/resync branch in runServe minus daemon-only
+// wiring (watcher, emitter, backfills).
+func runSyncWorkerStartup(
+	ctx context.Context,
+	cfg config.Config,
+	emit func(workerLine),
+	onProgress func(sync.Progress),
+) error {
+	database, releaseLock, err := openWorkerWriteDB(cfg)
+	if err != nil {
+		return err
+	}
+	defer releaseLock()
+	defer database.Close()
+
+	// Remove stale temp DB from a prior crashed resync before ResyncAll
+	// stages a fresh one, matching runServe's startup cleanup.
+	cleanResyncTemp(cfg.DBPath)
+
+	engine := sync.NewEngine(database, workerEngineConfig(cfg))
+	defer engine.Close()
+
+	var stats sync.SyncStats
+	if database.NeedsResync() {
+		stats = engine.ResyncAll(ctx, onProgress)
+	} else {
+		stats = engine.SyncAll(ctx, onProgress)
+	}
+
+	result := workerResultFromStats(ctx, stats)
+	emit(workerLine{Result: &result})
+	if result.Status != "ok" || !result.DiscoveryComplete {
+		return fmt.Errorf("sync worker startup: %s", result.Status)
+	}
+	return nil
+}
+
+// workerResultFromStats maps engine stats to a terminal result. Cancellation or
+// a safety abort is "aborted"; a completed pass with hard parse failures or
+// non-authoritative discovery is "failed"; otherwise "ok".
+func workerResultFromStats(
+	ctx context.Context, stats sync.SyncStats,
+) workerResult {
+	result := workerResult{
+		Synced:            stats.Synced,
+		Skipped:           stats.Skipped,
+		Failed:            stats.Failed,
+		DiscoveryComplete: stats.AuthoritativeDiscoveryComplete(),
+	}
+	switch {
+	case ctx.Err() != nil || stats.Aborted:
+		result.Status = "aborted"
+		if ctx.Err() != nil {
+			result.Error = ctx.Err().Error()
+		}
+	case stats.Failed > 0 || !result.DiscoveryComplete:
+		result.Status = "failed"
+	default:
+		result.Status = "ok"
+	}
+	return result
+}
+
+// openWorkerWriteDB reuses the daemon's direct-write open path — including the
+// db.write.lock acquisition — but returns errors instead of exiting. The
+// returned func releases the write-owner lock.
+func openWorkerWriteDB(cfg config.Config) (*db.DB, func(), error) {
+	database, lock, err := openWriteDB(context.Background(), cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	release := func() {
+		if err := lock.Close(); err != nil {
+			log.Printf("release sqlite write-owner lock: %v", err)
+		}
+	}
+	return database, release, nil
+}
+
+// workerEngineConfig mirrors the sync.EngineConfig literal in runServe minus the
+// daemon-only callbacks (emitter, watcher reconciliation, deferred maintenance).
+func workerEngineConfig(cfg config.Config) sync.EngineConfig {
+	return sync.EngineConfig{
+		AgentDirs:               cfg.AgentDirs,
+		IncludeCwdPrefixes:      cfg.SyncIncludeCwdPrefixes,
+		Machine:                 cfg.LocalMachineName,
+		BlockedResultCategories: cfg.ResultContentBlockedCategories,
+	}
+}
