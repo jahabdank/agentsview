@@ -25,6 +25,7 @@ type parseRetentionBudget struct {
 	waiters     atomic.Int64
 	largeSource atomic.Bool
 	scavenge    func()
+	acquired    atomic.Int64 // total successful acquisitions, for tests
 }
 
 func newParseRetentionBudget(capacity int64) *parseRetentionBudget {
@@ -45,6 +46,7 @@ func (budget *parseRetentionBudget) acquire(
 	weight := budget.weight(sourceBytes)
 	if budget.weighted.TryAcquire(weight) {
 		budget.noteKnownLargeSource(sourceBytes)
+		budget.acquired.Add(1)
 		return &parseRetentionLease{budget: budget, weight: weight}, nil
 	}
 	budget.waiters.Add(1)
@@ -57,6 +59,7 @@ func (budget *parseRetentionBudget) acquire(
 		return nil, err
 	}
 	budget.noteKnownLargeSource(sourceBytes)
+	budget.acquired.Add(1)
 	return &parseRetentionLease{budget: budget, weight: weight}, nil
 }
 

@@ -11,7 +11,53 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/testjsonl"
 )
+
+// newWarmBenchEngine builds a small already-synced Claude archive and
+// returns an engine watching it, mirroring the fixture shape
+// BenchmarkSyncAllWarmNoop uses. Five sessions exercise the per-source
+// skip gates a warm no-op pass runs.
+func newWarmBenchEngine(t *testing.T) (*Engine, context.Context) {
+	t.Helper()
+	dir := t.TempDir()
+	proj := filepath.Join(dir, "warm-project")
+	require.NoError(t, os.MkdirAll(proj, 0o755))
+	for s := range 5 {
+		builder := testjsonl.NewSessionBuilder()
+		for m := 0; m < 6; m += 2 {
+			ts := fmt.Sprintf("2026-06-20T10:%02d:00Z", m)
+			builder.AddClaudeUser(ts, fmt.Sprintf(
+				"user message %d in session %d", m, s,
+			))
+			builder.AddClaudeAssistant(ts, fmt.Sprintf(
+				"assistant reply %d in session %d", m, s,
+			))
+		}
+		path := filepath.Join(proj, fmt.Sprintf("warm-%04d.jsonl", s))
+		require.NoError(t, os.WriteFile(
+			path, []byte(builder.String()), 0o644,
+		))
+	}
+	engine := NewEngine(openTestDB(t), EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentClaude: {dir},
+		},
+		Machine: "local",
+	})
+	t.Cleanup(engine.Close)
+	return engine, context.Background()
+}
+
+func TestWarmNoopSyncAcquiresNoRetentionLeases(t *testing.T) {
+	e, ctx := newWarmBenchEngine(t)
+	e.SyncAll(ctx, nil) // cold pass parses, acquires leases
+	before := e.retentionBudget().acquired.Load()
+	stats := e.SyncAll(ctx, nil) // warm pass: everything skips
+	require.Equal(t, 0, stats.Synced)
+	assert.Equal(t, before, e.retentionBudget().acquired.Load(),
+		"warm no-op pass must not acquire parse-retention leases")
+}
 
 func TestParseRetentionBudgetBoundsConcurrentSourceWeight(t *testing.T) {
 	budget := newParseRetentionBudget(defaultParseRetentionBytes)
@@ -259,7 +305,25 @@ func TestStartWorkersFlushesBelowBatchUnderAdmissionPressure(t *testing.T) {
 }
 
 func TestStartWorkersCancellationReleasesAdmissionWaiters(t *testing.T) {
-	engine := NewEngine(openTestDB(t), EngineConfig{Machine: "local"})
+	const agent parser.AgentType = "retention-cancel-test"
+	provider := &directStreamingProvider{
+		ProviderBase: parser.ProviderBase{Def: parser.AgentDef{Type: agent}},
+		parseOutcome: parser.ParseOutcome{
+			Results: []parser.ParseResultOutcome{{
+				Result: parser.ParseResult{Session: parser.ParsedSession{
+					ID: "retention-cancel-test:session", Agent: agent,
+				}},
+			}},
+			ResultSetComplete: true,
+		},
+	}
+	engine := NewEngine(openTestDB(t), EngineConfig{
+		Machine:           "local",
+		ProviderFactories: []parser.ProviderFactory{directStreamingFactory{provider}},
+		ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+			agent: parser.ProviderMigrationProviderAuthoritative,
+		},
+	})
 	t.Cleanup(engine.Close)
 	engine.workerCountOverride = 2
 	budget := newParseRetentionBudget(defaultParseRetentionBytes)
@@ -269,9 +333,19 @@ func TestStartWorkersCancellationReleasesAdmissionWaiters(t *testing.T) {
 	require.NoError(t, err)
 	files := make([]parser.DiscoveredFile, 2)
 	for i := range files {
+		// A provider-authoritative, force-parsed source reaches the provider
+		// parse seam where the lease is acquired; a trivial file would return
+		// through a skip gate before the admission wait now that acquisition
+		// follows the gates.
 		path := filepath.Join(t.TempDir(), fmt.Sprintf("waiting-%d.jsonl", i))
 		require.NoError(t, os.WriteFile(path, []byte("{}\n"), 0o600))
-		files[i] = parser.DiscoveredFile{Path: path, Agent: parser.AgentClaude}
+		source := parser.SourceRef{
+			Provider: agent, Key: path, DisplayPath: path, FingerprintKey: path,
+		}
+		files[i] = parser.DiscoveredFile{
+			Path: path, Agent: agent, ProviderSource: &source,
+			ProviderProcess: true, ForceParse: true,
+		}
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	results := engine.startWorkers(ctx, files)

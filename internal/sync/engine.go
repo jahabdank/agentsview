@@ -5351,12 +5351,12 @@ func (e *Engine) startWorkers(
 					})
 					continue
 				}
-				result, lease := e.processFileWithRetention(ctx, file)
+				result := e.processFile(ctx, file)
 				emitResult(syncJob{
 					processResult:  result,
 					agent:          file.Agent,
 					path:           file.Path,
-					retentionLease: lease,
+					retentionLease: result.retentionLease,
 				})
 			}
 		})
@@ -5947,6 +5947,13 @@ type processResult struct {
 	storageTrustPath  string
 	storageTrustState string
 	storageTrustSnap  storageTrustSnapshot
+	// retentionLease bounds the memory retained by this result's parsed
+	// data. It is acquired at the parse seams (provider parse, incremental
+	// parse, legacy/S3 parse) and only ever set on a result carrying parsed
+	// data; skip results carry none. The worker loop copies it onto
+	// syncJob.retentionLease, which is released exactly once via
+	// releaseRetention or the pendingLeases flush.
+	retentionLease *parseRetentionLease
 }
 
 func (r processResult) needsRetryForSession(sessionID string) bool {
@@ -6032,17 +6039,6 @@ func (e *Engine) processFile(
 	res.mtime = mtime
 	res.sourceFingerprint = sourceFingerprint
 	return res
-}
-
-func (e *Engine) processFileWithRetention(
-	ctx context.Context,
-	file parser.DiscoveredFile,
-) (processResult, *parseRetentionLease) {
-	lease, err := e.retentionBudget().acquire(ctx, parseRetentionSourceBytes(file))
-	if err != nil {
-		return processResult{err: err}, nil
-	}
-	return e.processFile(ctx, file), lease
 }
 
 func (e *Engine) shouldUseCachedSkip(
@@ -6344,6 +6340,14 @@ func (e *Engine) processProviderFile(
 		}, true
 	}
 
+	// Provider parse seam: every gate above returns a lease-free skip. From
+	// here the provider parses the source, so acquire the retention lease that
+	// bounds the parsed payload and attach it to every result carrying that
+	// data. A result still classified as a skip below releases it immediately.
+	lease, err := e.retentionBudget().acquire(ctx, parseRetentionSourceBytes(file))
+	if err != nil {
+		return processResult{err: err}, true
+	}
 	if runtimeMetrics := reconciliationRuntimeMetricsFor(ctx); runtimeMetrics != nil {
 		if _, _, ok := sqliteContainerSourceForFile(file); ok {
 			runtimeMetrics.openCodeSQLiteParse()
@@ -6357,11 +6361,12 @@ func (e *Engine) processProviderFile(
 	})
 	if err != nil {
 		return processResult{
-			err:         err,
-			mtime:       fingerprint.MTimeNS,
-			cacheSkip:   cacheSkip,
-			cacheKey:    cacheKey,
-			noCacheSkip: true,
+			err:            err,
+			mtime:          fingerprint.MTimeNS,
+			cacheSkip:      cacheSkip,
+			cacheKey:       cacheKey,
+			noCacheSkip:    true,
+			retentionLease: lease,
 		}, true
 	}
 	if err := validateProviderOutcome(
@@ -6371,11 +6376,12 @@ func (e *Engine) processProviderFile(
 		outcome,
 	); err != nil {
 		return processResult{
-			err:         err,
-			mtime:       fingerprint.MTimeNS,
-			cacheSkip:   cacheSkip,
-			cacheKey:    cacheKey,
-			noCacheSkip: true,
+			err:            err,
+			mtime:          fingerprint.MTimeNS,
+			cacheSkip:      cacheSkip,
+			cacheKey:       cacheKey,
+			noCacheSkip:    true,
+			retentionLease: lease,
 		}, true
 	}
 	applyProviderFingerprintFileInfo(file.Agent, fingerprint, outcome.Results)
@@ -6392,7 +6398,7 @@ func (e *Engine) processProviderFile(
 				e.providerSourceSessionIDsForForceReplace(provider, source)...,
 			)
 		}
-		return processResult{
+		skipRes := processResult{
 			skip:                  !outcome.ForceReplace,
 			excludedSessionIDs:    excludedSessionIDs,
 			mtime:                 fingerprint.MTimeNS,
@@ -6402,7 +6408,15 @@ func (e *Engine) processProviderFile(
 			forceReplace:          outcome.ForceReplace,
 			suppressPresenceSweep: !outcome.ResultSetComplete,
 			providerFailureCount:  providerFailureCount,
-		}, true
+		}
+		// A SkipReason outcome without a force-replace carries no parsed data,
+		// so it stays a lease-free skip; a force-replace is parse-bearing.
+		if skipRes.skip {
+			lease.Release()
+		} else {
+			skipRes.retentionLease = lease
+		}
+		return skipRes, true
 	}
 
 	parsedResults := parseOutcomeResults(outcome.Results)
@@ -6417,6 +6431,7 @@ func (e *Engine) processProviderFile(
 		forceReplace:          outcome.ForceReplace || incForceReplace,
 		suppressPresenceSweep: !outcome.ResultSetComplete,
 		providerFailureCount:  providerFailureCount,
+		retentionLease:        lease,
 	}
 	// Incremental-append providers (Claude and Codex) need the stored file
 	// identity so a later sync can detect an atomic file replacement
@@ -7589,7 +7604,7 @@ func (e *Engine) tryProviderIncrementalAppend(
 		}
 	}
 
-	return e.tryIncrementalJSONL(file, info, file.Agent, parseFn)
+	return e.tryIncrementalJSONL(ctx, file, info, file.Agent, parseFn)
 }
 
 // incrementalParseFunc reads new JSONL lines from a file
@@ -7609,6 +7624,7 @@ type incrementalParseFunc func(
 // to full parse when the file maps to multiple DB sessions
 // (e.g. Claude DAG forks).
 func (e *Engine) tryIncrementalJSONL(
+	ctx context.Context,
 	file parser.DiscoveredFile,
 	info os.FileInfo,
 	agent parser.AgentType,
@@ -7723,10 +7739,23 @@ func (e *Engine) tryIncrementalJSONL(
 		incMtime = parser.CodexEffectiveMtime(file.Path, incMtime)
 	}
 
+	// Incremental parse seam: every gate above returns a lease-free decline.
+	// From here parseFn reads and parses the appended bytes, so acquire the
+	// retention lease that bounds the parsed payload. It is attached to the
+	// incremental results below and released on every decline (fall-through to
+	// a full parse re-acquires at the provider parse seam) or skip return.
+	lease, leaseErr := e.retentionBudget().acquire(
+		ctx, parseRetentionSourceBytes(file),
+	)
+	if leaseErr != nil {
+		return processResult{err: leaseErr}, true
+	}
+
 	newMsgs, links, endedAt, consumed, terminationStatus, err := parseFn(
 		file.Path, inc,
 	)
 	if err != nil {
+		lease.Release()
 		if parser.IsIncrementalFullParseFallback(err) {
 			log.Printf(
 				"incremental %s %s: %v (explicit full parse fallback)",
@@ -7792,6 +7821,7 @@ func (e *Engine) tryIncrementalJSONL(
 					hasTotalOutputTokens: inc.HasTotalOutputTokens,
 					hasPeakContextTokens: inc.HasPeakContextTokens,
 				},
+				retentionLease: lease,
 			}, true
 		}
 		// A larger source with no complete record consumed is an unfinished
@@ -7799,6 +7829,7 @@ func (e *Engine) tryIncrementalJSONL(
 		// the persisted cursor unchanged and suppress the mtime skip entry so a
 		// completed record is retried even when the writer restores the same
 		// filesystem timestamp.
+		lease.Release()
 		return processResult{skip: true, noCacheSkip: true}, true
 	}
 
@@ -7823,6 +7854,7 @@ func (e *Engine) tryIncrementalJSONL(
 						" message.id with stored tail, full parse",
 					agent, file.Path,
 				)
+				lease.Release()
 				return processResult{forceReplace: true}, false
 			}
 		}
@@ -7882,6 +7914,7 @@ func (e *Engine) tryIncrementalJSONL(
 			hasTotalOutputTokens: hasTotalOut,
 			hasPeakContextTokens: hasPeakCtx,
 		},
+		retentionLease: lease,
 	}, true
 }
 
@@ -11395,9 +11428,9 @@ func (e *Engine) SyncSingleSessionContext(
 		}
 	}
 
-	res, retentionLease := e.processFileWithRetention(ctx, file)
+	res := e.processFile(ctx, file)
 	defer e.retentionBudget().scavengeIfNeeded()
-	defer retentionLease.Release()
+	defer res.retentionLease.Release()
 	if res.err != nil {
 		if res.cacheSkip && res.mtime != 0 && !res.noCacheSkip {
 			e.cacheSkip(res.skipCacheKey(path), res.mtime, res.sourceFingerprint)
