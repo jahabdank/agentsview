@@ -5415,20 +5415,25 @@ func (e *Engine) collectAndBatch(
 	var pending []pendingWrite
 	var pendingLeases []*parseRetentionLease
 	baselineCandidates := make([]db.SessionSourcePath, 0, reconciliationPageSize)
+	baselineAdmitted := make([]db.SessionSourcePath, 0, reconciliationPageSize)
 	baselineAdmission := make(map[db.SessionSourcePath]bool, reconciliationPageSize)
 	runtimeMetrics := reconciliationRuntimeMetricsFor(ctx)
 	flushBaselineSources := func() {
 		if len(baselineCandidates) == 0 {
 			return
 		}
-		admitted := make([]db.SessionSourcePath, 0, len(baselineCandidates))
+		baselineAdmitted = baselineAdmitted[:0]
 		for _, source := range baselineCandidates {
 			if baselineAdmission[source] {
-				admitted = append(admitted, source)
+				baselineAdmitted = append(baselineAdmitted, source)
 			}
 		}
+		// ReplaceActiveSessionSourceBaselines only reads baselineAdmitted
+		// synchronously within this call (db.baselineActiveSessionSourcePathsTx
+		// iterates it while binding statement params); it does not retain the
+		// slice, so reusing the same backing array across flushes is safe.
 		if err := e.db.ReplaceActiveSessionSourceBaselines(
-			ctx, e.machine, baselineCandidates, admitted,
+			ctx, e.machine, baselineCandidates, baselineAdmitted,
 		); err != nil {
 			log.Printf("replace successful non-write source baselines: %v", err)
 			stats.RecordFailed()
