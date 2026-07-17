@@ -1239,6 +1239,85 @@ func TestCopyWorktreeProjectMappingsFromOldSchemaDefaultsLayout(t *testing.T) {
 	assert.True(t, got[0].Enabled, "enabled")
 }
 
+func TestCopyWorktreeProjectMappingsFromFillsOnlyEmptyOriginalProject(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	tests := []struct {
+		name                string
+		destinationOriginal string
+		wantOriginal        string
+	}{
+		{
+			name:         "fills empty destination",
+			wantOriginal: "source-label",
+		},
+		{
+			name:                "preserves non-empty destination",
+			destinationOriginal: "destination-label",
+			wantOriginal:        "destination-label",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			prefix := filepath.Join(dir, "service.worktrees")
+			sourcePath := filepath.Join(dir, "source.db")
+			source, err := Open(sourcePath)
+			require.NoError(t, err, "open source")
+			_, err = source.CreateWorktreeProjectMapping(
+				ctx,
+				WorktreeProjectMapping{
+					Machine:         "host-a.example",
+					PathPrefix:      prefix,
+					Layout:          WorktreeMappingLayoutRepoDotWorktrees,
+					OriginalProject: "source-label",
+					Enabled:         true,
+				},
+			)
+			require.NoError(t, err, "create source mapping")
+			require.NoError(t, source.Close(), "close source")
+
+			destination, err := Open(filepath.Join(dir, "destination.db"))
+			require.NoError(t, err, "open destination")
+			defer destination.Close()
+			owned, err := destination.CreateWorktreeProjectMapping(
+				ctx,
+				WorktreeProjectMapping{
+					Machine:         "host-a.example",
+					PathPrefix:      prefix,
+					Project:         "destination-service",
+					OriginalProject: tt.destinationOriginal,
+					Enabled:         false,
+				},
+			)
+			require.NoError(t, err, "create destination mapping")
+
+			require.NoError(
+				t,
+				destination.CopyWorktreeProjectMappingsFrom(sourcePath),
+				"copy source mappings",
+			)
+
+			mappings, err := destination.ListWorktreeProjectMappings(
+				ctx, "host-a.example",
+			)
+			require.NoError(t, err, "list destination mappings")
+			require.Len(t, mappings, 1)
+			assert.Equal(t, tt.wantOriginal, mappings[0].OriginalProject)
+			assert.Equal(t, owned.ID, mappings[0].ID, "destination owns the row")
+			assert.Equal(t, "host-a.example", mappings[0].Machine)
+			assert.Equal(t, prefix, mappings[0].PathPrefix)
+			assert.Equal(t, WorktreeMappingLayoutExplicit, mappings[0].Layout)
+			assert.Equal(t, "destination_service", mappings[0].Project)
+			assert.False(t, mappings[0].Enabled)
+			assert.Equal(t, owned.CreatedAt, mappings[0].CreatedAt)
+			assert.Equal(t, owned.UpdatedAt, mappings[0].UpdatedAt)
+		})
+	}
+}
+
 func TestCopySessionMetadataFromOldWorktreeMappingSchemaDefaultsLayout(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()

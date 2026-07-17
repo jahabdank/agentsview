@@ -400,8 +400,8 @@ func (db *DB) ListActiveWorktreeProjectMappings(
 
 // CopyWorktreeProjectMappingsFrom copies persistent worktree mappings from a
 // source DB into this DB. Omit id so source primary keys cannot shadow
-// destination rows; UNIQUE(machine, path_prefix) conflicts preserve existing
-// destination mappings.
+// destination rows. UNIQUE(machine, path_prefix) conflicts preserve the
+// destination mapping while filling its set-once original project context.
 func (db *DB) CopyWorktreeProjectMappingsFrom(sourcePath string) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -438,12 +438,19 @@ func (db *DB) CopyWorktreeProjectMappingsFrom(sourcePath string) error {
 			originalProjectSelect = "original_project"
 		}
 		if _, err := tx.ExecContext(ctx, `
-			INSERT OR IGNORE INTO main.worktree_project_mappings
+			INSERT INTO main.worktree_project_mappings
 				(machine, path_prefix, layout, project, original_project,
 				 enabled, created_at, updated_at)
 			SELECT machine, path_prefix, `+layoutSelect+`, project,
 				`+originalProjectSelect+`, enabled, created_at, updated_at
-			FROM old_db.worktree_project_mappings`); err != nil {
+			FROM old_db.worktree_project_mappings
+			WHERE TRUE
+			ON CONFLICT(machine, path_prefix) DO UPDATE SET
+				original_project = CASE
+					WHEN worktree_project_mappings.original_project = ''
+						THEN excluded.original_project
+					ELSE worktree_project_mappings.original_project
+				END`); err != nil {
 			return fmt.Errorf("copying worktree project mappings: %w", err)
 		}
 	}
