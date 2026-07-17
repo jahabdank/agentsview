@@ -1962,13 +1962,16 @@ func TestRunExclusiveSerializesWorktreeReclassification(t *testing.T) {
 	}()
 	<-entered
 
+	applyAttempted := make(chan struct{})
 	applyDone := make(chan error, 1)
 	go func() {
+		close(applyAttempted)
 		_, _, applyErr := engine.ApplyWorktreeReclassification(
 			ctx, draft, preview.MappingToken, preview.ExistingMappingID,
 		)
 		applyDone <- applyErr
 	}()
+	<-applyAttempted
 	select {
 	case applyErr := <-applyDone:
 		require.Failf(t, "apply overlapped exclusive work", "error: %v", applyErr)

@@ -454,6 +454,63 @@ func TestResolveWorktreeProjectMappingMatchesRootPrefix(t *testing.T) {
 	assert.Equal(t, "root_project", project, "root resolve")
 }
 
+func TestResolveWorktreeProjectMappingPreservesPortableRootIdentity(t *testing.T) {
+	tests := []struct {
+		name        string
+		prefix      string
+		cwd         string
+		project     string
+		wantProject string
+		wantMatch   bool
+		wantStored  string
+	}{
+		{
+			name: "windows drive root", prefix: `C:\`, cwd: `C:\worktrees\service`,
+			project: "drive-root", wantProject: "drive_root",
+			wantMatch: true, wantStored: "C:/",
+		},
+		{
+			name: "drive relative does not match drive absolute", prefix: `C:`,
+			cwd: `C:\worktrees\service`, project: "drive-relative", wantStored: "C:",
+		},
+		{
+			name: "UNC share root", prefix: `\\server\share\`,
+			cwd: `\\server\share\worktrees\service`, project: "unc-root",
+			wantProject: "unc_root", wantMatch: true, wantStored: "//server/share/",
+		},
+		{
+			name: "POSIX path does not match UNC path", prefix: `/server/share`,
+			cwd: `\\server\share\worktrees\service`, project: "posix-root",
+			wantStored: "/server/share",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := testDB(t)
+			mapping, err := d.CreateWorktreeProjectMapping(
+				context.Background(),
+				WorktreeProjectMapping{
+					Machine: "portable.example", PathPrefix: tt.prefix,
+					Project: tt.project, Enabled: true,
+				},
+			)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantStored, mapping.PathPrefix)
+
+			project, matched, err := d.ResolveWorktreeProjectMapping(
+				context.Background(), "portable.example", tt.cwd, "leaf",
+			)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantMatch, matched)
+			if tt.wantMatch {
+				assert.Equal(t, tt.wantProject, project)
+			} else {
+				assert.Equal(t, "leaf", project)
+			}
+		})
+	}
+}
+
 func TestApplyWorktreeProjectMappingsUpdatesOnlyCurrentMachineAndEnabledRows(t *testing.T) {
 	d := testDB(t)
 	ctx := context.Background()

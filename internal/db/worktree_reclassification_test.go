@@ -136,6 +136,63 @@ func TestWorktreeReclassificationExactCollisionIsServerResolved(t *testing.T) {
 	assert.Equal(t, "branch", updated.OriginalProject)
 }
 
+func TestWorktreeReclassificationExactCollisionPreservesPortableRootIdentity(
+	t *testing.T,
+) {
+	tests := []struct {
+		name            string
+		storedPrefix    string
+		draftPrefix     string
+		wantCollisionID bool
+	}{
+		{
+			name: "drive root alternate separators", storedPrefix: `C:\`,
+			draftPrefix: `C:/`, wantCollisionID: true,
+		},
+		{
+			name: "drive absolute and relative differ", storedPrefix: `C:\`,
+			draftPrefix: `C:`,
+		},
+		{
+			name: "UNC root alternate separators", storedPrefix: `\\server\share\`,
+			draftPrefix: `//server/share/`, wantCollisionID: true,
+		},
+		{
+			name: "UNC and POSIX roots differ", storedPrefix: `\\server\share\`,
+			draftPrefix: `/server/share/`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := testDB(t)
+			ctx := context.Background()
+			existing, err := d.CreateWorktreeProjectMapping(
+				ctx,
+				WorktreeProjectMapping{
+					Machine: "portable.example", PathPrefix: tt.storedPrefix,
+					Project: "old-target", Enabled: true,
+				},
+			)
+			require.NoError(t, err)
+
+			preview, err := d.PreviewWorktreeReclassification(
+				ctx,
+				WorktreeReclassificationDraft{
+					Machine: "portable.example", PathPrefix: tt.draftPrefix,
+					Project: "new-target", Enabled: true,
+				},
+			)
+			require.NoError(t, err)
+			if tt.wantCollisionID {
+				require.NotNil(t, preview.ExistingMappingID)
+				assert.Equal(t, existing.ID, *preview.ExistingMappingID)
+			} else {
+				assert.Nil(t, preview.ExistingMappingID)
+			}
+		})
+	}
+}
+
 func TestWorktreeReclassificationApplyRollsBackEveryWriteStage(t *testing.T) {
 	tests := []struct {
 		name       string

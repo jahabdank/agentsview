@@ -141,7 +141,7 @@ func (db *DB) ApplyWorktreeReclassification(
 		)
 	}
 	evaluation, err := evaluateWorktreeMappingsTx(
-		ctx, tx, normalized.Machine, active, &mapping,
+		ctx, tx, normalized.Machine, active, &mapping, "",
 	)
 	if err != nil {
 		return WorktreeProjectMapping{}, WorktreeReclassificationPreview{}, err
@@ -204,7 +204,7 @@ func previewWorktreeReclassificationTx(
 	collision := exactWorktreeMapping(stored, draft.PathPrefix)
 	effective := overlayWorktreeMapping(stored, draft, collision)
 	evaluation, err := evaluateWorktreeMappingsTx(
-		ctx, tx, draft.Machine, enabledWorktreeMappings(effective), &draft,
+		ctx, tx, draft.Machine, enabledWorktreeMappings(effective), &draft, "",
 	)
 	if err != nil {
 		return WorktreeReclassificationPreview{}, err
@@ -285,12 +285,30 @@ func evaluateWorktreeMappingsTx(
 	machine string,
 	mappings []WorktreeProjectMapping,
 	scope *WorktreeProjectMapping,
+	sessionID string,
 ) (worktreeReclassificationEvaluation, error) {
-	rows, err := tx.QueryContext(ctx, `
+	query := `
 		SELECT id, project, cwd, file_path
 		FROM sessions
 		WHERE machine = ? AND deleted_at IS NULL
-		ORDER BY id`, machine)
+		ORDER BY id`
+	args := []any{machine}
+	if sessionID != "" {
+		query = `
+			SELECT id, project, cwd, file_path
+			FROM sessions
+			WHERE machine = ? AND deleted_at IS NULL
+				AND (id = ? OR (
+					file_path IS NOT NULL AND file_path != ''
+					AND file_path = (
+						SELECT file_path FROM sessions
+						WHERE machine = ? AND id = ? AND deleted_at IS NULL
+					)
+				))
+			ORDER BY id`
+		args = []any{machine, sessionID, machine, sessionID}
+	}
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return worktreeReclassificationEvaluation{}, fmt.Errorf(
 			"querying sessions for worktree mapping evaluation: %w", err,
@@ -337,6 +355,9 @@ func evaluateWorktreeMappingsTx(
 
 	evaluation := worktreeReclassificationEvaluation{projects: map[string]int{}}
 	for _, row := range sessions {
+		if sessionID != "" && row.id != sessionID {
+			continue
+		}
 		if scope != nil {
 			matchCwd := row.matchCwd
 			if matchCwd == "" {

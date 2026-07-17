@@ -9679,7 +9679,7 @@ func (e *Engine) applyWorktreeMappingToSingleSession(
 ) error {
 	ctx := context.Background()
 	sess, err := e.db.GetSession(ctx, sessionID)
-	if err != nil || sess == nil || sess.Cwd == "" {
+	if err != nil || sess == nil {
 		return err
 	}
 

@@ -95,7 +95,25 @@ func normalizedMappingPath(value string) string {
 	if value == "" {
 		return ""
 	}
-	return path.Clean(value)
+	if strings.HasPrefix(value, "//") && !strings.HasPrefix(value, "///") {
+		rest := path.Clean(strings.TrimPrefix(value, "//"))
+		parts := strings.Split(rest, "/")
+		if len(parts) >= 2 && parts[0] != "" && parts[0] != "." &&
+			parts[0] != ".." && parts[1] != "" && parts[1] != "." &&
+			parts[1] != ".." {
+			normalized := "//" + rest
+			if len(parts) == 2 {
+				return normalized + "/"
+			}
+			return normalized
+		}
+	}
+	driveAbsolute := len(value) >= 3 && value[1] == ':' && value[2] == '/'
+	normalized := path.Clean(value)
+	if driveAbsolute && normalized == value[:2] {
+		return normalized + "/"
+	}
+	return normalized
 }
 
 func worktreePathMatches(prefix string, cwd string) bool {
@@ -107,8 +125,14 @@ func worktreePathMatches(prefix string, cwd string) bool {
 	if cwd == prefix {
 		return true
 	}
+	if strings.HasPrefix(prefix, "//") != strings.HasPrefix(cwd, "//") {
+		return false
+	}
+	if len(prefix) == 2 && prefix[1] == ':' {
+		return false
+	}
 	if prefix == "/" {
-		return strings.HasPrefix(cwd, "/")
+		return strings.HasPrefix(cwd, "/") && !strings.HasPrefix(cwd, "//")
 	}
 	return strings.HasPrefix(cwd, strings.TrimSuffix(prefix, "/")+"/")
 }
@@ -843,7 +867,7 @@ func (db *DB) applyWorktreeProjectMappings(
 	}
 
 	evaluation, err := evaluateWorktreeMappingsTx(
-		ctx, tx, machine, mappings, nil,
+		ctx, tx, machine, mappings, nil, "",
 	)
 	if err != nil {
 		return ApplyWorktreeProjectMappingsResult{}, err
@@ -903,7 +927,7 @@ func (db *DB) applyWorktreeProjectMappingToSession(
 	}
 	machine = strings.TrimSpace(machine)
 	sessionID = strings.TrimSpace(sessionID)
-	if machine == "" || sessionID == "" || strings.TrimSpace(cwd) == "" {
+	if machine == "" || sessionID == "" {
 		return false, nil
 	}
 
@@ -923,35 +947,22 @@ func (db *DB) applyWorktreeProjectMappingToSession(
 		return false, fmt.Errorf("loading active worktree mappings: %w", err)
 	}
 
-	row := worktreeMappingSessionRow{
-		id:      sessionID,
-		machine: machine,
-	}
-	err = tx.QueryRowContext(ctx, `
-		SELECT project, cwd
-		FROM sessions
-		WHERE id = ? AND machine = ? AND deleted_at IS NULL`,
-		sessionID,
-		machine,
-	).Scan(&row.project, &row.cwd)
-	if err == sql.ErrNoRows {
-		return false, nil
-	}
+	evaluation, err := evaluateWorktreeMappingsTx(
+		ctx, tx, machine, mappings, nil, sessionID,
+	)
 	if err != nil {
 		return false, fmt.Errorf(
-			"reading session %s for worktree mapping apply: %w",
+			"evaluating session %s for worktree mapping apply: %w",
 			sessionID,
 			err,
 		)
 	}
-
-	update, matched, shouldUpdate := applyMappingToSessionRow(mappings, row)
-	if !matched || !shouldUpdate {
+	if len(evaluation.updates) == 0 {
 		return false, nil
 	}
 
 	changed, err := updateSessionProjectTx(
-		ctx, tx, update, bumpLocalModifiedAt,
+		ctx, tx, evaluation.updates[0], bumpLocalModifiedAt,
 	)
 	if err != nil {
 		return false, err
