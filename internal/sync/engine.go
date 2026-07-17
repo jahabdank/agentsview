@@ -6799,7 +6799,7 @@ func providerFingerprintHashInCacheKey(agent parser.AgentType) bool {
 func providerFingerprintHashRequiredForFreshness(agent parser.AgentType) bool {
 	switch agent {
 	case parser.AgentClaude, parser.AgentCodex, parser.AgentDevin, parser.AgentHermes,
-		parser.AgentQoder, parser.AgentWindsurf:
+		parser.AgentQoder, parser.AgentWindsurf, parser.AgentGemini:
 		return true
 	default:
 		return false
@@ -7462,12 +7462,13 @@ func (e *Engine) providerSourceFreshBeforeFingerprint(
 		if e.shouldSkipByPath(path, effectiveInfo) {
 			return mtime, true
 		}
-	// Gemini is deliberately absent here. Its fingerprint is composite (the
-	// session file plus projects.json and trustedFolders.json), so a
-	// pre-fingerprint skip keyed only on the session file's size and mtime
-	// would skip a session whose project metadata changed while the transcript
-	// did not, leaving a stale project on scheduled syncs. Gemini relies on the
-	// post-fingerprint skip cache instead, whose mtime folds in the composite.
+	// Gemini is deliberately absent here. Its fingerprint hash folds in the
+	// session's resolved project name, so a pre-fingerprint skip keyed only on
+	// the session file's size and mtime would skip a session whose project
+	// metadata changed while the transcript did not, leaving a stale project
+	// on scheduled syncs. Gemini relies on the post-fingerprint DB hash check
+	// instead (providerFingerprintHashRequiredForFreshness), which catches a
+	// resolved-project change even when size and mtime are unchanged.
 	case parser.AgentCopilot:
 		mtime := copilotEffectiveMtime(path, info)
 		effectiveInfo := fakeSnapshotInfo{

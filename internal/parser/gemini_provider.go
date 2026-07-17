@@ -422,21 +422,45 @@ func (s geminiSourceSet) Fingerprint(
 	if err := addGeminiFingerprintPart(h, "session", path, info); err != nil {
 		return SourceFingerprint{}, err
 	}
-	for _, metadataPath := range geminiProjectMetadataPaths(root) {
-		metadataInfo, err := os.Stat(metadataPath)
-		if err != nil || metadataInfo.IsDir() {
-			continue
-		}
-		fingerprint.Size += metadataInfo.Size()
-		if mtime := metadataInfo.ModTime().UnixNano(); mtime > fingerprint.MTimeNS {
-			fingerprint.MTimeNS = mtime
-		}
-		if err := addGeminiFingerprintPart(h, "project", metadataPath, metadataInfo); err != nil {
-			return SourceFingerprint{}, err
-		}
+	if _, err := fmt.Fprintf(
+		h, "project\x00%s\x00",
+		s.resolvedProjectForFingerprint(root, path, source),
+	); err != nil {
+		return SourceFingerprint{}, err
 	}
 	fingerprint.Hash = fmt.Sprintf("%x", h.Sum(nil))
 	return fingerprint, nil
+}
+
+// geminiSessionDirHash extracts the tmp/<dirHash>/chats component that keys
+// the session's project resolution.
+func geminiSessionDirHash(root, path string) (string, bool) {
+	rel, ok := relUnder(filepath.Clean(root), filepath.Clean(path))
+	if !ok {
+		return "", false
+	}
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	if len(parts) != 4 || parts[0] != "tmp" || parts[2] != geminiChatsDir {
+		return "", false
+	}
+	return parts[1], true
+}
+
+// resolvedProjectForFingerprint returns the only metadata this session's
+// parse consumes: its resolved project name. Root-wide metadata files must
+// not leak into unrelated sessions' fingerprints (they used to
+// mass-invalidate the whole root on any edit).
+func (s geminiSourceSet) resolvedProjectForFingerprint(
+	root, path string, source SourceRef,
+) string {
+	if source.ProjectHint != "" {
+		return source.ProjectHint
+	}
+	dirHash, ok := geminiSessionDirHash(root, path)
+	if !ok {
+		return ""
+	}
+	return ResolveGeminiProject(dirHash, buildGeminiProjectMap(root))
 }
 
 func (s geminiSourceSet) pathFromSource(source SourceRef) (string, bool) {
@@ -516,13 +540,6 @@ func (s geminiSourceSet) sourceRefForPathWithProjectMap(
 // buildGeminiProjectMap indirects BuildGeminiProjectMap so discovery can build
 // the project map once per root and tests can observe how often it runs.
 var buildGeminiProjectMap = BuildGeminiProjectMap
-
-func geminiProjectMetadataPaths(root string) []string {
-	return []string{
-		filepath.Join(root, "projects.json"),
-		filepath.Join(root, "trustedFolders.json"),
-	}
-}
 
 func geminiProjectMetadataPath(root, path string) bool {
 	root = filepath.Clean(root)
