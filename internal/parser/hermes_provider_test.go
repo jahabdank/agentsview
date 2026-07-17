@@ -190,6 +190,28 @@ func TestHermesProviderStateDBSourceMethods(t *testing.T) {
 	assert.Equal(t, stateDB, changed[0].DisplayPath)
 }
 
+func TestHermesSourceForReconciliationPreservesOrdinaryTranscript(t *testing.T) {
+	root := t.TempDir()
+	sessionsDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.MkdirAll(sessionsDir, 0o755))
+	createHermesStateDB(t, root)
+	transcriptPath := filepath.Join(sessionsDir, "orphan.jsonl")
+	writeSourceFile(t, transcriptPath, hermesProviderJSONLFixture("orphan question"))
+
+	provider, ok := NewProvider(AgentHermes, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	resolver, ok := provider.(ReconciliationSourceResolver)
+	require.True(t, ok)
+	source, found, err := resolver.SourceForReconciliation(
+		t.Context(), transcriptPath, "project",
+	)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, transcriptPath, source.DisplayPath)
+	assert.Equal(t, transcriptPath, source.FingerprintKey)
+	assert.Equal(t, "project", source.ProjectHint)
+}
+
 func TestHermesStateMemberFingerprintIncludesSelectedTranscriptMetadata(t *testing.T) {
 	root := t.TempDir()
 	sessionsDir := filepath.Join(root, "sessions")

@@ -323,8 +323,10 @@ func writeOneSessionBatchTx(
 		(!deletionCause.Valid || deletionCause.String != deletionCauseSourceMissing) {
 		return 0, ErrSessionTrashed
 	}
+	replaceMessages := write.ReplaceMessages ||
+		(deletionCause.Valid && deletionCause.String == deletionCauseSourceMissing)
 	replacementTranscriptChanged := false
-	if write.ReplaceMessages && sessionExists {
+	if replaceMessages && sessionExists {
 		stored, err := sessionMessagesTx(
 			context.Background(), tx, write.Session.ID,
 		)
@@ -360,7 +362,7 @@ func writeOneSessionBatchTx(
 
 	msgs := write.Messages
 	var pins []savedPin
-	if write.ReplaceMessages && sessionExists {
+	if replaceMessages && sessionExists {
 		pins, err = savePinsTx(tx, write.Session.ID)
 		if err != nil {
 			return 0, err
@@ -376,7 +378,7 @@ func writeOneSessionBatchTx(
 		msgs = messagesAfterOrdinal(msgs, maxOrd)
 	}
 	transcriptChanged := len(msgs) > 0
-	if write.ReplaceMessages && sessionExists {
+	if replaceMessages && sessionExists {
 		transcriptChanged = replacementTranscriptChanged
 	}
 
@@ -399,7 +401,7 @@ func writeOneSessionBatchTx(
 			return 0, err
 		}
 	}
-	if write.ReplaceMessages && sessionExists {
+	if replaceMessages && sessionExists {
 		if err := reconcileRecallEvidenceForSessionTx(
 			context.Background(),
 			tx,
@@ -409,7 +411,7 @@ func writeOneSessionBatchTx(
 			return 0, err
 		}
 	}
-	if write.ReplaceMessages {
+	if replaceMessages {
 		if err := restorePinsTx(tx, write.Session.ID, pins); err != nil {
 			return 0, err
 		}

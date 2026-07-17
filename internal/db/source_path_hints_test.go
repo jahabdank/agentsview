@@ -758,6 +758,44 @@ func TestSourceMissingTombstoneRevivesThroughEverySessionUpsert(t *testing.T) {
 	}
 }
 
+func TestWriteSessionBatchSourceMissingRevivalReplacesRetainedMessages(
+	t *testing.T,
+) {
+	d := testDB(t)
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	session := Session{
+		ID: "session", Project: "project", Machine: defaultMachine,
+		Agent: "claude", FilePath: &path, MessageCount: 1,
+	}
+	write := func(content string) {
+		t.Helper()
+		result, err := d.WriteSessionBatch([]SessionBatchWrite{{
+			Session: session,
+			Messages: []Message{{
+				SessionID: "session", Ordinal: 0, Role: "user", Content: content,
+			}},
+			DataVersion: CurrentDataVersion(),
+		}})
+		require.NoError(t, err)
+		require.Equal(t, 1, result.WrittenSessions)
+	}
+
+	write("old content")
+	baselineSessionSource(t, d, defaultMachine, "claude", path)
+	changed, err := d.SoftDeleteSessionSourceOwnership(
+		t.Context(), defaultMachine, "claude", "session", path,
+	)
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	write("new content")
+	messages, err := d.GetAllMessages(t.Context(), "session")
+	require.NoError(t, err)
+	require.Len(t, messages, 1)
+	assert.Equal(t, "new content", messages[0].Content,
+		"source-missing revival must override append-only batch hints")
+}
+
 func TestUserTrashRemainsRejectedByEverySessionUpsert(t *testing.T) {
 	d := testDB(t)
 	insertSession(t, d, "session", "project")

@@ -803,9 +803,9 @@ func (e *Engine) SyncPathsContext(ctx context.Context, paths []string) error {
 	// Capture container states before classifyPaths lists any session rows,
 	// matching the capture-before-discovery ordering of full syncs.
 	preContainerStates := e.captureSQLiteContainerStates()
-	files := e.classifyPaths(paths)
+	files, classificationErr := e.classifyPaths(ctx, paths)
 	if len(files) == 0 && len(missingPaths) == 0 {
-		return nil
+		return classificationErr
 	}
 
 	e.syncMu.Lock()
@@ -841,7 +841,8 @@ func (e *Engine) SyncPathsContext(ctx context.Context, paths []string) error {
 	e.finishSQLiteContainerPass(true, false)
 	e.anomalies.applyTo(&stats)
 	e.persistSkipCache()
-	complete := ctx.Err() == nil && !stats.Aborted && stats.Failed == 0 &&
+	complete := classificationErr == nil && ctx.Err() == nil &&
+		!stats.Aborted && stats.Failed == 0 &&
 		stats.providerFailures == 0
 	if complete && len(missingPaths) > 0 {
 		var err error
@@ -861,7 +862,7 @@ func (e *Engine) SyncPathsContext(ctx context.Context, paths []string) error {
 			"sync: %d file(s) updated", stats.Synced,
 		)
 	}
-	if err := ctx.Err(); err != nil {
+	if err := errors.Join(classificationErr, ctx.Err()); err != nil {
 		return err
 	}
 	if !complete {
@@ -877,10 +878,12 @@ func (e *Engine) SyncPathsContext(ctx context.Context, paths []string) error {
 // parser.DiscoveredFile structs, filtering out paths that don't
 // match known session file patterns.
 func (e *Engine) classifyPaths(
+	ctx context.Context,
 	paths []string,
-) []parser.DiscoveredFile {
+) ([]parser.DiscoveredFile, error) {
 	seen := make(map[string]int, len(paths))
 	files := make([]parser.DiscoveredFile, 0, len(paths))
+	var classificationErr error
 	for _, p := range paths {
 		// Codex resolved-index events map to potentially several session
 		// sources and must classify even when the event path was deleted, so
@@ -889,7 +892,14 @@ func (e *Engine) classifyPaths(
 		// history.jsonl), are owned by each provider-authoritative
 		// SourcesForChangedPath via classifyProviderChangedPath.
 		dfs := e.classifyCodexIndexPath(p)
-		dfs = append(dfs, e.classifyProviderChangedPath(p)...)
+		providerFiles, err := e.classifyProviderChangedPath(ctx, p)
+		if err != nil {
+			classificationErr = errors.Join(
+				classificationErr,
+				fmt.Errorf("classify changed path %q: %w", p, err),
+			)
+		}
+		dfs = append(dfs, providerFiles...)
 		for _, df := range dfs {
 			e.invalidateVerifiedDiscoveredSource(df)
 			key := string(df.Agent) + "\x00" + df.Path
@@ -903,7 +913,7 @@ func (e *Engine) classifyPaths(
 	}
 	files = e.expandClaudeDuplicateCandidates(files)
 	files = dedupeDiscoveredFiles(files)
-	return e.dedupeClaudeDiscoveredFiles(files)
+	return e.dedupeClaudeDiscoveredFiles(files), classificationErr
 }
 
 func mergeChangedPathDiscoveredFile(
@@ -922,11 +932,12 @@ func mergeChangedPathDiscoveredFile(
 }
 
 func (e *Engine) classifyProviderChangedPath(
+	ctx context.Context,
 	path string,
-) []parser.DiscoveredFile {
-	ctx := context.Background()
+) ([]parser.DiscoveredFile, error) {
 	eventKind := providerChangedPathEventKind(path)
 	var files []parser.DiscoveredFile
+	var classificationErr error
 	seen := map[string]struct{}{}
 
 	agents := make([]parser.AgentType, 0, len(e.providerFactories))
@@ -968,9 +979,19 @@ func (e *Engine) classifyProviderChangedPath(
 			Machine: e.machine,
 		})
 		def := provider.Definition()
-		watchRoots := e.providerChangedPathWatchRoots(
+		watchRoots, err := e.providerChangedPathWatchRoots(
 			ctx, agentType, provider, roots,
 		)
+		if err != nil {
+			classificationErr = errors.Join(
+				classificationErr,
+				fmt.Errorf(
+					"%s provider changed-path watch roots for %q: %w",
+					def.Type, path, err,
+				),
+			)
+			continue
+		}
 		// Every SourcesForChangedPath implementation resolves the
 		// changed path within the provider's configured roots or plan
 		// watch roots (stored-path hints are scoped to the affected
@@ -994,16 +1015,19 @@ func (e *Engine) classifyProviderChangedPath(
 						resolver.StoredSourceHintScopes(request),
 					)
 					if len(scopes) > 0 {
-						var err error
-						request.StoredSourcePaths, err = e.db.ListStoredSourcePathHints(
-							string(def.Type),
+						request.StoredSourcePaths, err = e.db.ListStoredSourcePathHintsContext(
+							ctx, string(def.Type),
 							scopes,
 						)
 						if err != nil {
-							log.Printf(
-								"%s provider changed-path stored hints: %v",
-								def.Type, err,
+							classificationErr = errors.Join(
+								classificationErr,
+								fmt.Errorf(
+									"%s provider changed-path stored hints for %q: %w",
+									def.Type, path, err,
+								),
 							)
+							continue
 						}
 					}
 				}
@@ -1014,9 +1038,12 @@ func (e *Engine) classifyProviderChangedPath(
 			)
 			if err != nil {
 				if !errors.Is(err, parser.ErrUnsupportedProviderFeature) {
-					log.Printf(
-						"%s provider changed-path classification: %v",
-						def.Type, err,
+					classificationErr = errors.Join(
+						classificationErr,
+						fmt.Errorf(
+							"%s provider changed-path classification for %q: %w",
+							def.Type, path, err,
+						),
 					)
 				}
 				continue
@@ -1062,7 +1089,7 @@ func (e *Engine) classifyProviderChangedPath(
 			}
 		}
 	}
-	return files
+	return files, classificationErr
 }
 
 func storedSourceDBHintScopes(
@@ -1082,16 +1109,16 @@ func (e *Engine) providerChangedPathWatchRoots(
 	agent parser.AgentType,
 	provider parser.Provider,
 	roots []string,
-) []string {
+) ([]string, error) {
 	e.providerWatchRootsMu.Lock()
 	defer e.providerWatchRootsMu.Unlock()
 	if cached, ok := e.providerWatchRoots[agent]; ok {
-		return watchRootPaths(cached)
+		return watchRootPaths(cached), nil
 	}
 
 	resolved, err := parser.ResolveWatchRoots(ctx, provider)
 	if err != nil {
-		log.Printf("%s provider watch roots: %v", agent, err)
+		return nil, fmt.Errorf("resolve %s provider watch roots: %w", agent, err)
 	}
 	resolved = normalizedProviderWatchRoots(resolved)
 	if len(resolved) == 0 {
@@ -1105,7 +1132,7 @@ func (e *Engine) providerChangedPathWatchRoots(
 		e.providerWatchRoots = make(map[parser.AgentType][]parser.WatchRoot)
 	}
 	e.providerWatchRoots[agent] = resolved
-	return watchRootPaths(resolved)
+	return watchRootPaths(resolved), nil
 }
 
 func normalizedProviderWatchRoots(
@@ -4248,12 +4275,16 @@ func (e *Engine) visualStudioCopilotMissingVS2026PollSources(
 	roots []string,
 	currentSources map[string]struct{},
 ) ([]parser.SourceRef, map[string]struct{}) {
-	watchRoots := e.providerChangedPathWatchRoots(
-		ctx, parser.AgentVSCopilot, provider, roots,
-	)
 	var out []parser.SourceRef
 	seenHints := make(map[string]struct{})
 	forceParseSources := make(map[string]struct{})
+	watchRoots, err := e.providerChangedPathWatchRoots(
+		ctx, parser.AgentVSCopilot, provider, roots,
+	)
+	if err != nil {
+		log.Printf("%s provider poll watch roots: %v", parser.AgentVSCopilot, err)
+		return out, forceParseSources
+	}
 	for _, watchRoot := range watchRoots {
 		hints, err := e.db.ListStoredSourcePathHints(
 			string(parser.AgentVSCopilot), []db.StoredSourcePathHintScope{{Path: watchRoot}},
@@ -5529,7 +5560,8 @@ func (e *Engine) collectAndBatch(
 				e.cacheSkip(r.skipCacheKey(), r.mtime, r.sourceFingerprint)
 			}
 			e.noteSQLiteContainerResult(r.path, true)
-			if r.providerFailureCount == 0 {
+			if r.providerFailureCount == 0 &&
+				e.sourceAllowsParserExclusions(r.processResult) {
 				baselineSuccessfulSource(r)
 			}
 			progress.SessionsDone++
@@ -8491,7 +8523,8 @@ func (e *Engine) writeBatchWithOutcome(
 		// dependent write succeeds below. For incremental updates
 		// (writeIncremental), messages are written first since the session
 		// already exists.
-		if err := e.db.UpsertSessionPendingContent(s); err != nil {
+		revivingSourceMissing, err := e.db.UpsertSessionPendingContent(s)
+		if err != nil {
 			if isIntentionalSessionSkip(err) {
 				if pw.sess.File.Path != "" {
 					e.cacheSkip(
@@ -8516,7 +8549,7 @@ func (e *Engine) writeBatchWithOutcome(
 		}
 
 		replaceMessages := shouldReplaceFullParseMessages(
-			pw, forceReplace, stale,
+			pw, forceReplace, stale, revivingSourceMissing,
 		)
 
 		update, findings := computeSignalsAndSecrets(s, msgs)
@@ -9432,7 +9465,7 @@ func (e *Engine) writeBatchBulkWithOutcome(
 			continue
 		}
 		replaceMessages := shouldReplaceFullParseMessages(
-			pw, forceReplace, false,
+			pw, forceReplace, false, false,
 		)
 		tScan := time.Now()
 		update, findings := computeSignalsAndSecrets(s, msgs)
@@ -9835,9 +9868,10 @@ func remoteNameFromGitConfigSection(section string) string {
 }
 
 func shouldReplaceFullParseMessages(
-	pw pendingWrite, forceReplace, stale bool,
+	pw pendingWrite, forceReplace, stale, revivingSourceMissing bool,
 ) bool {
 	return forceReplace || pw.forceReplace || pw.needsRetry || stale ||
+		revivingSourceMissing ||
 		pw.sess.Agent == parser.AgentCowork ||
 		isOpenCodeFormatStorageAgent(pw.sess.Agent) ||
 		pw.sess.Agent == parser.AgentVSCopilot ||
@@ -10077,7 +10111,8 @@ func (e *Engine) writeSessionFullWithResolver(
 	if verdict != sessionWriteOK {
 		return errSessionPreserved
 	}
-	if err := e.db.UpsertSessionPendingContent(s); err != nil {
+	_, err := e.db.UpsertSessionPendingContent(s)
+	if err != nil {
 		if isIntentionalSessionSkip(err) {
 			if pw.sess.File.Path != "" {
 				e.cacheSkip(

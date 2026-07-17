@@ -395,9 +395,12 @@ func (s hermesSourceSet) ReconciliationOwnershipScopes(
 	requestedRoot string,
 ) []StoredSourceHintScope {
 	requestedRoot = filepath.Clean(requestedRoot)
+	requestedMatchRoot := absoluteHermesPath(requestedRoot)
 	var scopes []StoredSourceHintScope
 	for _, configuredRoot := range s.roots {
-		if !hermesPathWithinOrSame(configuredRoot, requestedRoot) {
+		if !hermesPathWithinOrSame(
+			absoluteHermesPath(configuredRoot), requestedMatchRoot,
+		) {
 			continue
 		}
 		stateDB, sessionsDir, ok := hermesArchiveRootPaths(configuredRoot)
@@ -421,8 +424,22 @@ func (s hermesSourceSet) SourceForReconciliation(
 	if err := ctx.Err(); err != nil {
 		return SourceRef{}, false, err
 	}
+	path = filepath.Clean(path)
 	for _, root := range s.roots {
-		source, ok := s.sourceForChangedPath(root, path, false)
+		var source SourceRef
+		var ok bool
+		if _, _, virtual := ParseVirtualSourcePathForBase(path, "state.db"); virtual {
+			source, ok = s.sourceForChangedPath(root, path, false)
+		} else if stateDB, sessionsDir, archive := hermesStatePaths(root); archive {
+			switch {
+			case samePath(path, stateDB):
+				source, ok = hermesArchiveSourceRef(root, stateDB)
+			case hermesPathInTranscriptDir(sessionsDir, path) && IsRegularFile(path):
+				source, ok = hermesTranscriptSourceRef(root, path)
+			}
+		} else {
+			source, ok = s.sourceRef(root, path)
+		}
 		if !ok {
 			continue
 		}
@@ -432,6 +449,15 @@ func (s hermesSourceSet) SourceForReconciliation(
 		return source, true, nil
 	}
 	return SourceRef{}, false, nil
+}
+
+func absoluteHermesPath(path string) string {
+	cleaned := filepath.Clean(path)
+	abs, err := filepath.Abs(cleaned)
+	if err != nil {
+		return cleaned
+	}
+	return abs
 }
 
 func hermesPathWithinOrSame(path, root string) bool {

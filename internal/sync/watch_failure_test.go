@@ -24,11 +24,180 @@ type fingerprintCountingProvider struct {
 	fingerprintCalls int
 }
 
+type changedPathFailureProvider struct {
+	parser.ProviderBase
+	root              string
+	watchPlanErr      error
+	classificationErr error
+	storedHintScopes  bool
+	contextValue      any
+	sourceCalls       int
+}
+
+func (p *changedPathFailureProvider) WatchPlan(
+	context.Context,
+) (parser.WatchPlan, error) {
+	if p.watchPlanErr != nil {
+		return parser.WatchPlan{}, p.watchPlanErr
+	}
+	return parser.WatchPlan{Roots: []parser.WatchRoot{{Path: p.root}}}, nil
+}
+
+func (p *changedPathFailureProvider) SourcesForChangedPath(
+	ctx context.Context, _ parser.ChangedPathRequest,
+) ([]parser.SourceRef, error) {
+	p.sourceCalls++
+	p.contextValue = ctx.Value(changedPathContextKey{})
+	return nil, p.classificationErr
+}
+
+func (p *changedPathFailureProvider) StoredSourceHintScopes(
+	req parser.ChangedPathRequest,
+) []parser.StoredSourceHintScope {
+	if !p.storedHintScopes {
+		return nil
+	}
+	return []parser.StoredSourceHintScope{{Path: req.Path}}
+}
+
+func (*changedPathFailureProvider) Parse(
+	context.Context, parser.ParseRequest,
+) (parser.ParseOutcome, error) {
+	return parser.ParseOutcome{}, nil
+}
+
+type changedPathFailureFactory struct {
+	provider *changedPathFailureProvider
+}
+
+func (f changedPathFailureFactory) Definition() parser.AgentDef {
+	return f.provider.Definition()
+}
+
+func (f changedPathFailureFactory) Capabilities() parser.Capabilities {
+	return f.provider.Capabilities()
+}
+
+func (f changedPathFailureFactory) NewProvider(
+	cfg parser.ProviderConfig,
+) parser.Provider {
+	f.provider.Config = cfg.Clone()
+	return f.provider
+}
+
+type changedPathContextKey struct{}
+
+func newChangedPathFailureEngine(
+	t *testing.T,
+	database *db.DB,
+	root string,
+	provider *changedPathFailureProvider,
+) *Engine {
+	t.Helper()
+	provider.root = root
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{"changed-path-failure": {root}},
+		Machine:   "local",
+		ProviderFactories: []parser.ProviderFactory{
+			changedPathFailureFactory{provider: provider},
+		},
+		ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+			"changed-path-failure": parser.ProviderMigrationProviderAuthoritative,
+		},
+	})
+	t.Cleanup(engine.Close)
+	return engine
+}
+
 func (p *fingerprintCountingProvider) Fingerprint(
 	context.Context, parser.SourceRef,
 ) (parser.SourceFingerprint, error) {
 	p.fingerprintCalls++
 	return parser.SourceFingerprint{Hash: "stored-hash"}, nil
+}
+
+func TestSyncPathsContextPropagatesChangedPathClassificationFailure(
+	t *testing.T,
+) {
+	database := openTestDB(t)
+	root := t.TempDir()
+	changedPath := filepath.Join(root, "replacement.jsonl")
+	missingPath := filepath.Join(root, "previous.jsonl")
+	require.NoError(t, os.WriteFile(changedPath, []byte("{}\n"), 0o600))
+	require.NoError(t, database.UpsertSession(db.Session{
+		ID: "previous", Agent: "changed-path-failure", Project: "project",
+		Machine: "local", FilePath: &missingPath,
+	}))
+	require.NoError(t, database.BaselineActiveSessionSourcePaths(
+		t.Context(), "local", []db.SessionSourcePath{{
+			Agent: "changed-path-failure", FilePath: missingPath,
+		}},
+	))
+	wantErr := errors.New("changed-path classification failed")
+	provider := &changedPathFailureProvider{
+		ProviderBase: parser.ProviderBase{
+			Def: parser.AgentDef{Type: "changed-path-failure", FileBased: true},
+		},
+		classificationErr: wantErr,
+	}
+	engine := newChangedPathFailureEngine(t, database, root, provider)
+	ctx := context.WithValue(t.Context(), changedPathContextKey{}, "caller")
+
+	err := engine.SyncPathsContext(ctx, []string{changedPath, missingPath})
+
+	require.ErrorIs(t, err, wantErr)
+	assert.Equal(t, "caller", provider.contextValue,
+		"changed-path classification must receive the watcher context")
+	stored, getErr := database.GetSession(t.Context(), "previous")
+	require.NoError(t, getErr)
+	assert.NotNil(t, stored,
+		"a classification failure must suppress missing-source tombstones")
+}
+
+func TestSyncPathsContextPropagatesChangedPathWatchRootFailure(t *testing.T) {
+	database := openTestDB(t)
+	root := t.TempDir()
+	changedPath := filepath.Join(root, "session.jsonl")
+	require.NoError(t, os.WriteFile(changedPath, []byte("{}\n"), 0o600))
+	wantErr := errors.New("watch root resolution failed")
+	provider := &changedPathFailureProvider{
+		ProviderBase: parser.ProviderBase{
+			Def: parser.AgentDef{Type: "changed-path-failure", FileBased: true},
+		},
+		watchPlanErr: wantErr,
+	}
+	engine := newChangedPathFailureEngine(t, database, root, provider)
+
+	err := engine.SyncPathsContext(t.Context(), []string{changedPath})
+
+	require.ErrorIs(t, err, wantErr)
+	assert.Zero(t, provider.sourceCalls,
+		"classification must stop when its watch-root plan is unresolved")
+}
+
+func TestSyncPathsContextPropagatesStoredHintCancellation(t *testing.T) {
+	database := openTestDB(t)
+	root := t.TempDir()
+	changedPath := filepath.Join(root, "container.db")
+	require.NoError(t, os.WriteFile(changedPath, []byte("fixture"), 0o600))
+	provider := &changedPathFailureProvider{
+		ProviderBase: parser.ProviderBase{
+			Def: parser.AgentDef{Type: "changed-path-failure", FileBased: true},
+			Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+				StoredSourceHints: parser.CapabilitySupported,
+			}},
+		},
+		storedHintScopes: true,
+	}
+	engine := newChangedPathFailureEngine(t, database, root, provider)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	err := engine.SyncPathsContext(ctx, []string{changedPath})
+
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Zero(t, provider.sourceCalls,
+		"provider classification must not run without its requested stored hints")
 }
 
 func TestSyncPathsContextDoesNotTombstoneAfterIncompleteReplacement(t *testing.T) {

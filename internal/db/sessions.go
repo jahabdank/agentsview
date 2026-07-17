@@ -1398,17 +1398,22 @@ func upsertSessionArgs(s Session) []any {
 // Sessions that were permanently deleted (in excluded_sessions)
 // or currently in the trash are rejected.
 func (db *DB) UpsertSession(s Session) error {
-	return db.upsertSession(s, true)
+	_, err := db.upsertSession(s, true)
+	return err
 }
 
 // UpsertSessionPendingContent inserts or updates the session row without
 // reviving a source-missing tombstone. Full content writers call
 // ReviveSourceMissingSession only after every required dependent write lands.
-func (db *DB) UpsertSessionPendingContent(s Session) error {
+// The returned bool reports whether the row was source-missing before the
+// upsert, so callers can replace rather than append its retained content.
+func (db *DB) UpsertSessionPendingContent(s Session) (bool, error) {
 	return db.upsertSession(s, false)
 }
 
-func (db *DB) upsertSession(s Session, reviveSourceMissing bool) error {
+func (db *DB) upsertSession(
+	s Session, reviveSourceMissing bool,
+) (bool, error) {
 	_ = ValidateAndSanitize(&s, nil, nil)
 
 	db.mu.Lock()
@@ -1421,19 +1426,21 @@ func (db *DB) upsertSession(s Session, reviveSourceMissing bool) error {
 		"SELECT 1 FROM excluded_sessions WHERE id = ?", s.ID,
 	).Scan(&excluded)
 	if excluded == 1 {
-		return ErrSessionExcluded
+		return false, ErrSessionExcluded
 	}
 	var deletedAt, deletionCause sql.NullString
 	err := db.getWriter().QueryRow(
 		"SELECT deleted_at, deletion_cause FROM sessions WHERE id = ?", s.ID,
 	).Scan(&deletedAt, &deletionCause)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("checking trash for %s: %w", s.ID, err)
+		return false, fmt.Errorf("checking trash for %s: %w", s.ID, err)
 	}
 	if deletedAt.Valid &&
 		(!deletionCause.Valid || deletionCause.String != deletionCauseSourceMissing) {
-		return ErrSessionTrashed
+		return false, ErrSessionTrashed
 	}
+	sourceMissing := deletionCause.Valid &&
+		deletionCause.String == deletionCauseSourceMissing
 
 	// data_version is intentionally NOT advanced here. The
 	// caller must call SetSessionDataVersion only after the
@@ -1448,9 +1455,9 @@ func (db *DB) upsertSession(s Session, reviveSourceMissing bool) error {
 	}
 	_, err = db.getWriter().Exec(query, upsertSessionArgs(s)...)
 	if err != nil {
-		return fmt.Errorf("upserting session %s: %w", s.ID, err)
+		return false, fmt.Errorf("upserting session %s: %w", s.ID, err)
 	}
-	return nil
+	return sourceMissing, nil
 }
 
 // ReviveSourceMissingSession makes a watcher-tombstoned session visible after
@@ -2576,6 +2583,21 @@ func (db *DB) ListStoredSourcePathHints(
 	agent string,
 	scopes []StoredSourcePathHintScope,
 ) ([]string, error) {
+	return db.ListStoredSourcePathHintsContext(
+		context.Background(), agent, scopes,
+	)
+}
+
+// ListStoredSourcePathHintsContext is ListStoredSourcePathHints with
+// caller-controlled cancellation for watcher classification.
+func (db *DB) ListStoredSourcePathHintsContext(
+	ctx context.Context,
+	agent string,
+	scopes []StoredSourcePathHintScope,
+) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if agent == "" {
 		return nil, nil
 	}
@@ -2590,7 +2612,7 @@ func (db *DB) ListStoredSourcePathHints(
 		end := min(start+storedSourcePathHintRootBatchSize, len(scopes))
 		batch := scopes[start:end]
 		query, args := storedSourcePathHintQuery(agent, batch)
-		rows, err := db.getReader().Query(query, args...)
+		rows, err := db.getReader().QueryContext(ctx, query, args...)
 		if err != nil {
 			return nil, fmt.Errorf("listing stored source path hints: %w", err)
 		}

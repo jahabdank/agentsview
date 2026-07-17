@@ -32,6 +32,24 @@ func openTestDB(t *testing.T) *db.DB {
 	return dbtest.OpenTestDB(t)
 }
 
+func requireClassifyPaths(
+	t *testing.T, engine *Engine, paths []string,
+) []parser.DiscoveredFile {
+	t.Helper()
+	files, err := engine.classifyPaths(t.Context(), paths)
+	require.NoError(t, err)
+	return files
+}
+
+func requireClassifyProviderChangedPath(
+	t *testing.T, engine *Engine, path string,
+) []parser.DiscoveredFile {
+	t.Helper()
+	files, err := engine.classifyProviderChangedPath(t.Context(), path)
+	require.NoError(t, err)
+	return files
+}
+
 func TestClaudeIDFreshnessRejectsSourceMissingTombstone(t *testing.T) {
 	database := openTestDB(t)
 	root := t.TempDir()
@@ -116,7 +134,7 @@ func TestClassifyProviderChangedPathWatchRootPlanCached(t *testing.T) {
 
 	for i := range 1000 {
 		path := filepath.Join(root, "archive", fmt.Sprintf("session-%04d.jsonl", i))
-		assert.Empty(t, engine.classifyProviderChangedPath(path))
+		assert.Empty(t, requireClassifyProviderChangedPath(t, engine, path))
 	}
 
 	assert.Equal(t, int32(1), watchRootsCalls.Load(),
@@ -1420,6 +1438,98 @@ func TestReconcileWatchRootsPartialProviderOutcomesCannotAcknowledgeComplete(t *
 	}
 }
 
+func TestReconcileWatchRootsCwdFilteredZeroResultRevokesDeletionProof(t *testing.T) {
+	const agent parser.AgentType = "cwd-filtered-zero-result"
+	const sessionID = "outside-session"
+	database := openTestDB(t)
+	root := t.TempDir()
+	path := filepath.Join(root, "outside.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte("{}\n"), 0o600))
+	source := parser.SourceRef{
+		Provider: agent, Key: path, DisplayPath: path, FingerprintKey: path,
+	}
+	started := time.Unix(1704067200, 0)
+	provider := &directStreamingProvider{
+		ProviderBase: parser.ProviderBase{
+			Def: parser.AgentDef{Type: agent, FileBased: true},
+			Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+				DiscoverSources:    parser.CapabilitySupported,
+				StreamingDiscovery: parser.CapabilitySupported,
+				WatchSources:       parser.CapabilitySupported,
+				FindSource:         parser.CapabilitySupported,
+			}},
+		},
+		source: &source,
+		parseOutcome: parser.ParseOutcome{
+			Results: []parser.ParseResultOutcome{{
+				Result: parser.ParseResult{Session: parser.ParsedSession{
+					ID: sessionID, Agent: agent, Project: "outside", Machine: "local",
+					Cwd: "/workspace/personal", StartedAt: started, EndedAt: started,
+					File: parser.FileInfo{Path: path},
+				}},
+				DataVersion: parser.DataVersionCurrent,
+			}},
+			ResultSetComplete: true,
+		},
+	}
+	newEngine := func(includeCwdPrefixes []string) *Engine {
+		return NewEngine(database, EngineConfig{
+			AgentDirs:          map[parser.AgentType][]string{agent: {root}},
+			Machine:            "local",
+			IncludeCwdPrefixes: includeCwdPrefixes,
+			ProviderFactories: []parser.ProviderFactory{
+				directStreamingFactory{provider: provider},
+			},
+			ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+				agent: parser.ProviderMigrationProviderAuthoritative,
+			},
+		})
+	}
+
+	engine := newEngine(nil)
+	t.Cleanup(engine.Close)
+	require.NoError(t, engine.ReconcileWatchRootsAfterLostEvents(
+		t.Context(), []string{root}, false,
+	))
+	engine.Close()
+	active, err := database.GetSession(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, active, "initial reconciliation must archive the session")
+	ownership, err := database.ListActiveSessionSourceOwnershipPage(
+		t.Context(), "local", string(agent), root, db.SessionSourceCursor{},
+	)
+	require.NoError(t, err)
+	require.Len(t, ownership, 1,
+		"initial reconciliation must establish deletion proof")
+
+	provider.parseOutcome = parser.ParseOutcome{
+		ResultSetComplete: true,
+		ForceReplace:      true,
+		SkipReason:        parser.SkipNoSession,
+	}
+	engine = newEngine([]string{"/workspace/work"})
+	t.Cleanup(engine.Close)
+	require.NoError(t, engine.ReconcileWatchRootsAfterLostEvents(
+		t.Context(), []string{root}, false,
+	))
+	ownership, err = database.ListActiveSessionSourceOwnershipPage(
+		t.Context(), "local", string(agent), root, db.SessionSourceCursor{},
+	)
+	require.NoError(t, err)
+	assert.Empty(t, ownership,
+		"a CWD-rejected zero-result source must lose deletion proof")
+
+	require.NoError(t, os.Remove(path))
+	provider.source = nil
+	require.NoError(t, engine.ReconcileWatchRootsAfterLostEvents(
+		t.Context(), []string{root}, false,
+	))
+	active, err = database.GetSession(t.Context(), sessionID)
+	require.NoError(t, err)
+	assert.NotNil(t, active,
+		"removing the filtered source must preserve the archived session")
+}
+
 func TestReconcileWatchRootsArchiveWriteFailureCannotAcknowledgeComplete(t *testing.T) {
 	database := openTestDB(t)
 	root := t.TempDir()
@@ -2225,6 +2335,11 @@ func TestReconcileWatchRootsRevivesRecreatedSourceMissingSession(t *testing.T) {
 	require.NotNil(t, active, "same source must become visible after recreation")
 	require.NotNil(t, active.FirstMessage)
 	assert.Equal(t, "recreated", *active.FirstMessage)
+	messages, err := fx.db.GetAllMessages(t.Context(), "session")
+	require.NoError(t, err)
+	require.Len(t, messages, 1)
+	assert.Equal(t, "recreated", messages[0].Content,
+		"revival must replace message rows left by the deleted source")
 }
 
 func TestReconcileWatchRootsPreservesHistoricalRowsUntilExactSourceObserved(
@@ -6866,7 +6981,7 @@ func TestEngine_ClassifyOnePathClaudeStatPermissionErrorStillClassifies(
 	// the provider's changed-path handling rather than the legacy
 	// classifyOnePath Claude block. A transient stat-permission error
 	// must still classify the path by shape so the change is not dropped.
-	files := engine.classifyPaths([]string{path})
+	files := requireClassifyPaths(t, engine, []string{path})
 	require.Len(t, files, 1, "expected path to classify despite stat permission error")
 	assert.Equal(t, path, files[0].Path)
 	assert.Equal(t, parser.AgentClaude, files[0].Agent)
@@ -6903,7 +7018,7 @@ func TestEngine_ClassifyPathsDedupesOpenCodeChildPaths(t *testing.T) {
 		require.NoError(t, os.WriteFile(path, []byte(content), 0o644), "WriteFile(%q)", path)
 	}
 
-	files := engine.classifyPaths([]string{
+	files := requireClassifyPaths(t, engine, []string{
 		messagePath,
 		partPath,
 	})
@@ -6942,7 +7057,7 @@ func TestEngine_ClassifyPathsOpenCodeRemovedMessageDir(
 	messageDir := filepath.Dir(messagePath)
 	require.NoError(t, os.RemoveAll(messageDir), "RemoveAll(%q)", messageDir)
 
-	files := engine.classifyPaths([]string{messageDir})
+	files := requireClassifyPaths(t, engine, []string{messageDir})
 	require.Len(t, files, 1)
 	assert.Equal(t, sessionPath, files[0].Path)
 }
@@ -6970,7 +7085,7 @@ func TestEngine_ClassifyPathsOpenCodeSQLiteWALFile(
 	require.NoError(t, err, "Stat(%q)", walPath)
 	require.Greater(t, walInfo.Size(), int64(32), "WAL must contain transaction frames")
 
-	files := engine.classifyPaths([]string{walPath})
+	files := requireClassifyPaths(t, engine, []string{walPath})
 	require.Len(t, files, 1)
 	assert.Equal(t,
 		parser.OpenCodeSQLiteVirtualPath(dbPath, "ses_wal"),
@@ -7060,7 +7175,7 @@ func TestEngine_ClassifyPathsOpenCodeRemovedMessageFile(
 
 	require.NoError(t, os.Remove(messagePath), "Remove(%q)", messagePath)
 
-	files := engine.classifyPaths([]string{messagePath})
+	files := requireClassifyPaths(t, engine, []string{messagePath})
 	require.Len(t, files, 1)
 	assert.Equal(t, sessionPath, files[0].Path)
 }
@@ -7111,7 +7226,7 @@ func TestEngine_ClassifyPathsOpenCodeFamilyRemovedSessionFile(
 			)
 			require.NoError(t, os.Remove(sessionPath), "Remove(%q)", sessionPath)
 
-			files := engine.classifyPaths([]string{sessionPath})
+			files := requireClassifyPaths(t, engine, []string{sessionPath})
 			assert.Empty(t, files)
 		})
 	}
@@ -7154,7 +7269,7 @@ func TestEngine_ClassifyPathsProviderRemoveKeepsDeletedSQLiteSources(
 			dbPath := tt.path(root)
 			require.NoFileExists(t, dbPath)
 
-			files := engine.classifyPaths([]string{dbPath})
+			files := requireClassifyPaths(t, engine, []string{dbPath})
 			require.Len(t, files, 1)
 			assert.Equal(t, dbPath, files[0].Path)
 			assert.Equal(t, tt.agent, files[0].Agent)
@@ -7248,7 +7363,7 @@ func TestEngine_ClassifyPathsOpenCodeRemovedPartDir(
 	partDir := filepath.Dir(partPath)
 	require.NoError(t, os.RemoveAll(partDir), "RemoveAll(%q)", partDir)
 
-	files := engine.classifyPaths([]string{partDir})
+	files := requireClassifyPaths(t, engine, []string{partDir})
 	require.Len(t, files, 1)
 	assert.Equal(t, sessionPath, files[0].Path)
 }
@@ -7288,7 +7403,7 @@ func TestEngine_ClassifyPathsOpenCodeRemovedPartFile(
 
 	require.NoError(t, os.Remove(partPath), "Remove(%q)", partPath)
 
-	files := engine.classifyPaths([]string{partPath})
+	files := requireClassifyPaths(t, engine, []string{partPath})
 	require.Len(t, files, 1)
 	assert.Equal(t, sessionPath, files[0].Path)
 }
@@ -7329,14 +7444,14 @@ func TestEngine_ClassifyPathsQwenPawRejectsColon(t *testing.T) {
 	colonSubdir := write("default", "sessions", "sub:bad", "ok.json")
 	colonStem := write("default", "sessions", "foo:bar.json")
 
-	files := engine.classifyPaths([]string{rootPath, subPath})
+	files := requireClassifyPaths(t, engine, []string{rootPath, subPath})
 	require.Len(t, files, 2)
 	for _, f := range files {
 		assert.Equal(t, parser.AgentQwenPaw, f.Agent)
 		assert.Equal(t, "default", f.Project)
 	}
 
-	got := engine.classifyPaths([]string{
+	got := requireClassifyPaths(t, engine, []string{
 		colonWorkspace, colonSubdir, colonStem,
 	})
 	assert.Empty(t, got,
@@ -7360,7 +7475,7 @@ func TestEngine_ClassifyPathsQwenSession(t *testing.T) {
 	sessionPath := filepath.Join(chatsDir, sessionID+".jsonl")
 	require.NoError(t, os.WriteFile(sessionPath, []byte("{}\n"), 0o644), "WriteFile(%q)", sessionPath)
 
-	files := engine.classifyPaths([]string{sessionPath})
+	files := requireClassifyPaths(t, engine, []string{sessionPath})
 	require.Len(t, files, 1, "len(files) = %d, want 1 (%v)", len(files), files)
 	assert.Equal(t, sessionPath, files[0].Path)
 	assert.Equal(t, parser.AgentQwen, files[0].Agent)
@@ -7380,7 +7495,7 @@ func TestEngine_ClassifyPathsQwenSession(t *testing.T) {
 		require.NoError(t, os.MkdirAll(filepath.Dir(p), 0o755), "MkdirAll(%q)", p)
 		require.NoError(t, os.WriteFile(p, []byte("{}"), 0o644), "WriteFile(%q)", p)
 	}
-	got := engine.classifyPaths(bogus)
+	got := requireClassifyPaths(t, engine, bogus)
 	assert.Empty(t, got, "expected no Qwen classifications for %v, got %v", bogus, got)
 }
 
@@ -7398,7 +7513,7 @@ func TestEngine_ClassifyPathsDeepSeekTUISession(t *testing.T) {
 	sessionPath := filepath.Join(deepSeekDir, sessionID+".json")
 	dbtest.WriteTestFile(t, sessionPath, []byte("{}"))
 
-	files := engine.classifyPaths([]string{sessionPath})
+	files := requireClassifyPaths(t, engine, []string{sessionPath})
 	require.Len(t, files, 1, "len(files) = %d, want 1 (%v)", len(files), files)
 	assert.Equal(t, sessionPath, files[0].Path)
 	assert.Equal(t, parser.AgentDeepSeekTUI, files[0].Agent)
@@ -7417,7 +7532,7 @@ func TestEngine_ClassifyPathsDeepSeekTUISession(t *testing.T) {
 		require.NoError(t, os.MkdirAll(filepath.Dir(p), 0o755), "MkdirAll(%q)", p)
 		dbtest.WriteTestFile(t, p, []byte("{}"))
 	}
-	got := engine.classifyPaths(bogus)
+	got := requireClassifyPaths(t, engine, bogus)
 	assert.Empty(t, got, "expected no DeepSeek TUI classifications for %v, got %v", bogus, got)
 }
 
@@ -7437,7 +7552,7 @@ func TestEngine_ClassifyPathsCommandCodeSession(t *testing.T) {
 	sessionPath := filepath.Join(projectDir, sessionID+".jsonl")
 	dbtest.WriteTestFile(t, sessionPath, []byte("{}\n"))
 
-	files := engine.classifyPaths([]string{sessionPath})
+	files := requireClassifyPaths(t, engine, []string{sessionPath})
 	require.Len(t, files, 1, "len(files) = %d, want 1 (%v)", len(files), files)
 	assert.Equal(t, sessionPath, files[0].Path)
 	assert.Equal(t, parser.AgentCommandCode, files[0].Agent)
@@ -7458,12 +7573,12 @@ func TestEngine_ClassifyPathsCommandCodeSession(t *testing.T) {
 		require.NoError(t, os.MkdirAll(filepath.Dir(p), 0o755), "MkdirAll(%q)", p)
 		dbtest.WriteTestFile(t, p, []byte("{}"))
 	}
-	got := engine.classifyPaths(bogus)
+	got := requireClassifyPaths(t, engine, bogus)
 	assert.Empty(t, got, "expected no Command Code classifications for %v, got %v", bogus, got)
 
 	metaPath := filepath.Join(projectDir, sessionID+".meta.json")
 	dbtest.WriteTestFile(t, metaPath, []byte("{}"))
-	files = engine.classifyPaths([]string{metaPath})
+	files = requireClassifyPaths(t, engine, []string{metaPath})
 	require.Len(t, files, 1, "len(files) = %d, want 1 (%v)", len(files), files)
 	assert.Equal(t, sessionPath, files[0].Path)
 	assert.Equal(t, parser.AgentCommandCode, files[0].Agent)
@@ -7485,7 +7600,7 @@ func TestEngine_ClassifyPathsQClawSession(t *testing.T) {
 	sessionPath := filepath.Join(sessionsDir, sessionID+".jsonl")
 	dbtest.WriteTestFile(t, sessionPath, []byte("{}\n"))
 
-	files := engine.classifyPaths([]string{sessionPath})
+	files := requireClassifyPaths(t, engine, []string{sessionPath})
 	require.Len(t, files, 1, "len(files) = %d, want 1 (%v)", len(files), files)
 	assert.Equal(t, sessionPath, files[0].Path)
 	assert.Equal(t, parser.AgentQClaw, files[0].Agent)
@@ -7499,7 +7614,7 @@ func TestEngine_ClassifyPathsQClawSession(t *testing.T) {
 	for _, p := range bogus {
 		dbtest.WriteTestFile(t, p, []byte("{}"))
 	}
-	got := engine.classifyPaths(bogus)
+	got := requireClassifyPaths(t, engine, bogus)
 	assert.Empty(t, got, "expected no QClaw classifications for %v, got %v", bogus, got)
 }
 
@@ -7525,11 +7640,11 @@ func TestEngine_ClassifyPathsQClawArchivedSession(t *testing.T) {
 	dbtest.WriteTestFile(t, active, []byte("{}\n"))
 	dbtest.WriteTestFile(t, archived, []byte("{}\n"))
 
-	got := engine.classifyPaths([]string{archived})
+	got := requireClassifyPaths(t, engine, []string{archived})
 	require.Empty(t, got, "expected archived file shadowed by active to be ignored, got %v", got)
 
 	require.NoError(t, os.Remove(active), "Remove(%q)", active)
-	files := engine.classifyPaths([]string{archived})
+	files := requireClassifyPaths(t, engine, []string{archived})
 	require.Len(t, files, 1, "len(files) = %d, want 1 (%v)", len(files), files)
 	assert.Equal(t, archived, files[0].Path)
 	assert.Equal(t, parser.AgentQClaw, files[0].Agent)
@@ -7552,7 +7667,7 @@ func TestEngine_ClassifyOnePathReasonixProjectBareMeta(t *testing.T) {
 	dbtest.WriteTestFile(t, sessionPath, []byte(`{"role":"user","content":"hi"}`))
 	dbtest.WriteTestFile(t, metaPath, []byte(`{"model":"claude"}`))
 
-	files := engine.classifyPaths([]string{metaPath})
+	files := requireClassifyPaths(t, engine, []string{metaPath})
 	require.Len(t, files, 1, "expected Reasonix sidecar to classify")
 	assert.Equal(t, sessionPath, files[0].Path)
 	assert.Equal(t, "proj", files[0].Project)
@@ -7575,7 +7690,7 @@ func TestEngine_ClassifyOnePathReasonixDeletedMeta(t *testing.T) {
 	metaPath := sessionPath + ".meta"
 	dbtest.WriteTestFile(t, sessionPath, []byte(`{"role":"user","content":"hi"}`))
 
-	files := engine.classifyPaths([]string{metaPath})
+	files := requireClassifyPaths(t, engine, []string{metaPath})
 	require.Len(t, files, 1, "expected deleted Reasonix sidecar to classify")
 	assert.Equal(t, sessionPath, files[0].Path)
 	assert.Equal(t, "proj", files[0].Project)
@@ -7596,7 +7711,7 @@ func TestEngine_ClassifyOnePathReasonixDeletedTranscriptIgnored(t *testing.T) {
 		reasonixDir, "projects", "proj", "sessions", "session-123.jsonl",
 	)
 
-	files := engine.classifyPaths([]string{sessionPath})
+	files := requireClassifyPaths(t, engine, []string{sessionPath})
 	assert.Empty(t, files, "expected deleted Reasonix transcript to be ignored")
 }
 
@@ -8456,7 +8571,7 @@ func TestEngine_ClassifyPathsProviderRemoveSkipsMissingGeminiSource(
 	dbtest.WriteTestFile(t, sessionPath, []byte("{}"))
 	require.NoError(t, os.Remove(sessionPath), "Remove(%q)", sessionPath)
 
-	files := engine.classifyPaths([]string{sessionPath})
+	files := requireClassifyPaths(t, engine, []string{sessionPath})
 	assert.Empty(t, files)
 }
 
@@ -8483,7 +8598,7 @@ func TestEngine_ClassifyPathsProviderSidecarKeepsExistingGeminiSources(
 	)
 	dbtest.WriteTestFile(t, sessionPath, []byte("{}"))
 
-	files := engine.classifyPaths([]string{projectsPath})
+	files := requireClassifyPaths(t, engine, []string{projectsPath})
 	require.Len(t, files, 1)
 	assert.Equal(t, sessionPath, files[0].Path)
 	assert.Equal(t, parser.AgentGemini, files[0].Agent)

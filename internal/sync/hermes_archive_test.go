@@ -384,6 +384,49 @@ func TestReconcileHermesDefaultSessionsRootTombstonesRemovedStateMember(t *testi
 		"authoritative reconciliation must tombstone a removed state.db member")
 }
 
+func TestReconcileHermesRelativeSessionsRootTombstonesRemovedStateMember(
+	t *testing.T,
+) {
+	root := t.TempDir()
+	stateDB := writeHermesArchiveStateDB(t, root)
+	sessionsDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.MkdirAll(sessionsDir, 0o755))
+	workingDir, err := os.Getwd()
+	require.NoError(t, err)
+	relativeSessionsDir, err := filepath.Rel(workingDir, sessionsDir)
+	require.NoError(t, err)
+	require.False(t, filepath.IsAbs(relativeSessionsDir))
+
+	database := dbtest.OpenTestDB(t)
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentHermes: {relativeSessionsDir},
+		},
+		Machine: "local",
+	})
+	t.Cleanup(engine.Close)
+	require.NoError(t, engine.ReconcileWatchRootsAfterLostEvents(
+		t.Context(), []string{sessionsDir}, false,
+	))
+	stored, err := database.GetSession(t.Context(), "hermes:child")
+	require.NoError(t, err)
+	require.NotNil(t, stored, "initial reconciliation must store the state member")
+
+	conn, err := sql.Open("sqlite3", stateDB)
+	require.NoError(t, err)
+	_, err = conn.ExecContext(t.Context(), "DELETE FROM sessions WHERE id = 'child'")
+	require.NoError(t, err)
+	require.NoError(t, conn.Close())
+
+	require.NoError(t, engine.ReconcileWatchRootsAfterLostEvents(
+		t.Context(), []string{sessionsDir}, false,
+	))
+	stored, err = database.GetSession(t.Context(), "hermes:child")
+	require.NoError(t, err)
+	assert.Nil(t, stored,
+		"absolute reconciliation scope must cover a configured relative root")
+}
+
 func TestReconcileHermesDefaultSessionsRootPreservesMissingStateDBArchive(t *testing.T) {
 	root := t.TempDir()
 	stateDB := writeHermesArchiveStateDB(t, root)

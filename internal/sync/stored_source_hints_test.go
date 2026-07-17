@@ -101,7 +101,7 @@ func TestClassifyProviderChangedPathSchedulesStoredSourceHintsByCapability(t *te
 				},
 			}
 
-			files := engine.classifyProviderChangedPath(changedPath)
+			files := requireClassifyProviderChangedPath(t, engine, changedPath)
 
 			require.Len(t, files, 1)
 			require.Len(t, seen, 1)
@@ -137,15 +137,17 @@ func TestClassifyStoredHintProviderChangedPathAllocationsStayBoundedByContainer(
 				parser.AgentWindsurf: parser.ProviderMigrationProviderAuthoritative,
 			},
 		}
-		warm := engine.classifyProviderChangedPath(path)
+		warm := requireClassifyProviderChangedPath(t, engine, path)
 		require.Len(t, warm, 1)
 		assert.Equal(t, path+"#live", warm[0].Path)
 		assert.Equal(t, parser.AgentWindsurf, warm[0].Agent)
 
 		var got []parser.DiscoveredFile
+		var classifyErr error
 		allocs := testing.AllocsPerRun(5, func() {
-			got = engine.classifyProviderChangedPath(path)
+			got, classifyErr = engine.classifyProviderChangedPath(t.Context(), path)
 		})
+		require.NoError(t, classifyErr)
 		require.Len(t, got, 1)
 		assert.Equal(t, path+"#live", got[0].Path)
 		assert.Equal(t, parser.AgentWindsurf, got[0].Agent)
@@ -268,7 +270,7 @@ func TestClassifyProviderChangedPathPreservesHintDependentTombstones(t *testing.
 				},
 			}
 
-			files := engine.classifyProviderChangedPath(changedPath)
+			files := requireClassifyProviderChangedPath(t, engine, changedPath)
 			var tombstone parser.DiscoveredFile
 			for _, file := range files {
 				if file.Path == deletedPath {
