@@ -122,18 +122,6 @@ func TestSyncWorkerRejectsUnknownMode(t *testing.T) {
 	assert.ErrorContains(t, err, "unknown sync-worker mode")
 }
 
-func TestSyncWorkerReportsNotImplementedModes(t *testing.T) {
-	cfg := testConfigWithClaudeFixture(t)
-	for _, mode := range []string{"audit"} {
-		t.Run(mode, func(t *testing.T) {
-			var out bytes.Buffer
-			err := runSyncWorker(cfg, mode, &out)
-			require.Error(t, err)
-			assert.ErrorContains(t, err, "not implemented")
-		})
-	}
-}
-
 func TestSyncWorkerResyncBuildModeBuildsReplacement(t *testing.T) {
 	cfg := testConfigWithClaudeFixture(t)
 	// Seed the archive the worker rebuilds from, then close it so the worker

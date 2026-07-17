@@ -46,6 +46,16 @@ const (
 	recursiveWatchBudget           = 8192
 )
 
+const (
+	// archiveAuditInterval is the daily cadence for the full-archive audit: a
+	// rare safety net for silent watcher event loss now that the unscoped
+	// 15-minute reconcile is gone.
+	archiveAuditInterval = 24 * time.Hour
+	// archiveAuditRetryInitial is the first retry delay after a failed audit. It
+	// doubles on each subsequent failure and is capped at archiveAuditInterval.
+	archiveAuditRetryInitial = time.Hour
+)
+
 func main() {
 	// Turn on the agentsview-test-fixture deny-list before any scan
 	// runs. The secrets package keeps the filter off by default so unit
@@ -351,7 +361,9 @@ func runServe(cfg config.Config, opts serveOptions) {
 			log.Printf("warning: remote_hosts config invalid, skipping periodic remote sync: %v", err)
 			validRemotes = false
 		}
-		go startPeriodicSync(ctx, cfg, engine, database, idleTracker, validRemotes, emitter)
+		go startPeriodicSync(
+			ctx, cfg, engine, database, writeLock, idleTracker, validRemotes, emitter,
+		)
 	}
 
 	identityBackfillEngine := engine
@@ -2039,6 +2051,7 @@ func startPeriodicSync(
 	cfg config.Config,
 	engine *sync.Engine,
 	database *db.DB,
+	lock *writeOwnerLock,
 	idleTracker *server.IdleTracker,
 	validRemotes bool,
 	emitter sync.Emitter,
@@ -2052,6 +2065,12 @@ func startPeriodicSync(
 			}
 		}
 	}
+
+	// The daily archive audit runs on its own cadence in a worker process; it
+	// must never run the archive-scale pass in the daemon. Its own loop keeps the
+	// scheduled reconcile below (Task 5) untouched.
+	go startArchiveAudit(ctx, cfg, engine, database, lock, idleTracker, emitter)
+
 	ticker := time.NewTicker(periodicSyncInterval)
 	defer ticker.Stop()
 	for {
@@ -2066,6 +2085,95 @@ func startPeriodicSync(
 			recomputePendingSessions(engine, database)
 		})
 	}
+}
+
+// startArchiveAudit drives the daily archive audit with retry-and-backoff
+// scheduling. Each attempt runs entirely in a worker process (via
+// runWorkerWritePass) wrapped in idleTracker.Do; a failed attempt is retained
+// and retried with a growing delay rather than falling back in process.
+func startArchiveAudit(
+	ctx context.Context,
+	cfg config.Config,
+	engine *sync.Engine,
+	database *db.DB,
+	lock *writeOwnerLock,
+	idleTracker *server.IdleTracker,
+	emitter sync.Emitter,
+) {
+	runArchiveAuditLoop(
+		ctx,
+		func(ctx context.Context, delay time.Duration) bool {
+			timer := time.NewTimer(delay)
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+				return false
+			case <-timer.C:
+				return true
+			}
+		},
+		func(ctx context.Context) bool {
+			ok := false
+			idleTracker.Do(func() {
+				ok = runArchiveAudit(
+					ctx, cfg, engine, database, lock, emitter,
+				) == nil
+			})
+			return ok
+		},
+	)
+}
+
+// runArchiveAuditLoop waits, runs one audit attempt, then reschedules from the
+// outcome: success returns to the daily interval; failure retries after a delay
+// that doubles each time and caps at archiveAuditInterval. wait blocks for the
+// delay and reports false when the context is done; audit reports whether the
+// attempt succeeded.
+func runArchiveAuditLoop(
+	ctx context.Context,
+	wait func(context.Context, time.Duration) bool,
+	audit func(context.Context) bool,
+) {
+	delay := archiveAuditInterval
+	retry := archiveAuditRetryInitial
+	for {
+		if !wait(ctx, delay) {
+			return
+		}
+		if audit(ctx) {
+			delay = archiveAuditInterval
+			retry = archiveAuditRetryInitial
+			continue
+		}
+		delay = retry
+		log.Printf("archive audit failed; next attempt in %s", retry)
+		retry = min(retry*2, archiveAuditInterval)
+	}
+}
+
+// runArchiveAudit executes one audit attempt: a full sync pass in a worker
+// process via runWorkerWritePass, never in the daemon. It emits "sessions" when
+// the audit changed data (Synced > 0) and returns an error on spawn failure or a
+// ran-and-failed worker so the caller retries with backoff; it never falls back
+// to an in-process pass.
+func runArchiveAudit(
+	ctx context.Context,
+	cfg config.Config,
+	engine *sync.Engine,
+	database *db.DB,
+	lock *writeOwnerLock,
+	emitter sync.Emitter,
+) error {
+	result, err := runWorkerWritePass(
+		ctx, cfg, engine, database, lock, "audit", nil,
+	)
+	if err != nil {
+		return err
+	}
+	if result.Synced > 0 && emitter != nil {
+		emitter.Emit("sessions")
+	}
+	return nil
 }
 
 // scheduledSyncEngine is the reconciliation surface the scheduled pass needs.

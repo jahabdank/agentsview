@@ -97,16 +97,15 @@ func runSyncWorkerContext(
 	emit := func(line workerLine) { _ = enc.Encode(line) }
 	onProgress := func(p sync.Progress) { emit(workerLine{Progress: &p}) }
 	switch mode {
-	case "startup", "sync":
-		// "sync" is the live-archive foreground pass; its body is identical to
-		// "startup" (including the NeedsResync branch for a stale-version
-		// archive). Only the daemon-side orchestration differs: "startup" runs
-		// before the daemon opens the DB, "sync" runs inside a writer handoff.
+	case "startup", "sync", "audit":
+		// "sync" is the live-archive foreground pass and "audit" is the daily
+		// safety-net pass; both share the "startup" body (including the
+		// NeedsResync branch for a stale-version archive). Only the daemon-side
+		// orchestration differs: "startup" runs before the daemon opens the DB,
+		// while "sync" and "audit" run inside a writer handoff.
 		return runSyncWorkerStartup(ctx, cfg, mode, emit, onProgress)
 	case "resync-build":
 		return runSyncWorkerResyncBuild(ctx, cfg, mode, emit, onProgress)
-	case "audit":
-		return fmt.Errorf("sync-worker mode %q not implemented yet", mode)
 	default:
 		return fmt.Errorf("unknown sync-worker mode %q", mode)
 	}
