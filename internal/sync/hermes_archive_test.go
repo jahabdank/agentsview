@@ -387,12 +387,13 @@ func TestReconcileHermesDefaultSessionsRootTombstonesRemovedStateMember(t *testi
 func TestReconcileHermesRelativeSessionsRootTombstonesRemovedStateMember(
 	t *testing.T,
 ) {
-	root := t.TempDir()
+	workingDir := t.TempDir()
+	t.Chdir(workingDir)
+	root := filepath.Join(workingDir, "archive")
+	require.NoError(t, os.MkdirAll(root, 0o755))
 	stateDB := writeHermesArchiveStateDB(t, root)
 	sessionsDir := filepath.Join(root, "sessions")
 	require.NoError(t, os.MkdirAll(sessionsDir, 0o755))
-	workingDir, err := os.Getwd()
-	require.NoError(t, err)
 	relativeSessionsDir, err := filepath.Rel(workingDir, sessionsDir)
 	require.NoError(t, err)
 	require.False(t, filepath.IsAbs(relativeSessionsDir))
