@@ -1301,6 +1301,62 @@ func TestProjectIdentityWriteBatchDiscoversLocalGitRemote(t *testing.T) {
 	assert.Equal(t, "feature/export", observations[0].GitBranch)
 }
 
+func TestProjectIdentityBulkWriteMappingPreservesParserProjectSnapshot(
+	t *testing.T,
+) {
+	database := openTestDB(t)
+	root := t.TempDir()
+	cwd := filepath.Join(root, "feature-login")
+	_, err := database.CreateWorktreeProjectMapping(
+		context.Background(),
+		db.WorktreeProjectMapping{
+			Machine:    "laptop",
+			PathPrefix: root,
+			Project:    "canonical-app",
+			Enabled:    true,
+		},
+	)
+	require.NoError(t, err, "CreateWorktreeProjectMapping")
+
+	e := NewEngine(database, EngineConfig{Machine: "laptop"})
+	written, _, failed, _ := e.writeBatch([]pendingWrite{{
+		sess: parser.ParsedSession{
+			ID:        "mapped-bulk-identity",
+			Project:   "feature_login",
+			Machine:   "laptop",
+			Agent:     parser.AgentCodex,
+			Cwd:       cwd,
+			StartedAt: time.Now(),
+		},
+	}}, syncWriteBulk, true)
+	require.Equal(t, 0, failed, "no session writes may fail")
+	require.Equal(t, 1, written)
+
+	session, err := database.GetSession(
+		context.Background(), "mapped-bulk-identity",
+	)
+	require.NoError(t, err, "GetSession")
+	require.NotNil(t, session)
+	assert.Equal(t, "canonical_app", session.Project)
+
+	observations, err := database.ListProjectIdentityObservations(
+		context.Background(), []string{"canonical_app"},
+	)
+	require.NoError(t, err, "ListProjectIdentityObservations")
+	require.Len(t, observations, 1)
+	assert.Equal(t, "canonical_app", observations[0].Project)
+	assert.Equal(t, cwd, observations[0].RootPath)
+
+	snapshots, err := database.ListSessionProjectIdentitySnapshots(
+		context.Background(),
+	)
+	require.NoError(t, err, "ListSessionProjectIdentitySnapshots")
+	require.Len(t, snapshots, 1)
+	assert.Equal(t, "mapped-bulk-identity", snapshots[0].SessionID)
+	assert.Equal(t, "feature_login", snapshots[0].Project)
+	assert.Equal(t, cwd, snapshots[0].RootPath)
+}
+
 func TestProjectIdentityDiscoversLinkedWorktreeRepositoryContext(t *testing.T) {
 	database := openTestDB(t)
 	mainRoot := filepath.Join(t.TempDir(), "main")

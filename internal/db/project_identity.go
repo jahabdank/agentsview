@@ -725,7 +725,23 @@ func upsertProjectIdentityObservationTx(
 	tx *sql.Tx,
 	obs export.ProjectIdentityObservation,
 ) error {
+	return upsertProjectIdentityObservationWithSnapshotProjectTx(
+		tx, obs, obs.Project,
+	)
+}
+
+func upsertProjectIdentityObservationWithSnapshotProjectTx(
+	tx *sql.Tx,
+	obs export.ProjectIdentityObservation,
+	snapshotProject string,
+) error {
 	normalized, err := normalizeProjectIdentityObservation(obs)
+	if err != nil {
+		return err
+	}
+	snapshot := normalized
+	snapshot.Project = snapshotProject
+	snapshot, err = normalizeProjectIdentityObservation(snapshot)
 	if err != nil {
 		return err
 	}
@@ -743,7 +759,7 @@ func upsertProjectIdentityObservationTx(
 		func(ctx context.Context, query string, args ...any) rowScanner {
 			return tx.QueryRowContext(ctx, query, args...)
 		},
-		normalized,
+		snapshot,
 	); err != nil {
 		return err
 	}

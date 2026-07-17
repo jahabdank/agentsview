@@ -14,14 +14,15 @@ import (
 // complete message set to store, the computed signal values,
 // and the data version to stamp after messages are written.
 type SessionBatchWrite struct {
-	Session             Session
-	Messages            []Message
-	UsageEvents         []UsageEvent
-	IdentityObservation export.ProjectIdentityObservation
-	Signals             SessionSignalUpdate
-	Findings            []SecretFinding
-	DataVersion         int
-	ReplaceMessages     bool
+	Session                 Session
+	Messages                []Message
+	UsageEvents             []UsageEvent
+	IdentityObservation     export.ProjectIdentityObservation
+	IdentitySnapshotProject string
+	Signals                 SessionSignalUpdate
+	Findings                []SecretFinding
+	DataVersion             int
+	ReplaceMessages         bool
 }
 
 // SessionBatchResult summarizes a WriteSessionBatch call.
@@ -340,8 +341,12 @@ func writeOneSessionBatchTx(
 		)
 	}
 	if write.IdentityObservation.Project != "" {
-		if err := upsertProjectIdentityObservationTx(
-			tx, write.IdentityObservation,
+		snapshotProject := write.IdentitySnapshotProject
+		if snapshotProject == "" {
+			snapshotProject = write.IdentityObservation.Project
+		}
+		if err := upsertProjectIdentityObservationWithSnapshotProjectTx(
+			tx, write.IdentityObservation, snapshotProject,
 		); err != nil {
 			return 0, err
 		}

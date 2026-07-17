@@ -1685,7 +1685,7 @@ func TestRemoteGitHubWorktreeProjectWhenPathMissing(t *testing.T) {
 	assertSessionProject(t, env.db, "remote-github-worktree", "sample_service")
 }
 
-func TestSyncEngineAppliesWorktreeProjectMapping(t *testing.T) {
+func TestSyncEngineMappingPreservesParserProjectIdentitySnapshot(t *testing.T) {
 	env := setupSingleAgentTestEnv(t, parser.AgentClaude)
 
 	assert.Equal(t, "local", env.engine.Machine())
@@ -1723,6 +1723,23 @@ func TestSyncEngineAppliesWorktreeProjectMapping(t *testing.T) {
 	assertSessionProject(
 		t, env.db, "mapped-worktree", "canonical_app",
 	)
+
+	observations, err := env.db.ListProjectIdentityObservations(
+		context.Background(), []string{"canonical_app"},
+	)
+	require.NoError(t, err, "ListProjectIdentityObservations")
+	require.Len(t, observations, 1)
+	assert.Equal(t, "canonical_app", observations[0].Project)
+	assert.Equal(t, sessionCwd, observations[0].RootPath)
+
+	snapshots, err := env.db.ListSessionProjectIdentitySnapshots(
+		context.Background(),
+	)
+	require.NoError(t, err, "ListSessionProjectIdentitySnapshots")
+	require.Len(t, snapshots, 1)
+	assert.Equal(t, "mapped-worktree", snapshots[0].SessionID)
+	assert.Equal(t, "feature_login", snapshots[0].Project)
+	assert.Equal(t, sessionCwd, snapshots[0].RootPath)
 }
 
 func TestSyncSingleSessionAppliesWorktreeProjectMapping(t *testing.T) {

@@ -6894,8 +6894,8 @@ func (e *Engine) writeBatch(
 			failedSessions++
 			continue
 		}
-		if err := e.writeProjectIdentityObservation(
-			context.Background(), s,
+		if err := e.writeProjectIdentityObservationWithSnapshotProject(
+			context.Background(), s, pw.sess.Project,
 		); err != nil {
 			log.Printf(
 				"write project identity observation for %s: %v",
@@ -7823,10 +7823,11 @@ func (e *Engine) writeBatchBulk(
 			IdentityObservation: identityObservationOrZero(
 				e.projectIdentityObservation(s),
 			),
-			Signals:         update,
-			Findings:        findings,
-			DataVersion:     dataVersionForWrite(pw),
-			ReplaceMessages: replaceMessages,
+			IdentitySnapshotProject: pw.sess.Project,
+			Signals:                 update,
+			Findings:                findings,
+			DataVersion:             dataVersionForWrite(pw),
+			ReplaceMessages:         replaceMessages,
 		})
 		if pw.sess.File.Path != "" {
 			sources[s.ID] = batchSourceFile{
