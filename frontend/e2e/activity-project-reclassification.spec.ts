@@ -1,4 +1,10 @@
-import { expect, test, type Browser, type Page } from "@playwright/test";
+import {
+  expect,
+  test,
+  type Browser,
+  type Locator,
+  type Page,
+} from "@playwright/test";
 
 const isDuckDBBackend = process.env.AGENTSVIEW_E2E_BACKEND === "duckdb";
 const wrongProject = "wrong_branch_label";
@@ -19,6 +25,16 @@ function projectAction(page: Page) {
   return page.getByRole("button", {
     name: `Reclassify project ${wrongProject}`,
   });
+}
+
+async function tabTo(page: Page, target: Locator, limit = 100): Promise<void> {
+  for (let i = 0; i < limit; i += 1) {
+    await page.keyboard.press("Tab");
+    if (await target.evaluate((element) => element === document.activeElement)) {
+      return;
+    }
+  }
+  throw new Error(`Target was not reached after ${limit} Tab presses`);
 }
 
 async function expectActionOpacity(
@@ -86,17 +102,16 @@ test.describe("Activity project reclassification", () => {
 
     await openFixtureActivity(page);
     const action = projectAction(page);
-    const row = page.locator(".bar-row", { has: action });
 
     await expectActionOpacity(page, "0");
-    await row.hover();
+    await action.hover();
     await expectActionOpacity(page, "1");
 
     await page.mouse.move(0, 0);
-    await action.focus();
+    await tabTo(page, action);
     await expect(action).toBeFocused();
     await expectActionOpacity(page, "1");
-    await action.press("Enter");
+    await page.keyboard.press("Enter");
 
     const dialog = page.getByRole("dialog", { name: "Reclassify project" });
     await expect(dialog).toBeVisible();
@@ -144,13 +159,12 @@ test.describe("Activity project reclassification", () => {
     await page.getByRole("button", { name: "Select machine" }).click();
     await page.getByRole("option", { name: machine, exact: true }).click();
 
-    const mappingList = page.locator(".mapping-list");
-    await expect(mappingList.getByText(targetProject, { exact: true }))
+    await expect(page.getByText(targetProject, { exact: true }))
       .toBeVisible();
-    await expect(mappingList.getByText(broaderPrefix, { exact: true }))
+    await expect(page.getByText(broaderPrefix, { exact: true }))
       .toBeVisible();
     await expect(
-      mappingList.getByText(`Originally shown as ${wrongProject}`, {
+      page.getByText(`Originally shown as ${wrongProject}`, {
         exact: true,
       }),
     ).toBeVisible();
@@ -181,9 +195,10 @@ test.describe("Activity project reclassification", () => {
       "Reclassification is available from the writable archive that syncs this machine's sessions.",
     );
 
-    await action.focus();
+    await tabTo(page, action);
     await expect(action).toBeFocused();
-    await action.press("Enter");
+    await expectActionOpacity(page, "1");
+    await page.keyboard.press("Enter");
 
     await expect(page.getByRole("dialog", { name: "Reclassify project" }))
       .toHaveCount(0);

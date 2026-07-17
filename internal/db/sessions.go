@@ -616,7 +616,9 @@ type SidebarSessionIndexRow struct {
 type SidebarSessionIndex struct {
 	Sessions   []SidebarSessionIndexRow `json:"sessions"`
 	NextCursor string                   `json:"next_cursor,omitempty"`
-	Total      int                      `json:"total"`
+	// Total counts canonical root groups matching the filter. Sessions may
+	// contain additional descendant rows needed to render those groups.
+	Total int `json:"total"`
 }
 
 // buildSessionFilter returns a WHERE clause and args for the
@@ -719,6 +721,20 @@ func (db *DB) GetSidebarSessionIndex(
 	}
 
 	f.Cursor = ""
+	rootFilter := f
+	rootFilter.IncludeChildren = false
+	rootWhere, rootArgs := buildSessionBaseFilter(rootFilter)
+	canonicalRootWhere := buildCanonicalRootWhere(f.IncludeOrphans)
+	var total int
+	countQuery := "SELECT COUNT(*) FROM sessions WHERE " +
+		rootWhere + " AND " + canonicalRootWhere
+	if err := db.getReader().QueryRowContext(
+		ctx, countQuery, rootArgs...,
+	).Scan(&total); err != nil {
+		return SidebarSessionIndex{},
+			fmt.Errorf("counting sidebar roots: %w", err)
+	}
+
 	where, args := buildSessionFilter(f)
 	query := `
 		SELECT
@@ -757,6 +773,7 @@ func (db *DB) GetSidebarSessionIndex(
 
 	index := SidebarSessionIndex{
 		Sessions: []SidebarSessionIndexRow{},
+		Total:    total,
 	}
 	for rows.Next() {
 		var row SidebarSessionIndexRow
@@ -789,8 +806,6 @@ func (db *DB) GetSidebarSessionIndex(
 		return SidebarSessionIndex{},
 			fmt.Errorf("iterating sidebar session index: %w", err)
 	}
-	index.Total = len(index.Sessions)
-
 	return index, nil
 }
 
