@@ -106,6 +106,105 @@ func TestPushMirrorsSessionProjectIdentitySnapshotsByArchiveGeneration(
 	assert.Zero(t, snapshotCount)
 }
 
+func TestFilteredFullSnapshotTombstoneKeepsDifferentProject(t *testing.T) {
+	const (
+		schema          = "agentsview_filtered_snapshot_tombstone_test"
+		keepSessionID   = "snapshot-keep"
+		deleteSessionID = "snapshot-delete"
+		formerProject   = "former_project"
+		currentProject  = "current_project"
+	)
+	pgURL := testPGURL(t)
+	cleanNamedPGSchema(t, pgURL, schema)
+	t.Cleanup(func() { cleanNamedPGSchema(t, pgURL, schema) })
+	ctx := context.Background()
+	local, err := db.Open(filepath.Join(t.TempDir(), "local.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, local.Close()) })
+	for _, sessionID := range []string{keepSessionID, deleteSessionID} {
+		require.NoError(t, local.UpsertSession(db.Session{
+			ID: sessionID, Project: formerProject,
+			Machine: "test-machine", Agent: "codex",
+		}))
+	}
+	archiveID, err := local.GetArchiveID(ctx)
+	require.NoError(t, err)
+	generation, err := local.GetDatabaseID(ctx)
+	require.NoError(t, err)
+
+	unfiltered, err := New(pgURL, schema, local, "test-machine", true, SyncOptions{})
+	require.NoError(t, err)
+	require.NoError(t, unfiltered.EnsureSchema(ctx))
+	require.NoError(t, unfiltered.syncProjectIdentityObservations(ctx, false))
+	_, err = unfiltered.pg.ExecContext(ctx, `
+		INSERT INTO source_session_project_identity_snapshots (
+			source_archive_id, source_database_generation, source_session_id,
+			project, machine, observed_at
+		) VALUES ($1, $2, $3, $4, $5, NOW())`,
+		"other-archive", "other-generation", keepSessionID,
+		currentProject, "other-machine",
+	)
+	require.NoError(t, err)
+	require.NoError(t, unfiltered.Close())
+
+	require.NoError(t, local.UpsertProjectIdentityObservation(ctx,
+		export.ProjectIdentityObservation{
+			SessionID: keepSessionID, Project: currentProject,
+			Machine: "test-machine", RootPath: "/workspace/current",
+			GitRemote:        "https://example.com/current.git",
+			RemoteResolution: export.ProjectResolutionResolved,
+			ObservedAt:       time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC),
+		},
+	))
+	require.NoError(t, local.DeleteSession(deleteSessionID))
+
+	currentOnly, err := New(pgURL, schema, local, "test-machine", true, SyncOptions{
+		Projects: []string{currentProject},
+	})
+	require.NoError(t, err)
+	require.NoError(t, currentOnly.EnsureSchema(ctx))
+	require.NoError(t, currentOnly.syncProjectIdentityObservations(ctx, false))
+	var count int
+	require.NoError(t, currentOnly.pg.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM source_session_project_identity_snapshots
+		WHERE source_archive_id = $1 AND source_database_generation = $2
+		  AND source_session_id = $3 AND project = $4`,
+		archiveID, generation, keepSessionID, currentProject,
+	).Scan(&count))
+	assert.Equal(t, 1, count)
+	require.NoError(t, currentOnly.pg.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM source_session_project_identity_snapshots
+		WHERE source_archive_id = $1 AND source_database_generation = $2
+		  AND source_session_id = $3 AND project = $4`,
+		archiveID, generation, deleteSessionID, formerProject,
+	).Scan(&count))
+	assert.Zero(t, count, "matching former-project tombstone must delete its row")
+	require.NoError(t, currentOnly.Close())
+
+	formerOnly, err := New(pgURL, schema, local, "test-machine", true, SyncOptions{
+		Projects: []string{formerProject},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, formerOnly.Close()) })
+	require.NoError(t, formerOnly.EnsureSchema(ctx))
+	require.NoError(t, formerOnly.syncProjectIdentityObservations(ctx, false))
+	require.NoError(t, formerOnly.pg.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM source_session_project_identity_snapshots
+		WHERE source_archive_id = $1 AND source_database_generation = $2
+		  AND source_session_id = $3 AND project = $4`,
+		archiveID, generation, keepSessionID, currentProject,
+	).Scan(&count))
+	assert.Equal(t, 1, count,
+		"former-project tombstone must preserve a reclassified snapshot")
+	require.NoError(t, formerOnly.pg.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM source_session_project_identity_snapshots
+		WHERE source_archive_id = $1 AND source_database_generation = $2
+		  AND source_session_id = $3 AND project = $4`,
+		"other-archive", "other-generation", keepSessionID, currentProject,
+	).Scan(&count))
+	assert.Equal(t, 1, count, "tombstone must preserve another archive owner")
+}
+
 func TestFilteredThenUnfilteredIdentityPublicationIncludesExcludedProject(
 	t *testing.T,
 ) {

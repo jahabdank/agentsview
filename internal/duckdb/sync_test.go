@@ -1532,6 +1532,78 @@ func TestSyncMirrorsSessionProjectIdentitySnapshotsByArchiveGeneration(
 	)
 }
 
+func TestFilteredFullSnapshotTombstoneKeepsDifferentProject(t *testing.T) {
+	const (
+		keepSessionID   = "snapshot-keep"
+		deleteSessionID = "snapshot-delete"
+		formerProject   = "former_project"
+		currentProject  = "current_project"
+	)
+	ctx := context.Background()
+	local := newLocalDB(t)
+	for _, sessionID := range []string{keepSessionID, deleteSessionID} {
+		require.NoError(t, local.UpsertSession(db.Session{
+			ID: sessionID, Project: formerProject,
+			Machine: "test-machine", Agent: "codex",
+		}))
+	}
+	archiveID, err := local.GetArchiveID(ctx)
+	require.NoError(t, err)
+	generation, err := local.GetDatabaseID(ctx)
+	require.NoError(t, err)
+	target := filepath.Join(t.TempDir(), "snapshot-tombstone.duckdb")
+
+	unfiltered := newTestSync(t, target, local, SyncOptions{})
+	require.NoError(t, unfiltered.EnsureSchema(ctx))
+	require.NoError(t, unfiltered.syncProjectIdentityObservations(ctx, false))
+	_, err = unfiltered.DB().ExecContext(ctx, `
+		INSERT INTO source_session_project_identity_snapshots (
+			source_archive_id, source_database_generation, source_session_id,
+			project, machine, observed_at
+		) VALUES (?, ?, ?, ?, ?, current_timestamp)`,
+		"other-archive", "other-generation", keepSessionID,
+		currentProject, "other-machine",
+	)
+	require.NoError(t, err)
+	require.NoError(t, unfiltered.Close())
+
+	require.NoError(t, local.UpsertProjectIdentityObservation(ctx,
+		export.ProjectIdentityObservation{
+			SessionID: keepSessionID, Project: currentProject,
+			Machine: "test-machine", RootPath: "/workspace/current",
+			GitRemote:        "https://example.com/current.git",
+			RemoteResolution: export.ProjectResolutionResolved,
+			ObservedAt:       time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC),
+		},
+	))
+	require.NoError(t, local.DeleteSession(deleteSessionID))
+
+	currentOnly := newTestSync(t, target, local, SyncOptions{
+		Projects: []string{currentProject},
+	})
+	require.NoError(t, currentOnly.EnsureSchema(ctx))
+	require.NoError(t, currentOnly.syncProjectIdentityObservations(ctx, false))
+	assertDuckDBSnapshotCount(t, currentOnly.DB(),
+		archiveID, generation, keepSessionID, currentProject, 1,
+	)
+	assertDuckDBSnapshotCount(t, currentOnly.DB(),
+		archiveID, generation, deleteSessionID, formerProject, 0,
+	)
+	require.NoError(t, currentOnly.Close())
+
+	formerOnly := newTestSync(t, target, local, SyncOptions{
+		Projects: []string{formerProject},
+	})
+	require.NoError(t, formerOnly.EnsureSchema(ctx))
+	require.NoError(t, formerOnly.syncProjectIdentityObservations(ctx, false))
+	assertDuckDBSnapshotCount(t, formerOnly.DB(),
+		archiveID, generation, keepSessionID, currentProject, 1,
+	)
+	assertDuckDBSnapshotCount(t, formerOnly.DB(),
+		"other-archive", "other-generation", keepSessionID, currentProject, 1,
+	)
+}
+
 func TestSyncPreservesAmbiguousIdentityAlongsideResolvedRemote(t *testing.T) {
 	ctx := context.Background()
 	local := newLocalDB(t)
@@ -2663,6 +2735,23 @@ func assertDuckDBCountWhere(
 		`SELECT COUNT(*) FROM `+table+` WHERE `+where, arg,
 	).Scan(&got))
 	assert.Equal(t, want, got, table)
+}
+
+func assertDuckDBSnapshotCount(
+	t *testing.T,
+	conn *sql.DB,
+	archiveID, generation, sessionID, project string,
+	want int,
+) {
+	t.Helper()
+	var got int
+	require.NoError(t, conn.QueryRow(`
+		SELECT COUNT(*) FROM source_session_project_identity_snapshots
+		WHERE source_archive_id = ? AND source_database_generation = ?
+		  AND source_session_id = ? AND project = ?`,
+		archiveID, generation, sessionID, project,
+	).Scan(&got))
+	assert.Equal(t, want, got, "source_session_project_identity_snapshots")
 }
 
 func TestSyncResultDurationIsSet(t *testing.T) {
