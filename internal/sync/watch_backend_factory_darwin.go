@@ -156,6 +156,7 @@ type darwinWatchBackend struct {
 	streams   map[string]darwinStream
 	logical   map[string]*darwinLogicalRoot
 	shallow   map[string]int
+	ancestors map[string]int
 	roots     atomic.Pointer[darwinRootSnapshot]
 
 	newStream              func(string, func([]fsevents.Event)) (darwinStream, error)
@@ -164,6 +165,9 @@ type darwinWatchBackend struct {
 	stat                   func(string) (os.FileInfo, error)
 	addShallow             func(string) error
 	removeShallow          func(string) error
+	addAncestor            func(string) error
+	removeAncestor         func(string) error
+	vnode                  *vnodeObserver
 	startKqueue            func() error
 	transitions            sync.WaitGroup
 	workerStarted          bool
@@ -254,6 +258,9 @@ func newDarwinWatchBackend(
 	backend.pathIsDirectory = pathIsDirectory
 	backend.addShallow = backend.kqueue.AddShallow
 	backend.removeShallow = backend.kqueue.Remove
+	backend.ancestors = make(map[string]int)
+	backend.addAncestor = backend.observeAncestor
+	backend.removeAncestor = backend.unobserveAncestor
 	backend.startKqueue = backend.kqueue.Start
 	backend.fallbackEvents = make(map[backendEvent]struct{})
 	backend.nativeOpen.Store(true)
@@ -347,7 +354,7 @@ func (b *darwinWatchBackend) RegisterRoots(
 			}
 			continue
 		}
-		if err := b.acquireShallowLocked(ancestor); err != nil {
+		if err := b.acquireAncestorLocked(ancestor); err != nil {
 			delete(b.logical, plan.Path)
 			results[i] = RecursiveWatchResult{Unwatched: 1, Err: err}
 			continue
@@ -533,6 +540,9 @@ func (b *darwinWatchBackend) Stop() {
 			_ = stream.Close()
 		}
 		b.kqueue.Stop()
+		if b.vnode != nil {
+			_ = b.vnode.Close()
+		}
 		b.transitions.Wait()
 		if workerStarted {
 			<-b.lifecycleDone
@@ -826,7 +836,7 @@ func (b *darwinWatchBackend) processLifecycle(checkPending bool) {
 				b.scheduleRetryLocked(state, now)
 				continue
 			}
-			if err := b.acquireShallowLocked(ancestor); err != nil {
+			if err := b.acquireAncestorLocked(ancestor); err != nil {
 				b.reportErrorLocked(fmt.Errorf("cover lost watch root: %w", err))
 				b.requestFallback(darwinFallbackLifecycle)
 				requests = append(requests, darwinReconcileRequest{scopes: state.plan.Scopes})
@@ -953,7 +963,7 @@ func (b *darwinWatchBackend) processLifecycle(checkPending bool) {
 			})
 			b.scheduleRetryLocked(state, now)
 		} else {
-			if err := b.acquireShallowLocked(ancestor); err != nil {
+			if err := b.acquireAncestorLocked(ancestor); err != nil {
 				b.reportErrorLocked(fmt.Errorf("advance watch root: %w", err))
 				b.requestFallback(darwinFallbackLifecycle)
 				requests = append(requests, darwinReconcileRequest{scopes: state.plan.Scopes})
@@ -965,7 +975,7 @@ func (b *darwinWatchBackend) processLifecycle(checkPending bool) {
 			b.schedulePendingRetryLocked(state, now)
 		}
 		if old != "" {
-			_ = b.releaseShallowLocked(old)
+			_ = b.releaseAncestorLocked(old)
 		}
 	}
 	releaseCallback := b.onPollingReleased
@@ -1087,7 +1097,7 @@ func (b *darwinWatchBackend) prepareRuntimeFallback() {
 	b.fallbackPhase.Store(uint32(darwinFallbackCollecting))
 	b.rootTransitions.Inc()
 	b.fallbackStreamCount = len(b.streams)
-	b.fallbackShallowCount = len(b.shallow)
+	b.fallbackShallowCount = len(b.shallow) + len(b.ancestors)
 	var pollRoots []string
 	for _, state := range b.logical {
 		pollRoots = appendWatchScopeRoots(pollRoots, state.plan.Scopes)
@@ -1729,6 +1739,53 @@ func (b *darwinWatchBackend) releaseShallowLocked(path string) error {
 	}
 	delete(b.shallow, path)
 	return b.removeShallow(path)
+}
+
+// observeAncestor lazily creates the single-descriptor vnode observer on the
+// first ancestor add, so daemons with no missing roots hold no kqueue.
+func (b *darwinWatchBackend) observeAncestor(path string) error {
+	if b.vnode == nil {
+		observer, err := newVnodeObserver(b.signalLifecycle)
+		if err != nil {
+			return err
+		}
+		b.vnode = observer
+	}
+	return b.vnode.Add(path)
+}
+
+func (b *darwinWatchBackend) unobserveAncestor(path string) error {
+	if b.vnode == nil {
+		return nil
+	}
+	return b.vnode.Remove(path)
+}
+
+func (b *darwinWatchBackend) acquireAncestorLocked(path string) error {
+	path = filepath.Clean(path)
+	if b.ancestors[path] > 0 {
+		b.ancestors[path]++
+		return nil
+	}
+	if err := b.addAncestor(path); err != nil {
+		return err
+	}
+	b.ancestors[path] = 1
+	return nil
+}
+
+func (b *darwinWatchBackend) releaseAncestorLocked(path string) error {
+	path = filepath.Clean(path)
+	refs := b.ancestors[path]
+	if refs == 0 {
+		return nil
+	}
+	if refs > 1 {
+		b.ancestors[path] = refs - 1
+		return nil
+	}
+	delete(b.ancestors, path)
+	return b.removeAncestor(path)
 }
 
 func (b *darwinWatchBackend) emitReconcile(

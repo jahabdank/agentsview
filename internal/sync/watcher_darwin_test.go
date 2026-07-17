@@ -652,14 +652,18 @@ func newDarwinLifecycleTestWatcher(
 		*trace = append(*trace, "stream-new:"+root)
 		return &recordingDarwinStream{root: root, trace: trace}, nil
 	}
-	backend.addShallow = func(path string) error {
+	addTrace := func(path string) error {
 		*trace = append(*trace, "shallow-add:"+path)
 		return nil
 	}
-	backend.removeShallow = func(path string) error {
+	removeTrace := func(path string) error {
 		*trace = append(*trace, "shallow-remove:"+path)
 		return nil
 	}
+	backend.addShallow = addTrace
+	backend.removeShallow = removeTrace
+	backend.addAncestor = addTrace
+	backend.removeAncestor = removeTrace
 	watcher, err := newWatcherWithBackend(
 		0, 0, func(context.Context, WatchBatch) error { return nil },
 		backend, defaultWatchBatchMaxEntries, defaultWatchBatchMaxPathBytes,
@@ -860,7 +864,7 @@ func TestDarwinWatcherHybridHandoffRetainsWritesFromEveryPhase(t *testing.T) {
 			},
 		}, nil
 	}
-	backend.removeShallow = func(path string) error {
+	backend.removeAncestor = func(path string) error {
 		watcher.eventSink.Add(backendEvent{Path: paths[1], Root: root, Op: backendOpWrite})
 		return nil
 	}
@@ -954,7 +958,7 @@ func TestDarwinWatcherRootDeletionHandoffRetainsWrites(t *testing.T) {
 		filepath.Join(root, "during-ancestor-add.jsonl"),
 		filepath.Join(root, "during-stream-close.jsonl"),
 	}
-	backend.addShallow = func(string) error {
+	backend.addAncestor = func(string) error {
 		watcher.eventSink.Add(backendEvent{Path: paths[0], Root: root, Op: backendOpWrite})
 		return nil
 	}
@@ -983,6 +987,31 @@ func TestDarwinWatcherRootDeletionHandoffRetainsWrites(t *testing.T) {
 	require.True(t, ok)
 	assert.ElementsMatch(t, paths, batch.Paths)
 	assert.Equal(t, []string{ancestor}, batch.ReconcileRoots)
+}
+
+func TestDarwinWatcherMissingRootAncestorAvoidsPerEntryWatch(t *testing.T) {
+	ancestor := t.TempDir()
+	for i := range 50 {
+		require.NoError(t, os.WriteFile(
+			filepath.Join(ancestor, fmt.Sprintf("entry%02d", i)), nil, 0o644))
+	}
+	backend, err := newDarwinWatchBackend(nil, time.Millisecond)
+	require.NoError(t, err)
+	defer backend.Stop()
+	var shallowAdds []string
+	backend.addShallow = func(path string) error {
+		shallowAdds = append(shallowAdds, path)
+		return nil
+	}
+	missing := filepath.Join(ancestor, "provider", "sessions")
+	results := backend.RegisterRoots(
+		[]WatchRoot{{Path: missing, Recursive: true}}, 1024)
+	require.Len(t, results, 1)
+	require.True(t, results[0].MissingRootLifecycleOwned)
+	assert.Empty(t, shallowAdds,
+		"ancestor coverage must not use the per-entry kqueue shallow watch")
+	require.NotNil(t, backend.vnode)
+	assert.Equal(t, 1, backend.vnode.watchedCount())
 }
 
 func TestDarwinWatcherMissingRootRealCreationDeletionRecreation(t *testing.T) {
@@ -1084,14 +1113,14 @@ func TestDarwinWatcherNativeCallbackDoesNotWaitForLifecycleLock(t *testing.T) {
 	require.Equal(t, RecursiveWatchResult{Watched: 1}, results[0])
 	require.NoError(t, os.Remove(root))
 	var lifecycleCalls atomic.Int32
-	backend.addShallow = func(string) error {
+	countCall := func(string) error {
 		lifecycleCalls.Add(1)
 		return nil
 	}
-	backend.removeShallow = func(string) error {
-		lifecycleCalls.Add(1)
-		return nil
-	}
+	backend.addShallow = countCall
+	backend.removeShallow = countCall
+	backend.addAncestor = countCall
+	backend.removeAncestor = countCall
 	backend.newStream = func(string, func([]fsevents.Event)) (darwinStream, error) {
 		lifecycleCalls.Add(1)
 		return &handoffRecordingStream{}, nil
@@ -1675,7 +1704,7 @@ func TestDarwinWatcherStartupFallbackRetainsMissingShallowRootLifecycle(t *testi
 		{Watched: 1},
 		{Watched: 1, MissingRootLifecycleOwned: true},
 	}, results)
-	assert.Equal(t, 1, backend.shallow[parent],
+	assert.Equal(t, 1, backend.ancestors[parent],
 		"startup fallback must retain the missing shallow root's ancestor watch")
 	require.NoError(t, watcher.Start())
 	requireReceiveWithin(t, polling, time.Second)
@@ -2073,13 +2102,13 @@ func TestDarwinWatcherLifecycleFailureFallsBackToPolling(t *testing.T) {
 	backend.retryInitial = time.Millisecond
 	backend.retryMax = 5 * time.Millisecond
 	var attempts atomic.Int32
-	backend.addShallow = func(path string) error {
+	backend.addAncestor = func(path string) error {
 		if path == intermediate && attempts.Add(1) == 1 {
 			return errors.New("descriptor unavailable")
 		}
 		return nil
 	}
-	backend.removeShallow = func(string) error { return nil }
+	backend.removeAncestor = func(string) error { return nil }
 	coverage := make(chan []string, 1)
 	batches := make(chan WatchBatch, 8)
 	watcher, err := newWatcherWithBackendOptions(
@@ -2123,13 +2152,13 @@ func TestDarwinWatcherShallowLifecycleFailureFallbackPollsScope(t *testing.T) {
 	require.NoError(t, err)
 	backend.retryInitial = time.Millisecond
 	backend.retryMax = 5 * time.Millisecond
-	backend.addShallow = func(path string) error {
+	backend.addAncestor = func(path string) error {
 		if path == intermediate {
 			return errors.New("descriptor unavailable")
 		}
 		return nil
 	}
-	backend.removeShallow = func(string) error { return nil }
+	backend.removeAncestor = func(string) error { return nil }
 	coverage := make(chan []string, 1)
 	watcher, err := newWatcherWithBackendOptions(
 		0, 0, func(context.Context, WatchBatch) error { return nil }, backend,
@@ -2267,8 +2296,8 @@ func TestDarwinWatcherPendingLossWinsOverActivationAcknowledgement(t *testing.T)
 	backend, err := newDarwinWatchBackend(nil, 20*time.Millisecond)
 	require.NoError(t, err)
 	backend.lifecycle = darwinBackendRunning
-	backend.addShallow = func(string) error { return nil }
-	backend.removeShallow = func(string) error { return nil }
+	backend.addAncestor = func(string) error { return nil }
+	backend.removeAncestor = func(string) error { return nil }
 	required := make(chan PollingObligation, 1)
 	backend.onPollingRequired = func(obligation PollingObligation) error {
 		required <- obligation
