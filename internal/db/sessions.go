@@ -2473,21 +2473,18 @@ func (db *DB) ReplaceActiveSessionSourceBaselines(
 		return fmt.Errorf("starting source baseline replacement transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	stmt, err := tx.PrepareContext(ctx, `
-		DELETE FROM local_session_source_baselines
-		WHERE machine = ? AND agent = ? AND file_path = ?`)
-	if err != nil {
-		return fmt.Errorf("preparing source baseline removal: %w", err)
-	}
-	defer stmt.Close()
-	for _, source := range candidates {
-		if source.Agent == "" || source.FilePath == "" {
+	for start := 0; start < len(candidates); start += baselinePairChunk {
+		end := min(start+baselinePairChunk, len(candidates))
+		filter, args, ok := buildSourcePairFilter(candidates[start:end])
+		if !ok {
 			continue
 		}
-		if _, err := stmt.ExecContext(
-			ctx, machine, source.Agent, source.FilePath,
+		execArgs := append([]any{machine}, args...)
+		if _, err := tx.ExecContext(ctx, `
+			DELETE FROM local_session_source_baselines
+			WHERE machine = ? AND `+filter, execArgs...,
 		); err != nil {
-			return fmt.Errorf("removing active session source baseline: %w", err)
+			return fmt.Errorf("removing active session source baselines: %w", err)
 		}
 	}
 	if err := baselineActiveSessionSourcePathsTx(
@@ -2501,38 +2498,70 @@ func (db *DB) ReplaceActiveSessionSourceBaselines(
 	return nil
 }
 
+// baselinePairChunk bounds how many (agent, file_path) pairs bind into one
+// set-based baseline statement. Warm no-op reconciliation replays a full
+// discovery page (up to reconciliationPageSize) of unchanged sources every
+// pass, so folding those per-source round trips into a handful of set-based
+// statements keeps the unchanged path from allocating one prepared-statement
+// exec per archived source. The chunk keeps the bind-variable count well under
+// SQLite's default limit regardless of the caller's page size.
+const baselinePairChunk = 200
+
+// buildSourcePairFilter renders a row-value IN clause matching each non-empty
+// (agent, file_path) pair and returns the SQL fragment plus its bind arguments
+// in pair order. It returns ok=false when the batch holds no usable pair.
+func buildSourcePairFilter(sources []SessionSourcePath) (string, []any, bool) {
+	args := make([]any, 0, len(sources)*2)
+	var sb strings.Builder
+	sb.Grow(len("(agent, file_path) IN (VALUES )") + len(sources)*len("(?,?),"))
+	sb.WriteString("(agent, file_path) IN (VALUES ")
+	for _, source := range sources {
+		if source.Agent == "" || source.FilePath == "" {
+			continue
+		}
+		if len(args) > 0 {
+			sb.WriteString(",")
+		}
+		sb.WriteString("(?,?)")
+		args = append(args, source.Agent, source.FilePath)
+	}
+	if len(args) == 0 {
+		return "", nil, false
+	}
+	sb.WriteString(")")
+	return sb.String(), args, true
+}
+
 func baselineActiveSessionSourcePathsTx(
 	ctx context.Context,
 	tx *sql.Tx,
 	machine string,
 	sources []SessionSourcePath,
 ) error {
-	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO local_session_source_baselines
-			(session_id, machine, agent, file_path)
-		SELECT id, machine, agent, file_path
-		FROM sessions
-		WHERE machine = ? AND agent = ? AND file_path = ?
-		  AND file_path IS NOT NULL AND deleted_at IS NULL
-		ON CONFLICT(session_id) DO UPDATE SET
-			machine = excluded.machine,
-			agent = excluded.agent,
-			file_path = excluded.file_path
-		WHERE local_session_source_baselines.machine IS NOT excluded.machine
-		   OR local_session_source_baselines.agent IS NOT excluded.agent
-		   OR local_session_source_baselines.file_path IS NOT excluded.file_path`)
-	if err != nil {
-		return fmt.Errorf("preparing source baseline update: %w", err)
-	}
-	defer stmt.Close()
-	for _, source := range sources {
-		if source.Agent == "" || source.FilePath == "" {
+	for start := 0; start < len(sources); start += baselinePairChunk {
+		end := min(start+baselinePairChunk, len(sources))
+		filter, args, ok := buildSourcePairFilter(sources[start:end])
+		if !ok {
 			continue
 		}
-		if _, err := stmt.ExecContext(
-			ctx, machine, source.Agent, source.FilePath,
+		execArgs := append([]any{machine}, args...)
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO local_session_source_baselines
+				(session_id, machine, agent, file_path)
+			SELECT id, machine, agent, file_path
+			FROM sessions
+			WHERE machine = ? AND `+filter+`
+			  AND file_path IS NOT NULL AND deleted_at IS NULL
+			ON CONFLICT(session_id) DO UPDATE SET
+				machine = excluded.machine,
+				agent = excluded.agent,
+				file_path = excluded.file_path
+			WHERE local_session_source_baselines.machine IS NOT excluded.machine
+			   OR local_session_source_baselines.agent IS NOT excluded.agent
+			   OR local_session_source_baselines.file_path IS NOT excluded.file_path`,
+			execArgs...,
 		); err != nil {
-			return fmt.Errorf("baselining active session source path: %w", err)
+			return fmt.Errorf("baselining active session source paths: %w", err)
 		}
 	}
 	return nil
