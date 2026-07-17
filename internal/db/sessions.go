@@ -2203,6 +2203,10 @@ type StoredSourcePathHintScope struct {
 // live Go memory does not scale with the number of archived sessions.
 const WatchReconcileSourcePageSize = 128
 
+// watchReconcileOwnershipScopeBatchSize bounds the SQL expression and bind
+// parameter count independently of the number of configured provider roots.
+const watchReconcileOwnershipScopeBatchSize = 32
+
 // SessionSourceCursor is the complete keyset cursor for source ownership
 // pages. Agent is retained to prevent accidentally reusing a cursor across
 // independently ordered agent scans.
@@ -2242,8 +2246,23 @@ func (db *DB) ListActiveSessionSourceOwnershipPage(
 	root string,
 	after SessionSourceCursor,
 ) ([]SessionSourceOwnership, error) {
-	root = cleanStoredSourcePathHint(root)
-	if machine == "" || agent == "" || root == "" || root == "." {
+	return db.ListActiveSessionSourceOwnershipScopesPage(
+		ctx, machine, agent, []StoredSourcePathHintScope{{Path: root}}, after,
+	)
+}
+
+// ListActiveSessionSourceOwnershipScopesPage returns one stable keyset page
+// across a provider's bounded physical scopes. Normalization deduplicates
+// repeated declarations before building the query.
+func (db *DB) ListActiveSessionSourceOwnershipScopesPage(
+	ctx context.Context,
+	machine string,
+	agent string,
+	scopes []StoredSourcePathHintScope,
+	after SessionSourceCursor,
+) ([]SessionSourceOwnership, error) {
+	scopes = normalizeStoredSourcePathHintScopes(scopes)
+	if machine == "" || agent == "" || len(scopes) == 0 {
 		return nil, nil
 	}
 	if after.Agent != "" && after.Agent != agent {
@@ -2251,14 +2270,43 @@ func (db *DB) ListActiveSessionSourceOwnershipPage(
 			"source ownership cursor agent %q does not match %q", after.Agent, agent,
 		)
 	}
-	likeRoot := sqliteLikeEscape(root)
-	rootClause := `(b.file_path = ? OR b.file_path LIKE ? ESCAPE '!')`
-	args := []any{
-		machine,
-		agent,
-		root,
-		likeRoot + string(filepath.Separator) + "%",
+	var ownership []SessionSourceOwnership
+	for start := 0; start < len(scopes); start += watchReconcileOwnershipScopeBatchSize {
+		end := min(start+watchReconcileOwnershipScopeBatchSize, len(scopes))
+		page, err := db.listActiveSessionSourceOwnershipScopeBatch(
+			ctx, machine, agent, scopes[start:end], after,
+		)
+		if err != nil {
+			return nil, err
+		}
+		ownership = mergeSessionSourceOwnershipPages(
+			ownership, page, WatchReconcileSourcePageSize,
+		)
 	}
+	return ownership, nil
+}
+
+func (db *DB) listActiveSessionSourceOwnershipScopeBatch(
+	ctx context.Context,
+	machine string,
+	agent string,
+	scopes []StoredSourcePathHintScope,
+	after SessionSourceCursor,
+) ([]SessionSourceOwnership, error) {
+	rootClauses := make([]string, 0, len(scopes))
+	args := []any{machine, agent}
+	for _, scope := range scopes {
+		root := scope.Path
+		likeRoot := sqliteLikeEscape(root)
+		rootClause := `(b.file_path = ? OR b.file_path LIKE ? ESCAPE '!')`
+		args = append(args, root, likeRoot+string(filepath.Separator)+"%")
+		if scope.IncludeVirtualMembers {
+			rootClause = `(` + rootClause + ` OR (b.file_path >= ? AND b.file_path < ?))`
+			args = append(args, root+"#", root+"$")
+		}
+		rootClauses = append(rootClauses, rootClause)
+	}
+	rootClause := `(` + strings.Join(rootClauses, ` OR `) + `)`
 	args = append(args,
 		after.FilePath, after.FilePath, after.ID,
 		WatchReconcileSourcePageSize,
@@ -2297,6 +2345,38 @@ func (db *DB) ListActiveSessionSourceOwnershipPage(
 		return nil, fmt.Errorf("iterating active session source ownership: %w", err)
 	}
 	return ownership, nil
+}
+
+func mergeSessionSourceOwnershipPages(
+	left, right []SessionSourceOwnership,
+	limit int,
+) []SessionSourceOwnership {
+	// Every batch returns its first page after the same cursor. Keeping the
+	// smallest unique limit across those prefixes therefore produces the first
+	// global page without retaining work proportional to the number of scopes.
+	combined := make([]SessionSourceOwnership, 0, min(len(left)+len(right), limit*2))
+	combined = append(combined, left...)
+	combined = append(combined, right...)
+	sort.Slice(combined, func(i, j int) bool {
+		if combined[i].FilePath != combined[j].FilePath {
+			return combined[i].FilePath < combined[j].FilePath
+		}
+		return combined[i].ID < combined[j].ID
+	})
+	merged := combined[:0]
+	for _, item := range combined {
+		if len(merged) > 0 {
+			previous := merged[len(merged)-1]
+			if item.FilePath == previous.FilePath && item.ID == previous.ID {
+				continue
+			}
+		}
+		merged = append(merged, item)
+		if len(merged) == limit {
+			break
+		}
+	}
+	return merged
 }
 
 // BaselineActiveSessionSourcePaths marks exact active local ownerships as

@@ -3313,6 +3313,12 @@ func (e *Engine) tombstoneMissingWatchSourcesForAgentLocked(
 	agentFilter parser.AgentType,
 	spool reconciliationSpoolStore,
 ) (deleted int, retErr error) {
+	if e.pathRewriter != nil {
+		// Remote imports rewrite extraction paths to canonical stored paths in
+		// one direction only. Without a stored-to-local inverse, stat and
+		// provider lookup cannot authoritatively prove source loss.
+		return 0, nil
+	}
 	for agent, dirs := range e.agentDirs {
 		if agentFilter != "" && agent != agentFilter {
 			continue
@@ -3334,13 +3340,20 @@ func (e *Engine) tombstoneMissingWatchSourcesForAgentLocked(
 			}) {
 				continue
 			}
+			ownershipScopes := []parser.StoredSourceHintScope{{Path: root}}
+			if resolver, ok := provider.(parser.ReconciliationOwnershipScopeProvider); ok {
+				if resolved := resolver.ReconciliationOwnershipScopes(root); len(resolved) > 0 {
+					ownershipScopes = resolved
+				}
+			}
 			var cursor db.SessionSourceCursor
 			for {
 				if err := ctx.Err(); err != nil {
 					return deleted, err
 				}
-				page, err := e.db.ListActiveSessionSourceOwnershipPage(
-					ctx, e.machine, string(agent), root, cursor,
+				page, err := e.db.ListActiveSessionSourceOwnershipScopesPage(
+					ctx, e.machine, string(agent),
+					storedSourceDBHintScopes(ownershipScopes), cursor,
 				)
 				if err != nil {
 					return deleted, fmt.Errorf(
@@ -3457,6 +3470,11 @@ func (e *Engine) tombstoneMissingWatchSourcesForAgentLocked(
 							_, _, virtual := parser.ParseVirtualSourcePath(
 								providerDiscoveredPath(source),
 							)
+							if virtual && !allProviderRootsCovered {
+								// A scoped pass cannot prove that the same logical
+								// member did not move to another configured root.
+								continue
+							}
 							if spool == nil || !virtual {
 								continue
 							}

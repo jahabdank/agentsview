@@ -2297,6 +2297,38 @@ func TestReconciliationSourceBaselineUsesStoredPathRewrite(t *testing.T) {
 		"the local candidate must baseline the path form stored by remote sync")
 }
 
+func TestTombstoneMissingWatchSourcesPreservesOneWayRewrittenOwnership(t *testing.T) {
+	database := openTestDB(t)
+	root := t.TempDir()
+	localPath := filepath.Join(root, "source", "session.jsonl")
+	storedPath := filepath.Join(root, "canonical", "session.jsonl")
+	require.NoError(t, database.UpsertSession(db.Session{
+		ID: "remote~session", Project: "project", Machine: "remote",
+		Agent: string(parser.AgentClaude), FilePath: &storedPath,
+	}))
+	require.NoError(t, database.BaselineActiveSessionSourcePaths(
+		t.Context(), "remote", []db.SessionSourcePath{{
+			Agent: string(parser.AgentClaude), FilePath: storedPath,
+		}},
+	))
+	engine := &Engine{
+		db: database, machine: "remote",
+		agentDirs: map[parser.AgentType][]string{parser.AgentClaude: {root}},
+		pathRewriter: func(path string) string {
+			require.Equal(t, localPath, path)
+			return storedPath
+		},
+	}
+
+	deleted, err := engine.tombstoneMissingWatchSources(t.Context(), []string{root})
+	require.NoError(t, err)
+	assert.Zero(t, deleted,
+		"one-way path rewriting cannot authoritatively prove remote source loss")
+	stored, err := database.GetSession(t.Context(), "remote~session")
+	require.NoError(t, err)
+	assert.NotNil(t, stored)
+}
+
 func TestSyncPathsBaselinesPresentSourceBeforeLaterDelete(t *testing.T) {
 	fx := newEngineFixture(t)
 	t.Cleanup(fx.engine.Close)

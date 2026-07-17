@@ -347,12 +347,113 @@ func TestReconcileHermesStateMemberDetectsSameStatTranscriptRewrite(t *testing.T
 	assertMessages("modified prompt", "Done.")
 }
 
+func TestReconcileHermesDefaultSessionsRootTombstonesRemovedStateMember(t *testing.T) {
+	root := t.TempDir()
+	stateDB := writeHermesArchiveStateDB(t, root)
+	sessionsDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.MkdirAll(sessionsDir, 0o755))
+
+	database := dbtest.OpenTestDB(t)
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentHermes: {sessionsDir},
+		},
+		Machine: "local",
+	})
+	t.Cleanup(engine.Close)
+
+	require.NoError(t, engine.ReconcileWatchRootsAfterLostEvents(
+		t.Context(), []string{sessionsDir}, false,
+	))
+	stored, err := database.GetSession(t.Context(), "hermes:child")
+	require.NoError(t, err)
+	require.NotNil(t, stored, "initial reconciliation must store the state member")
+
+	conn, err := sql.Open("sqlite3", stateDB)
+	require.NoError(t, err)
+	_, err = conn.ExecContext(t.Context(), "DELETE FROM sessions WHERE id = 'child'")
+	require.NoError(t, err)
+	require.NoError(t, conn.Close())
+
+	require.NoError(t, engine.ReconcileWatchRootsAfterLostEvents(
+		t.Context(), []string{sessionsDir}, false,
+	))
+	stored, err = database.GetSession(t.Context(), "hermes:child")
+	require.NoError(t, err)
+	assert.Nil(t, stored,
+		"authoritative reconciliation must tombstone a removed state.db member")
+}
+
+func TestReconcileHermesDefaultSessionsRootPreservesMissingStateDBArchive(t *testing.T) {
+	root := t.TempDir()
+	stateDB := writeHermesArchiveStateDB(t, root)
+	sessionsDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.MkdirAll(sessionsDir, 0o755))
+
+	database := dbtest.OpenTestDB(t)
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentHermes: {sessionsDir},
+		},
+		Machine: "local",
+	})
+	t.Cleanup(engine.Close)
+	require.NoError(t, engine.ReconcileWatchRootsAfterLostEvents(
+		t.Context(), []string{sessionsDir}, false,
+	))
+
+	require.NoError(t, os.Remove(stateDB))
+	require.NoError(t, engine.ReconcileWatchRootsAfterLostEvents(
+		t.Context(), []string{sessionsDir}, false,
+	))
+	stored, err := database.GetSession(t.Context(), "hermes:child")
+	require.NoError(t, err)
+	assert.NotNil(t, stored,
+		"a missing persistent state.db cannot prove its archived members were deleted")
+}
+
+func TestReconcileHermesScopedRootPreservesStateMemberMovedToAnotherRoot(t *testing.T) {
+	firstRoot := t.TempDir()
+	secondRoot := t.TempDir()
+	firstStateDB := writeHermesArchiveStateDB(t, firstRoot)
+	firstSessions := filepath.Join(firstRoot, "sessions")
+	secondSessions := filepath.Join(secondRoot, "sessions")
+	require.NoError(t, os.MkdirAll(firstSessions, 0o755))
+	require.NoError(t, os.MkdirAll(secondSessions, 0o755))
+
+	database := dbtest.OpenTestDB(t)
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentHermes: {firstSessions, secondSessions},
+		},
+		Machine: "local",
+	})
+	t.Cleanup(engine.Close)
+	require.NoError(t, engine.ReconcileWatchRootsAfterLostEvents(
+		t.Context(), nil, true,
+	))
+
+	writeHermesArchiveStateDB(t, secondRoot)
+	conn, err := sql.Open("sqlite3", firstStateDB)
+	require.NoError(t, err)
+	_, err = conn.ExecContext(t.Context(), "DELETE FROM sessions WHERE id = 'child'")
+	require.NoError(t, err)
+	require.NoError(t, conn.Close())
+
+	require.NoError(t, engine.ReconcileWatchRootsAfterLostEvents(
+		t.Context(), []string{firstSessions}, false,
+	))
+	stored, err := database.GetSession(t.Context(), "hermes:child")
+	require.NoError(t, err)
+	assert.NotNil(t, stored,
+		"a scoped pass cannot disprove the same virtual member under another root")
+}
+
 func writeHermesArchiveStateDB(t *testing.T, root string) string {
 	t.Helper()
 	stateDB := filepath.Join(root, "state.db")
 	conn, err := sql.Open("sqlite3", stateDB)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = conn.Close() })
 
 	_, err = conn.Exec(`
 		CREATE TABLE sessions (
@@ -413,5 +514,6 @@ func writeHermesArchiveStateDB(t *testing.T, root string) string {
 		);
 	`)
 	require.NoError(t, err)
+	require.NoError(t, conn.Close())
 	return stateDB
 }

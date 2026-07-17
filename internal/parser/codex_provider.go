@@ -325,6 +325,11 @@ func (s codexSourceSet) DiscoverEach(
 			}
 			source, ok := s.sourceRef(root, path, true)
 			if !ok {
+				if _, _, supported := CodexSessionPathInfo(root, path); supported {
+					source, ok = s.directPathSource(root, path, true)
+				}
+			}
+			if !ok {
 				return nil
 			}
 			return yield(source)

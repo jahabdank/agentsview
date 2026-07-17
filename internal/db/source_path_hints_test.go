@@ -251,6 +251,121 @@ func TestListActiveSessionSourceOwnershipPageUsesStableBoundedKeyset(t *testing.
 	}
 }
 
+func TestListActiveSessionSourceOwnershipScopesPagePagesVirtualMembersOnce(t *testing.T) {
+	d := testDB(t)
+	root := t.TempDir()
+	ownedRoot := filepath.Join(root, "z-owned")
+	stateDB := filepath.Join(ownedRoot, "state.db")
+	sessionsDir := filepath.Join(ownedRoot, "sessions")
+	seeds := make([]storedSourcePathSeed, 0, WatchReconcileSourcePageSize+4)
+	for i := range WatchReconcileSourcePageSize + 3 {
+		seeds = append(seeds, storedSourcePathSeed{
+			id:    fmt.Sprintf("hermes:%03d", i),
+			agent: "hermes",
+			path:  fmt.Sprintf("%s#member-%03d", stateDB, i),
+		})
+	}
+	seeds = append(seeds, storedSourcePathSeed{
+		id: "hermes:transcript", agent: "hermes",
+		path: filepath.Join(sessionsDir, "transcript.jsonl"),
+	})
+	unrelated := storedSourcePathSeed{
+		id: "hermes:unrelated", agent: "hermes",
+		path: filepath.Join(root, "other.db") + "#member",
+	}
+	insertSessionsWithSourcePaths(t, d, append(seeds, unrelated))
+	require.NoError(t, d.BaselineActiveSessionSourcePaths(
+		t.Context(), defaultMachine,
+		sourcePathsFromSeeds(append(seeds, unrelated)),
+	))
+
+	scopes := make([]StoredSourcePathHintScope, 0,
+		watchReconcileOwnershipScopeBatchSize+2)
+	for i := range watchReconcileOwnershipScopeBatchSize {
+		scopes = append(scopes, StoredSourcePathHintScope{
+			Path: filepath.Join(root, fmt.Sprintf("a-empty-scope-%02d", i)),
+		})
+	}
+	scopes = append(scopes,
+		StoredSourcePathHintScope{Path: stateDB, IncludeVirtualMembers: true},
+		StoredSourcePathHintScope{Path: sessionsDir},
+	)
+	normalizedScopes := normalizeStoredSourcePathHintScopes(scopes)
+	firstMatchingScope := len(normalizedScopes)
+	for i, scope := range normalizedScopes {
+		if scope.Path == stateDB || scope.Path == sessionsDir {
+			firstMatchingScope = i
+			break
+		}
+	}
+	require.GreaterOrEqual(t, firstMatchingScope,
+		watchReconcileOwnershipScopeBatchSize,
+		"all matching scopes must be outside the first SQL batch")
+	var got []SessionSourceOwnership
+	var cursor SessionSourceCursor
+	pageCount := 0
+	for {
+		page, err := d.ListActiveSessionSourceOwnershipScopesPage(
+			t.Context(), defaultMachine, "hermes", scopes, cursor,
+		)
+		require.NoError(t, err)
+		pageCount++
+		got = append(got, page...)
+		if len(page) < WatchReconcileSourcePageSize {
+			break
+		}
+		cursor = page[len(page)-1].Cursor()
+	}
+
+	require.Len(t, got, len(seeds),
+		"later batches must page each row once and keep sibling containers excluded")
+	assert.GreaterOrEqual(t, pageCount, 2,
+		"later-batch ownership must cross the global keyset page boundary")
+	gotIDs := make(map[string]struct{}, len(got))
+	for _, ownership := range got {
+		gotIDs[ownership.ID] = struct{}{}
+	}
+	for _, seed := range seeds {
+		assert.Contains(t, gotIDs, seed.id)
+	}
+	assert.NotContains(t, gotIDs, unrelated.id)
+}
+
+func TestListActiveSessionSourceOwnershipScopesPageBoundsSQLParameters(t *testing.T) {
+	d := testDB(t)
+	root := t.TempDir()
+	stateDB := filepath.Join(root, "zz-state.db")
+	seed := storedSourcePathSeed{
+		id: "hermes:member", agent: "hermes", path: stateDB + "#member",
+	}
+	insertSessionsWithSourcePaths(t, d, []storedSourcePathSeed{seed})
+	require.NoError(t, d.BaselineActiveSessionSourcePaths(
+		t.Context(), defaultMachine, sourcePathsFromSeeds([]storedSourcePathSeed{seed}),
+	))
+
+	const scopeCount = 8300 // More than 32,766 parameters in the unbatched query.
+	scopes := make([]StoredSourcePathHintScope, 0, scopeCount)
+	for i := range scopeCount - 1 {
+		scopes = append(scopes, StoredSourcePathHintScope{
+			Path:                  filepath.Join(root, fmt.Sprintf("aa-unrelated-%05d.db", i)),
+			IncludeVirtualMembers: true,
+		})
+	}
+	scopes = append(scopes, StoredSourcePathHintScope{
+		Path: stateDB, IncludeVirtualMembers: true,
+	})
+	normalizedScopes := normalizeStoredSourcePathHintScopes(scopes)
+	require.Equal(t, stateDB, normalizedScopes[len(normalizedScopes)-1].Path,
+		"the sole matching scope must remain in the final SQL batch")
+
+	page, err := d.ListActiveSessionSourceOwnershipScopesPage(
+		t.Context(), defaultMachine, "hermes", scopes, SessionSourceCursor{},
+	)
+	require.NoError(t, err)
+	require.Len(t, page, 1)
+	assert.Equal(t, seed.id, page[0].ID)
+}
+
 func TestSourceBaselineRequiresObservedExactSameMachineOwnership(t *testing.T) {
 	d := testDB(t)
 	root := t.TempDir()

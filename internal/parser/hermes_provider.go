@@ -69,6 +69,18 @@ func (p *hermesProvider) SourcesForChangedPath(
 	return p.sources.SourcesForChangedPath(ctx, req)
 }
 
+func (p *hermesProvider) ReconciliationOwnershipScopes(
+	root string,
+) []StoredSourceHintScope {
+	return p.sources.ReconciliationOwnershipScopes(root)
+}
+
+func (p *hermesProvider) SourceForReconciliation(
+	ctx context.Context, path, project string,
+) (SourceRef, bool, error) {
+	return p.sources.SourceForReconciliation(ctx, path, project)
+}
+
 func (p *hermesProvider) FindSource(
 	ctx context.Context,
 	req FindSourceRequest,
@@ -377,6 +389,58 @@ func (s hermesSourceSet) WatchPlan(context.Context) (WatchPlan, error) {
 		roots = append(roots, hermesWatchRoots(root)...)
 	}
 	return WatchPlan{Roots: roots}, nil
+}
+
+func (s hermesSourceSet) ReconciliationOwnershipScopes(
+	requestedRoot string,
+) []StoredSourceHintScope {
+	requestedRoot = filepath.Clean(requestedRoot)
+	var scopes []StoredSourceHintScope
+	for _, configuredRoot := range s.roots {
+		if !hermesPathWithinOrSame(configuredRoot, requestedRoot) {
+			continue
+		}
+		stateDB, sessionsDir, ok := hermesArchiveRootPaths(configuredRoot)
+		if !ok {
+			scopes = append(scopes, StoredSourceHintScope{Path: configuredRoot})
+			continue
+		}
+		if IsRegularFile(stateDB) {
+			scopes = append(scopes, StoredSourceHintScope{
+				Path: stateDB, IncludeVirtualMembers: true,
+			})
+		}
+		scopes = append(scopes, StoredSourceHintScope{Path: sessionsDir})
+	}
+	return scopes
+}
+
+func (s hermesSourceSet) SourceForReconciliation(
+	ctx context.Context, path, project string,
+) (SourceRef, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return SourceRef{}, false, err
+	}
+	for _, root := range s.roots {
+		source, ok := s.sourceForChangedPath(root, path, false)
+		if !ok {
+			continue
+		}
+		if project != "" {
+			source.ProjectHint = project
+		}
+		return source, true, nil
+	}
+	return SourceRef{}, false, nil
+}
+
+func hermesPathWithinOrSame(path, root string) bool {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false
+	}
+	return rel == "." || rel != ".." &&
+		!strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func (s hermesSourceSet) SourcesForChangedPath(

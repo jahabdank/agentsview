@@ -150,6 +150,15 @@ type StoredSourceHintScopeProvider interface {
 	StoredSourceHintScopes(ChangedPathRequest) []StoredSourceHintScope
 }
 
+// ReconciliationOwnershipScopeProvider maps one logical configured root to
+// the bounded stored-source scopes it physically owns. Providers whose stored
+// identities are virtual members of a sibling container use this to keep
+// deletion ownership paging within that container without broadening the scan
+// to the provider's full archive.
+type ReconciliationOwnershipScopeProvider interface {
+	ReconciliationOwnershipScopes(root string) []StoredSourceHintScope
+}
+
 // ProviderBase is embedded by concrete providers to make optional source
 // methods callable with zero-value no-op behavior.
 type ProviderBase struct {
