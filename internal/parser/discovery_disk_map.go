@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/tidwall/gjson"
 )
@@ -29,6 +30,12 @@ type discoveryDiskMapFaults struct {
 }
 
 type discoveryDiskMapFaultsContextKey struct{}
+
+const discoveryDiskMapForEachQuery = `
+	SELECT key, value
+	FROM entries
+	ORDER BY key, ordinal
+`
 
 // WithDiscoveryDiskMapQueryError injects a disk-index query failure for
 // end-to-end reconciliation tests. Production callers never attach this value.
@@ -81,7 +88,21 @@ func newDiscoveryDiskMap() (*discoveryDiskMap, error) {
 		return nil, err
 	}
 	database.SetMaxOpenConns(1)
-	if _, err := database.Exec("CREATE TABLE entries (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID"); err != nil {
+	if _, err := database.Exec(`
+		CREATE TABLE entries (
+			key TEXT NOT NULL,
+			ordinal INTEGER NOT NULL,
+			value TEXT NOT NULL,
+			PRIMARY KEY (key, ordinal)
+		) WITHOUT ROWID;
+		CREATE TRIGGER entries_replace_tail
+		AFTER INSERT ON entries
+		WHEN NEW.ordinal = 0
+		BEGIN
+			DELETE FROM entries
+			WHERE key = NEW.key AND ordinal <> 0;
+		END;
+	`); err != nil {
 		_ = database.Close()
 		_ = os.Remove(path)
 		return nil, err
@@ -105,7 +126,10 @@ func (m *discoveryDiskMap) loadJSONL(
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	stmt, err := tx.PrepareContext(ctx, "INSERT OR REPLACE INTO entries (key, value) VALUES (?, ?)")
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT OR REPLACE INTO entries (key, ordinal, value)
+		VALUES (?, 0, ?)
+	`)
 	if err != nil {
 		return err
 	}
@@ -138,26 +162,53 @@ func (m *discoveryDiskMap) get(
 	if m.queryError != nil {
 		return "", false, m.queryError
 	}
-	var value string
-	err := m.db.QueryRowContext(ctx, "SELECT value FROM entries WHERE key = ?", key).Scan(&value)
-	if err == sql.ErrNoRows {
-		return "", false, nil
-	}
+	rows, err := m.db.QueryContext(ctx, `
+		SELECT value
+		FROM entries
+		WHERE key = ?
+		ORDER BY ordinal
+	`, key)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return "", false, ctxErr
 		}
 		return "", false, fmt.Errorf("read discovery index key: %w", err)
 	}
-	return value, true, nil
+	defer rows.Close()
+	var value strings.Builder
+	found := false
+	for rows.Next() {
+		var part string
+		if err := rows.Scan(&part); err != nil {
+			return "", false, err
+		}
+		if found {
+			value.WriteByte('\n')
+		}
+		value.WriteString(part)
+		found = true
+	}
+	if err := rows.Err(); err != nil {
+		return "", false, err
+	}
+	return value.String(), found, nil
 }
 
 func (m *discoveryDiskMap) put(ctx context.Context, key, value string, replace bool) error {
-	verb := "INSERT OR IGNORE"
 	if replace {
-		verb = "INSERT OR REPLACE"
+		_, err := m.db.ExecContext(
+			ctx,
+			`INSERT OR REPLACE INTO entries (key, ordinal, value)
+			 VALUES (?, 0, ?)`,
+			key,
+			value,
+		)
+		return err
 	}
-	_, err := m.db.ExecContext(ctx, verb+" INTO entries (key, value) VALUES (?, ?)", key, value)
+	_, err := m.db.ExecContext(ctx, `
+		INSERT OR IGNORE INTO entries (key, ordinal, value)
+		VALUES (?, 0, ?)
+	`, key, value)
 	return err
 }
 
@@ -165,7 +216,10 @@ func (m *discoveryDiskMap) putIfAbsent(
 	ctx context.Context, key, value string,
 ) (bool, error) {
 	result, err := m.db.ExecContext(
-		ctx, "INSERT OR IGNORE INTO entries (key, value) VALUES (?, ?)", key, value,
+		ctx, `
+			INSERT OR IGNORE INTO entries (key, ordinal, value)
+			VALUES (?, 0, ?)
+		`, key, value,
 	)
 	if err != nil {
 		return false, err
@@ -176,9 +230,19 @@ func (m *discoveryDiskMap) putIfAbsent(
 
 func (m *discoveryDiskMap) append(ctx context.Context, key, value string) error {
 	_, err := m.db.ExecContext(ctx, `
-		INSERT INTO entries (key, value) VALUES (?, ?)
-		ON CONFLICT(key) DO UPDATE SET value = entries.value || char(10) || excluded.value
-	`, key, value)
+		INSERT INTO entries (key, ordinal, value)
+		VALUES (
+			?,
+			COALESCE((
+				SELECT ordinal + 1
+				FROM entries
+				WHERE key = ?
+				ORDER BY ordinal DESC
+				LIMIT 1
+			), 0),
+			?
+		)
+	`, key, key, value)
 	return err
 }
 
@@ -188,22 +252,48 @@ func (m *discoveryDiskMap) forEach(
 	if m.queryError != nil {
 		return m.queryError
 	}
-	rows, err := m.db.QueryContext(ctx, "SELECT key, value FROM entries ORDER BY key")
+	rows, err := m.db.QueryContext(ctx, discoveryDiskMapForEachQuery)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
-	for rows.Next() {
-		var key, value string
-		if err := rows.Scan(&key, &value); err != nil {
-			return err
-		}
+	var currentKey string
+	var value strings.Builder
+	haveKey := false
+	havePart := false
+	yieldCurrent := func() error {
 		observeStreamingDiscoveryBuffer(ctx, 1)
-		if err := yield(key, value); err != nil {
+		return yield(currentKey, value.String())
+	}
+	for rows.Next() {
+		var key, part string
+		if err := rows.Scan(&key, &part); err != nil {
 			return err
 		}
+		if haveKey && key != currentKey {
+			if err := yieldCurrent(); err != nil {
+				return err
+			}
+			value.Reset()
+			havePart = false
+		}
+		if !haveKey || key != currentKey {
+			currentKey = key
+			haveKey = true
+		}
+		if havePart {
+			value.WriteByte('\n')
+		}
+		value.WriteString(part)
+		havePart = true
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if !haveKey {
+		return nil
+	}
+	return yieldCurrent()
 }
 
 func (m *discoveryDiskMap) addGeminiPath(

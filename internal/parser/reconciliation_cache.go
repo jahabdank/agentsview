@@ -60,8 +60,9 @@ func reconciliationCacheAddInt(ctx context.Context, key string) (int, error) {
 	}
 	var next int
 	err := cache.index.db.QueryRowContext(ctx, `
-		INSERT INTO entries (key, value) VALUES (?, '1')
-		ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1
+		INSERT INTO entries (key, ordinal, value) VALUES (?, 0, '1')
+		ON CONFLICT(key, ordinal) DO UPDATE
+		SET value = CAST(value AS INTEGER) + 1
 		RETURNING CAST(value AS INTEGER)
 	`, key).Scan(&next)
 	return next - 1, err
