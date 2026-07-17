@@ -667,7 +667,9 @@ func (db *DB) UpsertProjectIdentityObservation(
 // UpsertProjectIdentityObservationWithSnapshotProject publishes current
 // aggregate evidence while preserving a separately labelled parser-time
 // snapshot. Only the project label may differ, so both rows retain identical
-// source evidence.
+// source evidence. An empty snapshot project preserves the aggregate but omits
+// the snapshot rather than inventing a source label; this also removes the
+// target-labelled fallback created by the session insert trigger.
 func (db *DB) UpsertProjectIdentityObservationWithSnapshotProject(
 	ctx context.Context,
 	obs export.ProjectIdentityObservation,
@@ -680,12 +682,6 @@ func (db *DB) UpsertProjectIdentityObservationWithSnapshotProject(
 		ctx = context.Background()
 	}
 	obs, err := normalizeProjectIdentityObservation(obs)
-	if err != nil {
-		return err
-	}
-	snapshot := obs
-	snapshot.Project = snapshotProject
-	snapshot, err = normalizeProjectIdentityObservation(snapshot)
 	if err != nil {
 		return err
 	}
@@ -706,12 +702,12 @@ func (db *DB) UpsertProjectIdentityObservationWithSnapshotProject(
 	); err != nil {
 		return err
 	}
-	if err := upsertSessionProjectIdentitySnapshotExec(
+	if err := writeSessionProjectIdentitySnapshotExec(
 		ctx, tx,
 		func(ctx context.Context, query string, args ...any) rowScanner {
 			return tx.QueryRowContext(ctx, query, args...)
 		},
-		snapshot,
+		obs, snapshotProject,
 	); err != nil {
 		return err
 	}
@@ -739,12 +735,6 @@ func upsertProjectIdentityObservationWithSnapshotProjectTx(
 	if err != nil {
 		return err
 	}
-	snapshot := normalized
-	snapshot.Project = snapshotProject
-	snapshot, err = normalizeProjectIdentityObservation(snapshot)
-	if err != nil {
-		return err
-	}
 	if err := upsertProjectIdentityObservationExec(
 		context.Background(), tx,
 		func(ctx context.Context, query string, args ...any) rowScanner {
@@ -754,16 +744,47 @@ func upsertProjectIdentityObservationWithSnapshotProjectTx(
 	); err != nil {
 		return err
 	}
-	if err := upsertSessionProjectIdentitySnapshotExec(
+	if err := writeSessionProjectIdentitySnapshotExec(
 		context.Background(), tx,
 		func(ctx context.Context, query string, args ...any) rowScanner {
 			return tx.QueryRowContext(ctx, query, args...)
 		},
-		snapshot,
+		normalized, snapshotProject,
 	); err != nil {
 		return err
 	}
 	return nil
+}
+
+func writeSessionProjectIdentitySnapshotExec(
+	ctx context.Context,
+	exec contextExecer,
+	queryRow contextQueryRow,
+	obs export.ProjectIdentityObservation,
+	snapshotProject string,
+) error {
+	snapshotProject = strings.TrimSpace(snapshotProject)
+	if snapshotProject == "" {
+		sessionID := strings.TrimSpace(obs.SessionID)
+		if sessionID == "" {
+			return nil
+		}
+		if _, err := exec.ExecContext(ctx, `
+			DELETE FROM session_project_identity_snapshots
+			WHERE session_id = ?`, sessionID); err != nil {
+			return fmt.Errorf("deleting session project identity snapshot: %w", err)
+		}
+		return nil
+	}
+	snapshot := obs
+	snapshot.Project = snapshotProject
+	snapshot, err := normalizeProjectIdentityObservation(snapshot)
+	if err != nil {
+		return err
+	}
+	return upsertSessionProjectIdentitySnapshotExec(
+		ctx, exec, queryRow, snapshot,
+	)
 }
 
 // rebuildProjectIdentityAggregatesTx republishes immutable per-session

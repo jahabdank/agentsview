@@ -594,10 +594,54 @@ func TestProjectObservationSessionBatchWritePersistsObservation(t *testing.T) {
 	require.Len(t, got, 1)
 	assert.Equal(t, "/tmp/worktree", got[0].RootPath)
 	assert.Empty(t, got[0].GitRemote)
+	snapshots, err := d.ListSessionProjectIdentitySnapshots(ctx)
+	require.NoError(t, err)
+	require.Len(t, snapshots, 1)
+	assert.Equal(t, "mapped-project", snapshots[0].Project,
+		"an omitted snapshot project keeps the legacy same-label default")
 
 	projects := export.BuildProjectsMap([]string{"mapped-project"}, got)
 	require.Equal(t, export.ProjectResolutionUnknown, projects["mapped-project"].Resolution)
 	assert.Nil(t, projects["mapped-project"].Identity)
+}
+
+func TestProjectObservationSessionBatchExplicitEmptyProjectOmitsSnapshot(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := context.Background()
+	emptySourceProject := ""
+	result, err := d.WriteSessionBatch([]SessionBatchWrite{{
+		Session: Session{
+			ID:      "batch-empty-source",
+			Project: "mapped-project",
+			Machine: "laptop",
+			Agent:   "codex",
+		},
+		IdentityObservation: export.ProjectIdentityObservation{
+			SessionID: "batch-empty-source",
+			Project:   "mapped-project",
+			Machine:   "laptop",
+			RootPath:  "/tmp/worktree",
+		},
+		IdentitySnapshotProject: &emptySourceProject,
+		DataVersion:             CurrentDataVersion(),
+		ReplaceMessages:         true,
+	}})
+	require.NoError(t, err)
+	assert.Equal(t, 1, result.WrittenSessions)
+
+	observations, err := d.ListProjectIdentityObservations(
+		ctx, []string{"mapped-project"},
+	)
+	require.NoError(t, err)
+	require.Len(t, observations, 1)
+	assert.Equal(t, "mapped-project", observations[0].Project)
+
+	snapshots, err := d.ListSessionProjectIdentitySnapshots(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, snapshots,
+		"an explicit empty source must not become mapped snapshot evidence")
 }
 
 func seedProjectIdentityObservation(t *testing.T, d *DB, project string) {

@@ -7816,6 +7816,7 @@ func (e *Engine) writeBatchBulk(
 		tScan := time.Now()
 		update, findings := computeSignalsAndSecrets(s, msgs)
 		e.phaseStats.ScanNanos.Add(int64(time.Since(tScan)))
+		snapshotProject := pw.sess.Project
 		writes = append(writes, db.SessionBatchWrite{
 			Session:     s,
 			Messages:    msgs,
@@ -7823,7 +7824,7 @@ func (e *Engine) writeBatchBulk(
 			IdentityObservation: identityObservationOrZero(
 				e.projectIdentityObservation(s),
 			),
-			IdentitySnapshotProject: pw.sess.Project,
+			IdentitySnapshotProject: &snapshotProject,
 			Signals:                 update,
 			Findings:                findings,
 			DataVersion:             dataVersionForWrite(pw),
@@ -8492,6 +8493,14 @@ func (e *Engine) writeSessionFullWithResolver(
 		}
 		log.Printf("upsert session %s: %v", s.ID, err)
 		return err
+	}
+	if err := e.writeProjectIdentityObservationWithSnapshotProject(
+		context.Background(), s, pw.sess.Project,
+	); err != nil {
+		log.Printf(
+			"write project identity observation for %s: %v",
+			s.ID, err,
+		)
 	}
 	update, findings := computeSignalsAndSecrets(s, msgs)
 	if err := e.db.ReplaceSessionContent(s.ID, msgs, update, findings); err != nil {

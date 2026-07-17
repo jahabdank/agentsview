@@ -14,11 +14,13 @@ import (
 // complete message set to store, the computed signal values,
 // and the data version to stamp after messages are written.
 type SessionBatchWrite struct {
-	Session                 Session
-	Messages                []Message
-	UsageEvents             []UsageEvent
-	IdentityObservation     export.ProjectIdentityObservation
-	IdentitySnapshotProject string
+	Session             Session
+	Messages            []Message
+	UsageEvents         []UsageEvent
+	IdentityObservation export.ProjectIdentityObservation
+	// IdentitySnapshotProject distinguishes legacy omission (nil, use the
+	// aggregate project) from an explicit empty parser source (omit snapshot).
+	IdentitySnapshotProject *string
 	Signals                 SessionSignalUpdate
 	Findings                []SecretFinding
 	DataVersion             int
@@ -341,13 +343,18 @@ func writeOneSessionBatchTx(
 		)
 	}
 	if write.IdentityObservation.Project != "" {
-		snapshotProject := write.IdentitySnapshotProject
-		if snapshotProject == "" {
-			snapshotProject = write.IdentityObservation.Project
+		var err error
+		if write.IdentitySnapshotProject == nil {
+			err = upsertProjectIdentityObservationTx(
+				tx, write.IdentityObservation,
+			)
+		} else {
+			err = upsertProjectIdentityObservationWithSnapshotProjectTx(
+				tx, write.IdentityObservation,
+				*write.IdentitySnapshotProject,
+			)
 		}
-		if err := upsertProjectIdentityObservationWithSnapshotProjectTx(
-			tx, write.IdentityObservation, snapshotProject,
-		); err != nil {
+		if err != nil {
 			return 0, err
 		}
 	}

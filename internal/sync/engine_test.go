@@ -1357,6 +1357,125 @@ func TestProjectIdentityBulkWriteMappingPreservesParserProjectSnapshot(
 	assert.Equal(t, cwd, snapshots[0].RootPath)
 }
 
+func TestProjectIdentityFullSessionWriteMappingPreservesParserProjectSnapshot(
+	t *testing.T,
+) {
+	database := openTestDB(t)
+	root := t.TempDir()
+	cwd := filepath.Join(root, "feature-login")
+	_, err := database.CreateWorktreeProjectMapping(
+		context.Background(),
+		db.WorktreeProjectMapping{
+			Machine:    "laptop",
+			PathPrefix: root,
+			Project:    "canonical-app",
+			Enabled:    true,
+		},
+	)
+	require.NoError(t, err, "CreateWorktreeProjectMapping")
+
+	e := NewEngine(database, EngineConfig{Machine: "laptop"})
+	err = e.writeSessionFull(pendingWrite{
+		sess: parser.ParsedSession{
+			ID:        "mapped-full-identity",
+			Project:   "feature_login",
+			Machine:   "laptop",
+			Agent:     parser.AgentCodex,
+			Cwd:       cwd,
+			StartedAt: time.Now(),
+		},
+	})
+	require.NoError(t, err, "writeSessionFull")
+
+	session, err := database.GetSession(
+		context.Background(), "mapped-full-identity",
+	)
+	require.NoError(t, err, "GetSession")
+	require.NotNil(t, session)
+	assert.Equal(t, "canonical_app", session.Project)
+
+	observations, err := database.ListProjectIdentityObservations(
+		context.Background(), []string{"canonical_app"},
+	)
+	require.NoError(t, err, "ListProjectIdentityObservations")
+	require.Len(t, observations, 1)
+	assert.Equal(t, "canonical_app", observations[0].Project)
+	assert.Equal(t, cwd, observations[0].RootPath)
+
+	snapshots, err := database.ListSessionProjectIdentitySnapshots(
+		context.Background(),
+	)
+	require.NoError(t, err, "ListSessionProjectIdentitySnapshots")
+	require.Len(t, snapshots, 1)
+	assert.Equal(t, "mapped-full-identity", snapshots[0].SessionID)
+	assert.Equal(t, "feature_login", snapshots[0].Project)
+	assert.Equal(t, cwd, snapshots[0].RootPath)
+}
+
+func TestProjectIdentityMappedWriteWithEmptyParserProjectOmitsSnapshot(
+	t *testing.T,
+) {
+	tests := []struct {
+		name string
+		mode syncWriteMode
+	}{
+		{name: "ordinary", mode: syncWriteDefault},
+		{name: "bulk", mode: syncWriteBulk},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			database := openTestDB(t)
+			root := t.TempDir()
+			cwd := filepath.Join(root, "unclassified")
+			_, err := database.CreateWorktreeProjectMapping(
+				context.Background(),
+				db.WorktreeProjectMapping{
+					Machine:    "laptop",
+					PathPrefix: root,
+					Project:    "canonical-app",
+					Enabled:    true,
+				},
+			)
+			require.NoError(t, err, "CreateWorktreeProjectMapping")
+
+			e := NewEngine(database, EngineConfig{Machine: "laptop"})
+			written, _, failed, _ := e.writeBatch([]pendingWrite{{
+				sess: parser.ParsedSession{
+					ID:        "mapped-empty-" + tt.name,
+					Machine:   "laptop",
+					Agent:     parser.AgentCodex,
+					Cwd:       cwd,
+					StartedAt: time.Now(),
+				},
+			}}, tt.mode, true)
+			require.Equal(t, 0, failed, "no session writes may fail")
+			require.Equal(t, 1, written)
+
+			session, err := database.GetSession(
+				context.Background(), "mapped-empty-"+tt.name,
+			)
+			require.NoError(t, err, "GetSession")
+			require.NotNil(t, session)
+			assert.Equal(t, "canonical_app", session.Project)
+
+			observations, err := database.ListProjectIdentityObservations(
+				context.Background(), []string{"canonical_app"},
+			)
+			require.NoError(t, err, "ListProjectIdentityObservations")
+			require.Len(t, observations, 1)
+			assert.Equal(t, "canonical_app", observations[0].Project)
+			assert.Equal(t, cwd, observations[0].RootPath)
+
+			snapshots, err := database.ListSessionProjectIdentitySnapshots(
+				context.Background(),
+			)
+			require.NoError(t, err, "ListSessionProjectIdentitySnapshots")
+			assert.Empty(t, snapshots,
+				"empty parser project must not become target-labelled evidence")
+		})
+	}
+}
+
 func TestProjectIdentityDiscoversLinkedWorktreeRepositoryContext(t *testing.T) {
 	database := openTestDB(t)
 	mainRoot := filepath.Join(t.TempDir(), "main")
