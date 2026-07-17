@@ -930,9 +930,9 @@ func TestMigration_ToolResultEventsTable(t *testing.T) {
 		"expected tool_result_events table after reopen")
 }
 
-func TestCurrentDataVersionAntigravityParentLinks(t *testing.T) {
-	assert.Equal(t, 67, CurrentDataVersion(),
-		"Antigravity parent-link parsing requires a data version bump")
+func TestCurrentDataVersionGenericGitHubWorktrees(t *testing.T) {
+	assert.Equal(t, 68, CurrentDataVersion(),
+		"generic GitHub worktree parsing requires a data version bump")
 }
 func TestInsertMessages_PreservesToolResultEvents(t *testing.T) {
 	d := testDB(t)

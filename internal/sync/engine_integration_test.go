@@ -1662,6 +1662,29 @@ func TestSyncEngineWorktreeProjectWhenPathMissing(t *testing.T) {
 	assertSessionProject(t, env.db, "offline-worktree", "agentsview")
 }
 
+func TestRemoteGitHubWorktreeProjectWhenPathMissing(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentClaude)
+	sessionCwd := filepath.Join(
+		t.TempDir(), "missing", "worktrees", "github.com", "example-org",
+		"sample-service", "fix-123", "cmd", "server",
+	)
+	require.NoDirExists(t, sessionCwd, "fixture cwd must remain unavailable locally")
+
+	content := testjsonl.NewSessionBuilder().
+		AddRaw(fmt.Sprintf(`{"type":"user","timestamp":"2024-01-01T10:00:00Z","cwd":%q,"gitBranch":"fix-123","message":{"content":"hello"}}`, sessionCwd)).
+		AddClaudeAssistant(tsEarlyS5, "ok").
+		String()
+
+	env.writeClaudeSessionForProject(
+		t, "/remote/sessions/sample-service",
+		"remote-github-worktree.jsonl", content,
+	)
+
+	runSyncAndAssert(t, env.engine, sync.SyncStats{TotalSessions: 1, Synced: 1, Skipped: 0})
+
+	assertSessionProject(t, env.db, "remote-github-worktree", "sample_service")
+}
+
 func TestSyncEngineAppliesWorktreeProjectMapping(t *testing.T) {
 	env := setupSingleAgentTestEnv(t, parser.AgentClaude)
 
