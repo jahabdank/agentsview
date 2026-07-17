@@ -652,6 +652,25 @@ func TestCoworkRegistryEntry(t *testing.T) {
 		"Cowork root contains large local_* working trees that discovery skips")
 }
 
+func TestPeriodicReconcileCapability(t *testing.T) {
+	optedIn := map[AgentType]bool{}
+	for _, def := range Registry {
+		optedIn[def.Type] = def.PeriodicReconcile
+	}
+	// Shallow-watched providers rely on scheduled reconciliation because
+	// subdirectory changes are invisible to their shallow watch coverage.
+	assert.True(t, optedIn[AgentCowork])
+	assert.True(t, optedIn[AgentOpenHands])
+	assert.True(t, optedIn[AgentAider])
+	// Recursive session roots must NOT opt in: their shallow roots are
+	// supplemental (codex_provider.go WatchPlan registers Recursive:true),
+	// so scheduled reconciliation would rescan the whole session tree.
+	assert.False(t, optedIn[AgentCodex])
+	assert.False(t, optedIn[AgentHermes])
+	assert.False(t, optedIn[AgentClaude])
+	assert.False(t, optedIn[AgentGemini])
+}
+
 func TestAgentByPrefixCowork(t *testing.T) {
 	def, ok := AgentByPrefix("cowork:c0000000-0000-4000-8000-000000000001")
 	require.True(t, ok, "cowork-prefixed ID should resolve")

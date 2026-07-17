@@ -78,6 +78,12 @@ type AgentDef struct {
 	FileBased         bool     // false for DB-backed agents
 	Usage             UsageCapabilities
 
+	// PeriodicReconcile opts the agent into the scheduled scoped
+	// reconciliation because its declared watch coverage is shallow and
+	// subdirectory changes are invisible to the watcher. Expensive
+	// scheduling inputs default to unsupported.
+	PeriodicReconcile bool
+
 	// WatchRootsFunc resolves the directories to watch for live
 	// updates under a configured root, for agents whose watch
 	// targets depend on the on-disk layout rather than a static
@@ -122,14 +128,15 @@ var Registry = []AgentDef{
 		FileBased:         true,
 	},
 	{
-		Type:         AgentCowork,
-		DisplayName:  "Claude Cowork",
-		EnvVar:       "COWORK_DIR",
-		ConfigKey:    "cowork_dirs",
-		DefaultDirs:  coworkDefaultDirs(),
-		IDPrefix:     "cowork:",
-		FileBased:    true,
-		ShallowWatch: true,
+		Type:              AgentCowork,
+		DisplayName:       "Claude Cowork",
+		EnvVar:            "COWORK_DIR",
+		ConfigKey:         "cowork_dirs",
+		DefaultDirs:       coworkDefaultDirs(),
+		IDPrefix:          "cowork:",
+		FileBased:         true,
+		ShallowWatch:      true,
+		PeriodicReconcile: true,
 	},
 	{
 		Type:        AgentCodex,
@@ -214,14 +221,15 @@ var Registry = []AgentDef{
 		WatchRootsFunc: ResolveKiloWatchRoots,
 	},
 	{
-		Type:         AgentOpenHands,
-		DisplayName:  "OpenHands CLI",
-		EnvVar:       "OPENHANDS_CONVERSATIONS_DIR",
-		ConfigKey:    "openhands_dirs",
-		DefaultDirs:  []string{".openhands/conversations"},
-		IDPrefix:     "openhands:",
-		FileBased:    true,
-		ShallowWatch: true,
+		Type:              AgentOpenHands,
+		DisplayName:       "OpenHands CLI",
+		EnvVar:            "OPENHANDS_CONVERSATIONS_DIR",
+		ConfigKey:         "openhands_dirs",
+		DefaultDirs:       []string{".openhands/conversations"},
+		IDPrefix:          "openhands:",
+		FileBased:         true,
+		ShallowWatch:      true,
+		PeriodicReconcile: true,
 	},
 	{
 		Type:        AgentCursor,
@@ -683,13 +691,14 @@ var Registry = []AgentDef{
 		// roots; watch those roots shallowly and rely on the 15-minute
 		// periodic sync to pick up new repos' history files. Aider history
 		// is append-mostly, so this is an acceptable latency tradeoff.
-		Type:         AgentAider,
-		DisplayName:  "Aider",
-		EnvVar:       "AIDER_DIR",
-		ConfigKey:    "aider_dirs",
-		IDPrefix:     "aider:",
-		FileBased:    true,
-		ShallowWatch: true,
+		Type:              AgentAider,
+		DisplayName:       "Aider",
+		EnvVar:            "AIDER_DIR",
+		ConfigKey:         "aider_dirs",
+		IDPrefix:          "aider:",
+		FileBased:         true,
+		ShallowWatch:      true,
+		PeriodicReconcile: true,
 	},
 	{
 		Type:         AgentReasonix,

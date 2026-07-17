@@ -2700,7 +2700,33 @@ func (e *Engine) ReconcileWatchRoots(
 func (e *Engine) reconcileWatchRoots(
 	ctx context.Context, roots []string, full, force bool,
 ) error {
-	logicalRoots, excludedRemoteRoots := e.localReconciliationRoots(roots, full)
+	return e.reconcileScopedWatchRoots(ctx, "", roots, full, force)
+}
+
+// ReconcileProviderRoots reconciles the given roots for a single provider. It
+// bypasses the cross-provider expansion in logicalRootsForWatchRoots and
+// restricts both discovery and deletion to that provider, so a shallow-watched
+// agent's scheduled pass never enumerates or tombstones another agent's
+// sessions under an overlapping root.
+func (e *Engine) ReconcileProviderRoots(
+	ctx context.Context, agent parser.AgentType, roots []string,
+) error {
+	if agent == "" {
+		return e.reconcileWatchRoots(ctx, roots, false, false)
+	}
+	return e.reconcileScopedWatchRoots(ctx, agent, roots, false, false)
+}
+
+func (e *Engine) reconcileScopedWatchRoots(
+	ctx context.Context, agent parser.AgentType, roots []string, full, force bool,
+) error {
+	var logicalRoots []string
+	var excludedRemoteRoots int
+	if agent == "" {
+		logicalRoots, excludedRemoteRoots = e.localReconciliationRoots(roots, full)
+	} else {
+		logicalRoots, excludedRemoteRoots = e.agentReconciliationRoots(agent, roots)
+	}
 	if !full && len(roots) > 0 && len(logicalRoots) == 0 && excludedRemoteRoots > 0 {
 		e.setLastReconciliationResult(ReconciliationResult{
 			Complete: true,
@@ -2709,7 +2735,7 @@ func (e *Engine) reconcileWatchRoots(
 		return nil
 	}
 	stats, metrics, tombstoned, err := e.reconcileWatchRootsStreamed(
-		ctx, logicalRoots, full, force,
+		ctx, agent, logicalRoots, full, force,
 	)
 	metrics.ExcludedRemoteRoots = excludedRemoteRoots
 	if stats.Synced > 0 || tombstoned > 0 {
@@ -2746,7 +2772,7 @@ func (e *Engine) ReconciliationRootsForAgent(agent string) []string {
 }
 
 func (e *Engine) reconcileWatchRootsStreamed(
-	ctx context.Context, roots []string, full, force bool,
+	ctx context.Context, agent parser.AgentType, roots []string, full, force bool,
 ) (stats SyncStats, metrics ReconciliationMetrics, tombstoned int, retErr error) {
 	if err := ctx.Err(); err != nil {
 		return SyncStats{Aborted: true}, metrics, 0, err
@@ -2797,6 +2823,8 @@ func (e *Engine) reconcileWatchRootsStreamed(
 	scope := newRootSyncScope(roots)
 	if full {
 		scope = nil
+	} else if scope != nil {
+		scope.agent = agent
 	}
 	preContainerStates := e.captureSQLiteContainerStates()
 	providers, completedScopes, failedRoots, failures, discoveryErr, err := e.streamReconciliationCandidates(
@@ -2944,8 +2972,8 @@ func (e *Engine) reconcileWatchRootsStreamed(
 	}
 	if retErr == nil && ctx.Err() == nil && !stats.Aborted &&
 		stats.Failed == 0 && stats.providerFailures == 0 {
-		tombstoned, retErr = e.tombstoneMissingWatchSourcesLocked(
-			ctx, roots, spool,
+		tombstoned, retErr = e.tombstoneMissingWatchSourcesForAgentLocked(
+			ctx, roots, agent, spool,
 		)
 	} else if canTombstoneCompletedScopes && ctx.Err() == nil &&
 		!stats.Aborted && stats.Failed == 0 {
@@ -3058,6 +3086,9 @@ func (e *Engine) streamReconciliationCandidates(
 	})
 	for _, agent := range agents {
 		if e.providerMigrationModes[agent] != parser.ProviderMigrationProviderAuthoritative {
+			continue
+		}
+		if !scope.matchesAgent(agent) {
 			continue
 		}
 		roots := slices.DeleteFunc(append([]string(nil), e.agentDirs[agent]...), func(root string) bool {
@@ -3734,6 +3765,54 @@ func (e *Engine) logicalRootsForWatchRoots(roots []string) []string {
 	return logical
 }
 
+// logicalRootsForAgentWatchRoots resolves the given roots against one agent's
+// configured dirs only. Unlike logicalRootsForWatchRoots it never crosses into
+// another provider's dirs, so an overlapping ancestor root cannot drag other
+// providers into a scoped reconciliation.
+func (e *Engine) logicalRootsForAgentWatchRoots(
+	agent parser.AgentType, roots []string,
+) []string {
+	dirs := e.agentDirs[agent]
+	var logical []string
+	for _, root := range roots {
+		cleanedRoot := cleanRootPath(root)
+		matched := false
+		for _, dir := range dirs {
+			cleanedDir := cleanRootPath(dir)
+			if !samePathOrDescendant(cleanedRoot, cleanedDir) &&
+				!samePathOrDescendant(cleanedDir, cleanedRoot) {
+				continue
+			}
+			if !slices.Contains(logical, cleanedDir) {
+				logical = append(logical, cleanedDir)
+			}
+			matched = true
+		}
+		if !matched && !slices.Contains(logical, cleanedRoot) {
+			logical = append(logical, cleanedRoot)
+		}
+	}
+	return logical
+}
+
+// agentReconciliationRoots restricts the requested roots to a single agent's
+// configured dirs and excludes remote object roots, mirroring
+// localReconciliationRoots but without the cross-provider expansion.
+func (e *Engine) agentReconciliationRoots(
+	agent parser.AgentType, roots []string,
+) ([]string, int) {
+	local := make([]string, 0, len(roots))
+	remote := 0
+	for _, root := range roots {
+		if isRemoteReconciliationRoot(root) {
+			remote++
+			continue
+		}
+		local = append(local, root)
+	}
+	return e.logicalRootsForAgentWatchRoots(agent, local), remote
+}
+
 // localReconciliationRoots expands a full watcher recovery to every configured
 // local root before tombstoning. Remote object roots are owned by the remote
 // sync path: local reconciliation neither enumerates nor tombstones them, and
@@ -3818,6 +3897,10 @@ func (e *Engine) SyncRootsSince(
 
 type rootSyncScope struct {
 	roots []string
+	// agent, when non-empty, restricts discovery to a single provider so a
+	// scoped reconciliation cannot drag other providers into the pass through
+	// ancestor/descendant root overlap. Zero value matches every agent.
+	agent parser.AgentType
 }
 
 func newRootSyncScope(roots []string) *rootSyncScope {
@@ -3858,6 +3941,16 @@ func (s *rootSyncScope) includesAny(dirs []string) bool {
 		return true
 	}
 	return slices.ContainsFunc(dirs, s.includes)
+}
+
+// matchesAgent reports whether the given provider is in scope. An unscoped
+// scope (nil) or one without an agent filter matches every provider; an
+// agent-filtered scope matches only that provider.
+func (s *rootSyncScope) matchesAgent(agent parser.AgentType) bool {
+	if s == nil || s.agent == "" {
+		return true
+	}
+	return s.agent == agent
 }
 
 func cleanRootPath(path string) string {
@@ -4196,6 +4289,9 @@ func (e *Engine) discoverProviderSources(
 	for _, agentType := range agents {
 		mode := e.providerMigrationModes[agentType]
 		if mode != parser.ProviderMigrationProviderAuthoritative {
+			continue
+		}
+		if !scope.matchesAgent(agentType) {
 			continue
 		}
 		roots := e.agentDirs[agentType]

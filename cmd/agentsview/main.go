@@ -1753,11 +1753,62 @@ func startPeriodicSync(
 			return
 		case <-ticker.C:
 		}
-		log.Println("Running scheduled sync...")
+		log.Println("Running scheduled reconciliation...")
 		idleTracker.Do(func() {
-			engine.SyncAll(ctx, nil)
+			runScheduledSyncPass(ctx, engine, scheduledReconcileTargets(cfg))
 			recomputePendingSessions(engine, database)
 		})
+	}
+}
+
+// scheduledSyncEngine is the reconciliation surface the scheduled pass needs.
+// Native-watched providers already get event-driven sync plus degraded-coverage
+// polling, so the scheduled pass only reconciles the opted-in providers.
+type scheduledSyncEngine interface {
+	ReconcileProviderRoots(ctx context.Context, agent parser.AgentType, roots []string) error
+}
+
+// scheduledReconcileTarget pairs an opted-in provider with the configured roots
+// the scheduled pass must reconcile for it.
+type scheduledReconcileTarget struct {
+	Agent parser.AgentType
+	Roots []string
+}
+
+// scheduledReconcileTargets selects the configured roots for providers that
+// declare PeriodicReconcile. Every other provider is covered by the watcher and
+// the degraded-coverage poller, so the scheduled pass leaves them untouched.
+func scheduledReconcileTargets(cfg config.Config) []scheduledReconcileTarget {
+	roots, _ := collectWatchRoots(cfg)
+	byAgent := make(map[parser.AgentType][]string)
+	for _, root := range roots {
+		for _, scope := range root.scopes {
+			byAgent[scope.agent] = appendUniqueString(byAgent[scope.agent], scope.syncDir)
+		}
+	}
+	var targets []scheduledReconcileTarget
+	for _, def := range parser.Registry {
+		if !def.PeriodicReconcile {
+			continue
+		}
+		dirs := byAgent[def.Type]
+		if len(dirs) == 0 {
+			continue
+		}
+		targets = append(targets, scheduledReconcileTarget{Agent: def.Type, Roots: dirs})
+	}
+	return targets
+}
+
+// runScheduledSyncPass reconciles each opted-in provider within its own scope.
+// A failure for one provider is logged and does not block the others.
+func runScheduledSyncPass(
+	ctx context.Context, engine scheduledSyncEngine, targets []scheduledReconcileTarget,
+) {
+	for _, target := range targets {
+		if err := engine.ReconcileProviderRoots(ctx, target.Agent, target.Roots); err != nil {
+			log.Printf("scheduled reconciliation for %s: %v", target.Agent, err)
+		}
 	}
 }
 
