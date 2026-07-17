@@ -1724,6 +1724,9 @@
   "activity_reclassify_projects_affected": [
     { "declarations": ["input count", "local countPlural = count: plural", "local countNumber = count: number"], "selectors": ["countPlural"], "match": { "countPlural=one": "{countNumber} project", "countPlural=other": "{countNumber} projects" } }
   ],
+  "activity_reclassify_project_sample_sessions": [
+    { "declarations": ["input count", "local countPlural = count: plural", "local countNumber = count: number"], "selectors": ["countPlural"], "match": { "countPlural=one": "{countNumber} session", "countPlural=other": "{countNumber} sessions" } }
+  ],
   "activity_reclassify_multiple_projects": "This prefix affects multiple projects. Review the sample before applying.",
   "activity_reclassify_zero_matches": "This prefix matches no sessions in the archive.",
   "activity_reclassify_conflict": "Mappings changed since the preview. The impact has been refreshed; review it before applying.",

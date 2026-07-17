@@ -76,7 +76,7 @@ class ActivityStore {
   private reportRead = new LatestRead();
   private filterOptionsRead = new LatestRead();
   #filterOptionsLoaded = false;
-  #filterOptionsPromise: Promise<void> | null = null;
+  #filterOptionsPromise: Promise<boolean> | null = null;
   #filterOptionsVersion = 0;
   #attached = 0;
 
@@ -185,8 +185,8 @@ class ActivityStore {
   async refreshAfterReclassification(): Promise<boolean> {
     const reportLoaded = await this.load({ background: true });
     this.invalidateFilterOptions();
-    await this.loadFilterOptions();
-    return reportLoaded;
+    const optionsLoaded = await this.loadFilterOptions();
+    return reportLoaded && optionsLoaded;
   }
 
   cancelInFlightReads(): void {
@@ -206,13 +206,14 @@ class ActivityStore {
    * request. A transient failure leaves the cache un-loaded so the next call
    * retries; lists that did succeed keep their values in the meantime.
    */
-  async loadFilterOptions() {
-    if (this.#filterOptionsLoaded) return;
+  async loadFilterOptions(): Promise<boolean> {
+    if (this.#filterOptionsLoaded) return true;
     if (this.#filterOptionsPromise) return this.#filterOptionsPromise;
     const ver = this.#filterOptionsVersion;
     const signal = this.filterOptionsRead.begin();
     const opts = { includeOneShot: true, includeAutomated: true };
-    this.#filterOptionsPromise = (async () => {
+    let request!: Promise<boolean>;
+    request = (async () => {
       configureGeneratedClient();
       let ok = true;
       try {
@@ -223,7 +224,7 @@ class ActivityStore {
         if (ver === this.#filterOptionsVersion && this.filterOptionsRead.isCurrent(signal))
           this.projects = res.projects;
       } catch (e) {
-        if (isAbortError(e) || !this.filterOptionsRead.isCurrent(signal)) return;
+        if (isAbortError(e) || !this.filterOptionsRead.isCurrent(signal)) return false;
         ok = false; // keep the current list; retry on the next call
       }
       try {
@@ -234,7 +235,7 @@ class ActivityStore {
         if (ver === this.#filterOptionsVersion && this.filterOptionsRead.isCurrent(signal))
           this.agents = res.agents;
       } catch (e) {
-        if (isAbortError(e) || !this.filterOptionsRead.isCurrent(signal)) return;
+        if (isAbortError(e) || !this.filterOptionsRead.isCurrent(signal)) return false;
         ok = false;
       }
       try {
@@ -245,18 +246,22 @@ class ActivityStore {
         if (ver === this.#filterOptionsVersion && this.filterOptionsRead.isCurrent(signal))
           this.machines = res.machines;
       } catch (e) {
-        if (isAbortError(e) || !this.filterOptionsRead.isCurrent(signal)) return;
+        if (isAbortError(e) || !this.filterOptionsRead.isCurrent(signal)) return false;
         ok = false;
       }
-      if (ver === this.#filterOptionsVersion && this.filterOptionsRead.isCurrent(signal)) {
+      const current = ver === this.#filterOptionsVersion && this.filterOptionsRead.isCurrent(signal);
+      if (current) {
         // Cache only a fully successful load so a transient failure is
         // retried rather than frozen as a permanent empty list.
         this.#filterOptionsLoaded = ok;
-        this.#filterOptionsPromise = null;
       }
+      return current && ok;
+    })().finally(() => {
+      if (this.#filterOptionsPromise === request) this.#filterOptionsPromise = null;
       this.filterOptionsRead.finish(signal);
-    })();
-    return this.#filterOptionsPromise;
+    });
+    this.#filterOptionsPromise = request;
+    return request;
   }
 
   /**

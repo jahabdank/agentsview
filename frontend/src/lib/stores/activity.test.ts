@@ -164,6 +164,19 @@ describe("load", () => {
     expect(activity.report?.range_start).toBe("2026-06-16T00:00:00Z");
   });
 
+  it("reports a stale refresh when filter options fail after the report succeeds", async () => {
+    const prior = makeReport({ range_start: "2026-06-15T00:00:00Z" });
+    activity.report = prior;
+    api.getActivityReport.mockResolvedValue(makeReport({ range_start: "2026-06-16T00:00:00Z" }));
+    api.getProjects.mockRejectedValueOnce(new Error("projects unavailable"));
+    api.getAgents.mockResolvedValue({ agents: [] });
+    api.getMachines.mockResolvedValue({ machines: [] });
+
+    await expect(activity.refreshAfterReclassification()).resolves.toBe(false);
+    expect(activity.report?.range_start).toBe("2026-06-16T00:00:00Z");
+    expect(activity.projects).toEqual([]);
+  });
+
   it("aborts the obsolete report when a replacement starts", async () => {
     const signals: AbortSignal[] = [];
     apiRuntimeMocks.callGenerated.mockImplementation(

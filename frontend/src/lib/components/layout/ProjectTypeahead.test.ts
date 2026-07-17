@@ -107,4 +107,22 @@ describe("ProjectTypeahead", () => {
     expect(screen.queryByRole("option", { name: 'Use project ""' })).toBeNull();
     expect(screen.queryByRole("option", { name: /^Use project/ })).toBeNull();
   });
+
+  it("reports query edits to callers that need to invalidate derived state", async () => {
+    const onquery = vi.fn();
+    component = mount(ProjectTypeahead, {
+      target: document.body,
+      props: {
+        projects,
+        value: "repo-a",
+        onselect: vi.fn(),
+        onquery,
+      },
+    });
+
+    await fireEvent.click(screen.getByRole("button"));
+    await fireEvent.input(screen.getByRole("combobox"), { target: { value: "repo-b" } });
+
+    expect(onquery).toHaveBeenLastCalledWith("repo-b");
+  });
 });

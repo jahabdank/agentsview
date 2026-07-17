@@ -55,6 +55,14 @@ async function flush() {
   await tick();
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 describe("ProjectReclassificationModal", () => {
   let component: ReturnType<typeof mount> | undefined;
 
@@ -206,6 +214,45 @@ describe("ProjectReclassificationModal", () => {
     expect(api.apply.mock.calls[0]![0].requestBody.mapping_token).toBe("latest-token");
   });
 
+  it("invalidates an accepted preview as soon as the target query changes", async () => {
+    render();
+    await flush();
+    await chooseTarget();
+    expect(
+      screen.getByRole("button", { name: "Apply reclassification" }) as HTMLButtonElement,
+    ).toHaveProperty("disabled", false);
+
+    await fireEvent.click(screen.getByTitle("Target project"));
+    await fireEvent.input(screen.getByRole("combobox"), {
+      target: { value: "target-pro" },
+    });
+
+    const apply = screen.getByRole("button", { name: "Apply reclassification" });
+    expect(apply as HTMLButtonElement).toHaveProperty("disabled", true);
+    await fireEvent.click(apply);
+    expect(api.apply).not.toHaveBeenCalled();
+  });
+
+  it("stops showing a canceled preview as loading when the draft becomes invalid", async () => {
+    const pending = deferred<typeof preview>();
+    api.preview.mockReturnValueOnce(pending.promise);
+    render();
+    await flush();
+    await fireEvent.click(screen.getByTitle("Target project"));
+    await fireEvent.mouseDown(screen.getByRole("option", { name: "target-project (12)" }));
+    await vi.advanceTimersByTimeAsync(300);
+    await flush();
+    expect(screen.getByText(/Calculating full-archive impact/)).toBeTruthy();
+
+    await fireEvent.input(screen.getByLabelText("Path prefix"), { target: { value: "" } });
+    await flush();
+
+    expect(screen.queryByText(/Calculating full-archive impact/)).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Apply reclassification" }) as HTMLButtonElement,
+    ).toHaveProperty("disabled", true);
+  });
+
   it("requires an explicit choice for multiple candidates and explains unavailable cwd evidence", async () => {
     api.candidates.mockResolvedValue({
       candidates: [
@@ -234,7 +281,8 @@ describe("ProjectReclassificationModal", () => {
   });
 
   it("applies exactly once and offers only refresh retry after a post-commit failure", async () => {
-    const onRefresh = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    const retry = deferred<boolean>();
+    const onRefresh = vi.fn().mockResolvedValueOnce(false).mockReturnValueOnce(retry.promise);
     const onComplete = vi.fn();
     render({ onRefresh, onComplete });
     await flush();
@@ -248,11 +296,84 @@ describe("ProjectReclassificationModal", () => {
     expect(api.apply.mock.calls[0]![0].requestBody.mapping_token).toBe("token-1");
     expect(screen.queryByRole("button", { name: "Apply reclassification" })).toBeNull();
     expect(screen.getByText(/Applied, but Activity could not refresh/)).toBeTruthy();
-    await fireEvent.click(screen.getByRole("button", { name: "Retry refresh" }));
+    const retryButton = screen.getByRole("button", { name: "Retry refresh" });
+    await fireEvent.click(retryButton);
+    await fireEvent.click(retryButton);
     await flush();
     expect(api.apply).toHaveBeenCalledTimes(1);
     expect(onRefresh).toHaveBeenCalledTimes(2);
+    expect(
+      screen.getByRole("button", { name: "Refreshing…" }) as HTMLButtonElement,
+    ).toHaveProperty("disabled", true);
+
+    retry.resolve(true);
+    await flush();
     expect(onComplete).toHaveBeenCalledTimes(1);
+  });
+
+  it("marks the initial post-commit refresh in flight before exposing a retry", async () => {
+    const pendingRefresh = deferred<boolean>();
+    const onRefresh = vi.fn().mockReturnValue(pendingRefresh.promise);
+    render({ onRefresh });
+    await flush();
+    await chooseTarget();
+
+    await fireEvent.click(screen.getByRole("button", { name: "Apply reclassification" }));
+    await flush();
+
+    const refreshing = screen.getByRole("button", { name: "Refreshing…" });
+    expect(refreshing as HTMLButtonElement).toHaveProperty("disabled", true);
+    expect(screen.queryByText(/Applied, but Activity could not refresh/)).toBeNull();
+    await fireEvent.click(refreshing);
+    expect(onRefresh).toHaveBeenCalledTimes(1);
+
+    pendingRefresh.resolve(false);
+    await flush();
+    expect(screen.getByText(/Applied, but Activity could not refresh/)).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Retry refresh" }) as HTMLButtonElement,
+    ).toHaveProperty("disabled", false);
+  });
+
+  it("suppresses every dismissal while apply is in flight and still refreshes after success", async () => {
+    const pendingApply = deferred<{ mapping: object; result: typeof preview }>();
+    const onclose = vi.fn();
+    const onRefresh = vi.fn().mockResolvedValue(false);
+    api.apply.mockReturnValueOnce(pendingApply.promise);
+    render({ onclose, onRefresh });
+    await flush();
+    await chooseTarget();
+
+    await fireEvent.click(screen.getByRole("button", { name: "Apply reclassification" }));
+    await flush();
+    const cancel = screen.getByRole("button", { name: "Cancel" });
+    expect(cancel as HTMLButtonElement).toHaveProperty("disabled", true);
+    await fireEvent.click(cancel);
+    await fireEvent.click(screen.getByRole("button", { name: "Close project reclassification" }));
+    await fireEvent.keyDown(window, { key: "Escape" });
+    const overlay = document.querySelector(".kit-modal-overlay");
+    expect(overlay).not.toBeNull();
+    await fireEvent.pointerDown(overlay!);
+    expect(onclose).not.toHaveBeenCalled();
+
+    pendingApply.resolve({ mapping: {}, result: preview });
+    await flush();
+    expect(api.apply).toHaveBeenCalledTimes(1);
+    expect(onRefresh).toHaveBeenCalledTimes(1);
+  });
+
+  it("localizes and number-formats project sample session counts", async () => {
+    api.preview.mockResolvedValueOnce({
+      ...preview,
+      project_samples: [{ project: "wrong-project", count: 1234 }],
+    });
+    render();
+    await flush();
+    await chooseTarget();
+
+    expect(screen.getByRole("alert").textContent).toContain(
+      "wrong-project (1,234 sessions)",
+    );
   });
 
   it("refreshes the preview after a mapping-set conflict", async () => {

@@ -520,6 +520,10 @@ then the repository gates:
 - relevant DuckDB integration tests
 - `npm run i18n:compile` from `frontend/`
 - `npm run check` from `frontend/`
+- `npm run check:kit-ui` from `frontend/`, comparing the exact diagnostic set
+  with the clean pre-feature branch baseline. Reject new or changed
+  diagnostics; the 37 unrelated baseline findings remain separate cleanup
+  work.
 - frontend component tests
 - the committed Playwright reclassification spec
 

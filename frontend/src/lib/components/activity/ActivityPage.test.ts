@@ -27,7 +27,7 @@ function stubActivityPageCollaborators() {
     },
   );
   vi.spyOn(activity, "attach").mockReturnValue(() => {});
-  vi.spyOn(activity, "loadFilterOptions").mockResolvedValue();
+  vi.spyOn(activity, "loadFilterOptions").mockResolvedValue(true);
   vi.spyOn(activity, "load").mockResolvedValue(true);
 }
 
@@ -259,6 +259,72 @@ describe("ActivityPage project reclassification", () => {
     expect(screen.queryByRole("dialog", { name: "Reclassify project" })).toBeNull();
     expect(document.activeElement).toBe(trigger);
   });
+
+  it("returns focus to the Project heading when refresh removes the triggering row", async () => {
+    stubActivityPageCollaborators();
+    sync.serverVersion = { read_only: false } as unknown as NonNullable<
+      typeof sync.serverVersion
+    >;
+    activity.report = projectReport();
+    activity.projects = [{ name: "target-project", session_count: 2 }];
+    vi.spyOn(
+      ActivityService,
+      "getApiV1ActivityProjectReclassificationCandidates",
+    ).mockResolvedValue({
+      candidates: [{
+        id: "candidate-1",
+        machine: "remote.example",
+        suggested_prefix: "/srv/worktrees/example/repo/branch",
+        contributing_sessions: 1,
+        distinct_cwds: 1,
+        evidence_kind: "identity",
+        examples: [],
+        available: true,
+      }],
+    } as never);
+    vi.spyOn(
+      SettingsService,
+      "postApiV1SettingsWorktreeMappingsPreview",
+    ).mockResolvedValue({
+      mapping_token: "token-1",
+      normalized_project: "target-project",
+      matched_sessions: 1,
+      updated_sessions: 1,
+      distinct_projects: 1,
+      project_samples: [],
+      session_samples: [],
+    } as never);
+    vi.spyOn(
+      SettingsService,
+      "postApiV1SettingsWorktreeMappingsReclassify",
+    ).mockResolvedValue({ mapping: {}, result: {} } as never);
+    vi.spyOn(activity, "refreshAfterReclassification").mockImplementation(async () => {
+      activity.report = { ...projectReport(), by_project: [] } as Report;
+      return true;
+    });
+
+    component = mount(ActivityPage, { target: document.body });
+    await flushEffects();
+    const trigger = screen.getByRole("button", {
+      name: "Reclassify project wrong-project",
+    });
+    await fireEvent.click(trigger);
+    await flushEffects();
+    await fireEvent.click(screen.getByTitle("Target project"));
+    await fireEvent.mouseDown(
+      screen.getByRole("option", { name: "target-project (2)" }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 320));
+    await flushEffects();
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Apply reclassification" }),
+    );
+    await flushEffects();
+
+    const projectHeading = screen.getByRole("heading", { name: "Project" });
+    expect(trigger.isConnected).toBe(false);
+    expect(document.activeElement).toBe(projectHeading);
+  });
 });
 
 describe("ActivityPage date yoke controls", () => {
@@ -332,7 +398,7 @@ describe("ActivityPage date yoke integration", () => {
       },
     );
     vi.spyOn(activity, "attach").mockReturnValue(() => {});
-    vi.spyOn(activity, "loadFilterOptions").mockResolvedValue();
+    vi.spyOn(activity, "loadFilterOptions").mockResolvedValue(true);
     vi.spyOn(activity, "load").mockImplementation(() => {
       loadStates.push({
         preset: activity.preset,

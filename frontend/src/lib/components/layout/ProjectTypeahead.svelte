@@ -7,6 +7,7 @@
     projects: ProjectInfo[];
     value: string;
     onselect: (value: string) => void;
+    onquery?: (query: string) => void;
     includeAll?: boolean;
     allowCustom?: boolean;
     customLabel?: string;
@@ -19,6 +20,7 @@
     projects,
     value,
     onselect,
+    onquery = undefined,
     includeAll = true,
     allowCustom = false,
     customLabel = m.activity_reclassify_use_custom_project({ query: "{query}" }),
@@ -65,5 +67,6 @@
   {emptyLabel}
   {allowCustom}
   {customLabel}
+  {onquery}
   {onselect}
 />

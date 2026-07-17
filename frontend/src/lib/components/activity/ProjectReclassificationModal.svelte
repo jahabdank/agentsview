@@ -51,6 +51,7 @@
   let refreshing = $state(false);
   let applyError = $state("");
   let previewTimer: ReturnType<typeof setTimeout> | undefined;
+  let suppressTargetQueryReset = false;
   let disposed = false;
   const candidatesRead = new LatestRead();
   const previewRead = new LatestRead();
@@ -110,6 +111,7 @@
 
   function clearAcceptedPreview() {
     previewRead.cancel();
+    previewLoading = false;
     preview = null;
     previewError = "";
     conflict = false;
@@ -134,8 +136,18 @@
 
   function selectTarget(value: string) {
     targetProject = value.trim();
+    suppressTargetQueryReset = true;
     clearAcceptedPreview();
     schedulePreview();
+  }
+
+  function editTargetQuery(value: string) {
+    if (suppressTargetQueryReset && value === "") {
+      suppressTargetQueryReset = false;
+      return;
+    }
+    suppressTargetQueryReset = false;
+    clearAcceptedPreview();
   }
 
   function draft() {
@@ -196,9 +208,11 @@
       );
       if (disposed) return;
       applied = true;
-      const refreshed = await onRefresh();
-      if (disposed) return;
-      if (refreshed) onComplete();
+      // Keep dismissal blocked through the initial refresh as well as the
+      // mutation request. The refresh has already started after commit, and
+      // the modal remains present until it can show either completion or the
+      // refresh-only retry state.
+      await refreshActivity();
     } catch (error) {
       if (disposed) return;
       if (typeof error === "object" && error !== null && "status" in error && error.status === 409) {
@@ -218,14 +232,31 @@
 
   async function retryRefresh() {
     if (!applied || refreshing) return;
+    await refreshActivity();
+  }
+
+  async function refreshActivity() {
     refreshing = true;
-    const refreshed = await onRefresh();
-    if (!disposed && refreshed) onComplete();
-    if (!disposed) refreshing = false;
+    let refreshed = false;
+    try {
+      refreshed = await onRefresh();
+    } catch {
+      // The mutation has committed; a refresh error must stay on the
+      // refresh-only path rather than being misreported as an apply failure.
+    }
+    if (disposed) return;
+    refreshing = false;
+    if (refreshed) onComplete();
+  }
+
+  function requestClose() {
+    if (applying) return;
+    onclose();
   }
 
   function openSettings(event: MouseEvent) {
     event.preventDefault();
+    if (applying) return;
     onclose();
     router.navigate("settings");
   }
@@ -244,7 +275,7 @@
       onclick={retryRefresh}
     />
   {:else}
-    <Button label={m.activity_reclassify_cancel()} onclick={onclose} />
+    <Button label={m.activity_reclassify_cancel()} disabled={applying} onclick={requestClose} />
     <Button
       label={applying
         ? m.activity_reclassify_applying()
@@ -262,7 +293,7 @@
   closeLabel={m.activity_reclassify_close()}
   width="560px"
   maxWidth="min(560px, calc(100vw - 32px))"
-  onclose={onclose}
+  onclose={requestClose}
   footer={footer}
 >
   <div class="modal-content">
@@ -315,6 +346,7 @@
               {projects}
               value={targetProject}
               onselect={selectTarget}
+              onquery={editTargetQuery}
               includeAll={false}
               allowCustom={true}
               customLabel={m.activity_reclassify_use_custom_project({ query: "{query}" })}
@@ -341,7 +373,7 @@
           {#if preview.project_samples?.length}
             <ul>
               {#each preview.project_samples as sample}
-                <li>{sample.project} ({sample.count})</li>
+                <li>{sample.project} ({m.activity_reclassify_project_sample_sessions({ count: sample.count })})</li>
               {/each}
             </ul>
           {/if}
@@ -356,7 +388,7 @@
     {/if}
     {#if previewError}<p class="error-text">{previewError}</p>{/if}
     {#if applyError}<p class="error-text">{applyError}</p>{/if}
-    {#if applied}
+    {#if applied && !refreshing}
       <p class="warning" role="status">{m.activity_reclassify_applied_refresh_failed()}</p>
     {/if}
 
