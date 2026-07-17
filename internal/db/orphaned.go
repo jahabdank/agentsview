@@ -677,6 +677,10 @@ func (d *DB) CopySessionMetadataFrom(
 		if oldDBHasColumn(ctx, tx, "worktree_project_mappings", "layout") {
 			layoutSelect = "layout"
 		}
+		originalProjectSelect := "''"
+		if oldDBHasColumn(ctx, tx, "worktree_project_mappings", "original_project") {
+			originalProjectSelect = "original_project"
+		}
 		if _, err := tx.ExecContext(ctx, `
 			DELETE FROM main.worktree_project_mappings
 			WHERE NOT EXISTS (
@@ -689,13 +693,16 @@ func (d *DB) CopySessionMetadataFrom(
 		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO main.worktree_project_mappings
-				(machine, path_prefix, layout, project, enabled, created_at, updated_at)
-			SELECT machine, path_prefix, `+layoutSelect+`, project, enabled, created_at, updated_at
+				(machine, path_prefix, layout, project, original_project,
+				 enabled, created_at, updated_at)
+			SELECT machine, path_prefix, `+layoutSelect+`, project,
+				`+originalProjectSelect+`, enabled, created_at, updated_at
 			FROM old_db.worktree_project_mappings
 			WHERE true
 			ON CONFLICT(machine, path_prefix) DO UPDATE SET
 				layout = excluded.layout,
 				project = excluded.project,
+				original_project = excluded.original_project,
 				enabled = excluded.enabled,
 				created_at = excluded.created_at,
 				updated_at = excluded.updated_at`); err != nil {

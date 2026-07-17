@@ -16,38 +16,71 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 )
 
-func TestWorktreeMappingsAPIUsesCurrentMachine(t *testing.T) {
+func TestRemoteMachineWorktreeMappingsAPI(t *testing.T) {
 	te := setup(t)
 	prefix := filepath.Join(t.TempDir(), "app.worktrees")
+	require.NoError(t, te.db.UpsertSession(db.Session{
+		ID: "remote-session", Machine: "host-a.example", Agent: "claude",
+		Project: "branch_label", Cwd: filepath.Join(prefix, "feature"),
+	}), "insert remote session")
 
 	created := postWorktreeMapping(t, te, map[string]any{
-		"path_prefix": prefix,
-		"project":     "canonical-app",
-		"machine":     "other-machine",
+		"path_prefix":      prefix,
+		"project":          "canonical-app",
+		"original_project": "branch_label",
+		"machine":          "host-a.example",
 	})
-	require.Equal(t, "test", created.Machine)
+	require.Equal(t, "host-a.example", created.Machine)
 	require.Equal(t, db.WorktreeMappingLayoutExplicit, created.Layout)
 	require.Equal(t, "canonical_app", created.Project)
+	require.Equal(t, "branch_label", created.OriginalProject)
 	require.True(t, created.Enabled, "created mapping should default enabled")
 
 	var list struct {
-		Machine  string                      `json:"machine"`
-		Mappings []db.WorktreeProjectMapping `json:"mappings"`
+		Machine      string                      `json:"machine"`
+		LocalMachine string                      `json:"local_machine"`
+		Machines     []string                    `json:"machines"`
+		Mappings     []db.WorktreeProjectMapping `json:"mappings"`
 	}
-	w := te.get(t, "/api/v1/settings/worktree-mappings")
+	w := te.get(t, "/api/v1/settings/worktree-mappings?machine=host-a.example")
 	assertStatus(t, w, http.StatusOK)
 	decodeInto(t, w, &list)
-	require.Equal(t, "test", list.Machine)
+	require.Equal(t, "host-a.example", list.Machine)
+	assert.Equal(t, "test", list.LocalMachine)
+	assert.Equal(t, []string{"host-a.example"}, list.Machines)
 	require.Len(t, list.Mappings, 1)
 
 	updated := putWorktreeMapping(t, te, created.ID, map[string]any{
-		"path_prefix": prefix,
-		"project":     "disabled-app",
-		"enabled":     false,
+		"path_prefix":      prefix,
+		"project":          "canonical-app-v2",
+		"original_project": "replacement-label",
+		"machine":          "host-b.example",
+		"enabled":          true,
 	})
-	assert.False(t, updated.Enabled, "updated mapping should be disabled")
+	assert.True(t, updated.Enabled)
+	assert.Equal(t, "host-a.example", updated.Machine,
+		"mapping ID determines the machine on edit")
 	assert.Equal(t, db.WorktreeMappingLayoutExplicit, updated.Layout)
-	assert.Equal(t, "disabled_app", updated.Project)
+	assert.Equal(t, "canonical_app_v2", updated.Project)
+	assert.Equal(t, "branch_label", updated.OriginalProject,
+		"HTTP edits cannot overwrite original project")
+
+	w = te.post(t, "/api/v1/settings/worktree-mappings/apply", `{
+		"machine": "host-a.example"
+	}`)
+	assertStatus(t, w, http.StatusOK)
+	var applied struct {
+		Machine         string `json:"machine"`
+		MatchedSessions int    `json:"matched_sessions"`
+		UpdatedSessions int    `json:"updated_sessions"`
+	}
+	decodeInto(t, w, &applied)
+	assert.Equal(t, "host-a.example", applied.Machine)
+	assert.Equal(t, 1, applied.MatchedSessions)
+	assert.Equal(t, 1, applied.UpdatedSessions)
+	sess, err := te.db.GetSession(context.Background(), "remote-session")
+	require.NoError(t, err)
+	assert.Equal(t, "canonical_app_v2", sess.Project)
 
 	req := httptest.NewRequest(
 		http.MethodDelete,
@@ -60,10 +93,10 @@ func TestWorktreeMappingsAPIUsesCurrentMachine(t *testing.T) {
 	te.handler.ServeHTTP(delW, req)
 	assertStatus(t, delW, http.StatusNoContent)
 
-	w = te.get(t, "/api/v1/settings/worktree-mappings")
+	w = te.get(t, "/api/v1/settings/worktree-mappings?machine=host-a.example")
 	assertStatus(t, w, http.StatusOK)
 	decodeInto(t, w, &list)
-	assert.Empty(t, list.Mappings, "mappings after delete should be empty")
+	assert.Empty(t, list.Mappings, "remote mappings after delete should be empty")
 }
 
 func TestWorktreeMappingsAPIHandlesLayouts(t *testing.T) {

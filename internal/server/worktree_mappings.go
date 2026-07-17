@@ -3,16 +3,23 @@ package server
 import "go.kenn.io/agentsview/internal/db"
 
 type worktreeMappingsResponse struct {
-	Machine  string                      `json:"machine"`
-	Mappings []db.WorktreeProjectMapping `json:"mappings"`
+	Machine      string                      `json:"machine"`
+	LocalMachine string                      `json:"local_machine"`
+	Machines     []string                    `json:"machines"`
+	Mappings     []db.WorktreeProjectMapping `json:"mappings"`
 }
 
 type worktreeMappingRequest struct {
-	PathPrefix *string `json:"path_prefix,omitempty"`
-	Layout     *string `json:"layout,omitempty"`
-	Project    *string `json:"project,omitempty"`
-	Enabled    *bool   `json:"enabled,omitempty"`
-	Machine    *string `json:"machine,omitempty"`
+	PathPrefix      *string `json:"path_prefix,omitempty"`
+	Layout          *string `json:"layout,omitempty"`
+	Project         *string `json:"project,omitempty"`
+	OriginalProject *string `json:"original_project,omitempty"`
+	Enabled         *bool   `json:"enabled,omitempty"`
+	Machine         *string `json:"machine,omitempty"`
+}
+
+type applyWorktreeMappingsRequest struct {
+	Machine *string `json:"machine,omitempty"`
 }
 
 type applyWorktreeMappingsResponse struct {

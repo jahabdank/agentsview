@@ -38,6 +38,117 @@ func TestWorktreeProjectMappingsCRUDNormalizesAndScopesByMachine(t *testing.T) {
 	assert.Empty(t, other, "server mappings")
 }
 
+func TestWorktreeProjectMappingOriginalProjectIsSetOnce(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+	prefix := filepath.Join(t.TempDir(), "service.worktrees")
+
+	created, err := d.CreateWorktreeProjectMapping(ctx, WorktreeProjectMapping{
+		Machine:         "host-a.example",
+		PathPrefix:      prefix,
+		Project:         "service",
+		OriginalProject: "branch-label",
+		Enabled:         true,
+	})
+	require.NoError(t, err, "create mapping with original project")
+	assert.Equal(t, "branch-label", created.OriginalProject)
+
+	edited, err := d.UpdateWorktreeProjectMapping(
+		ctx,
+		created.Machine,
+		created.ID,
+		WorktreeProjectMapping{
+			PathPrefix:      prefix,
+			Project:         "renamed-service",
+			OriginalProject: "replacement-label",
+			Enabled:         true,
+		},
+	)
+	require.NoError(t, err, "edit mapping with an existing original project")
+	assert.Equal(t, "branch-label", edited.OriginalProject,
+		"non-empty original_project cannot be overwritten")
+
+	settingsCreated, err := d.CreateWorktreeProjectMapping(ctx, WorktreeProjectMapping{
+		Machine:    "host-a.example",
+		PathPrefix: filepath.Join(t.TempDir(), "other.worktrees"),
+		Project:    "other-service",
+		Enabled:    true,
+	})
+	require.NoError(t, err, "create Settings-style mapping")
+	assert.Empty(t, settingsCreated.OriginalProject)
+
+	filled, err := d.UpdateWorktreeProjectMapping(
+		ctx,
+		settingsCreated.Machine,
+		settingsCreated.ID,
+		WorktreeProjectMapping{
+			PathPrefix:      settingsCreated.PathPrefix,
+			Project:         settingsCreated.Project,
+			OriginalProject: "activity-label",
+			Enabled:         true,
+		},
+	)
+	require.NoError(t, err, "fill original project once")
+	assert.Equal(t, "activity-label", filled.OriginalProject,
+		"an empty Settings-created value may be filled once")
+}
+
+func TestWorktreeProjectMappingMachinesIncludeSessionsAndMappings(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+	require.NoError(t, d.UpsertSession(Session{
+		ID: "remote-session", Machine: "host-a.example", Agent: "claude",
+		Project: "service",
+	}), "insert remote session")
+	require.NoError(t, d.UpsertSession(Session{
+		ID: "deleted-session", Machine: "deleted.example", Agent: "claude",
+		Project: "service",
+	}), "insert deleted remote session")
+	_, err := d.getWriter().ExecContext(ctx,
+		`UPDATE sessions SET deleted_at = ? WHERE id = ?`,
+		"2026-07-16T00:00:00Z", "deleted-session")
+	require.NoError(t, err, "mark remote session deleted")
+	_, err = d.CreateWorktreeProjectMapping(ctx, WorktreeProjectMapping{
+		Machine: "host-b.example", PathPrefix: filepath.Join(t.TempDir(), "service"),
+		Project: "service", Enabled: true,
+	})
+	require.NoError(t, err, "create remote mapping")
+
+	machines, err := d.ListWorktreeProjectMappingMachines(ctx)
+	require.NoError(t, err, "list mapping machines")
+	assert.Equal(t, []string{"host-a.example", "host-b.example"}, machines)
+}
+
+func TestSchemaColumnMigrationAddsWorktreeOriginalProject(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "archive.db")
+	d, err := Open(path)
+	require.NoError(t, err, "open current archive")
+	require.NoError(t, d.Close(), "close current archive")
+
+	legacy, err := sql.Open("sqlite3", path)
+	require.NoError(t, err, "open archive as legacy sqlite")
+	_, err = legacy.Exec(
+		`ALTER TABLE worktree_project_mappings DROP COLUMN original_project`,
+	)
+	require.NoError(t, err, "remove post-legacy column")
+	_, err = legacy.Exec(`
+		INSERT INTO worktree_project_mappings
+			(machine, path_prefix, layout, project, enabled)
+		VALUES ('host-a.example', '/srv/worktrees/service', 'explicit', 'service', 1)`)
+	require.NoError(t, err, "seed legacy mapping")
+	require.NoError(t, legacy.Close(), "close legacy sqlite")
+
+	migrated, err := Open(path)
+	require.NoError(t, err, "open and migrate archive")
+	defer migrated.Close()
+	mappings, err := migrated.ListWorktreeProjectMappings(ctx, "host-a.example")
+	require.NoError(t, err, "list migrated mapping")
+	require.Len(t, mappings, 1)
+	assert.Empty(t, mappings[0].OriginalProject,
+		"legacy mappings default original project to empty")
+}
+
 func TestWorktreeProjectMappingsRejectInvalidAndDuplicateRows(t *testing.T) {
 	d := testDB(t)
 	ctx := context.Background()
@@ -900,10 +1011,11 @@ func TestWorktreeProjectMappingsFinalMetadataCopyRefreshesStalePrecopy(
 	sourceMapping, err := srcDB.CreateWorktreeProjectMapping(
 		ctx,
 		WorktreeProjectMapping{
-			Machine:    "laptop",
-			PathPrefix: prefix,
-			Project:    "old-project",
-			Enabled:    true,
+			Machine:         "laptop",
+			PathPrefix:      prefix,
+			Project:         "old-project",
+			OriginalProject: "activity-label",
+			Enabled:         true,
 		},
 	)
 	require.NoError(t, err, "CreateWorktreeProjectMapping src")
@@ -918,15 +1030,21 @@ func TestWorktreeProjectMappingsFinalMetadataCopyRefreshesStalePrecopy(
 		dstDB.CopyWorktreeProjectMappingsFrom(srcPath),
 		"CopyWorktreeProjectMappingsFrom",
 	)
+	preCopied, err := dstDB.ListWorktreeProjectMappings(ctx, "laptop")
+	require.NoError(t, err, "list pre-copied mappings")
+	require.Len(t, preCopied, 1)
+	assert.Equal(t, "activity-label", preCopied[0].OriginalProject,
+		"pre-copy preserves original project")
 
 	_, err = srcDB.UpdateWorktreeProjectMapping(
 		ctx,
 		"laptop",
 		sourceMapping.ID,
 		WorktreeProjectMapping{
-			PathPrefix: prefix,
-			Project:    "new-project",
-			Enabled:    false,
+			PathPrefix:      prefix,
+			Project:         "new-project",
+			OriginalProject: "replacement-label",
+			Enabled:         false,
 		},
 	)
 	require.NoError(t, err, "UpdateWorktreeProjectMapping src")
@@ -951,6 +1069,7 @@ func TestWorktreeProjectMappingsFinalMetadataCopyRefreshesStalePrecopy(
 	require.NoError(t, err, "ListWorktreeProjectMappings")
 	require.Len(t, got, 1, "mapping count")
 	assert.Equal(t, "new_project", got[0].Project, "project")
+	assert.Equal(t, "activity-label", got[0].OriginalProject, "original project")
 	assert.False(t, got[0].Enabled, "mapping should reflect disabled source row")
 }
 
@@ -1031,6 +1150,7 @@ func TestCopyWorktreeProjectMappingsFromOldSchemaDefaultsLayout(t *testing.T) {
 	require.Len(t, got, 1, "mapping count")
 	assert.Equal(t, WorktreeMappingLayoutExplicit, got[0].Layout, "layout")
 	assert.Equal(t, "old_project", got[0].Project, "project")
+	assert.Empty(t, got[0].OriginalProject, "legacy original project")
 	assert.True(t, got[0].Enabled, "enabled")
 }
 
@@ -1057,7 +1177,79 @@ func TestCopySessionMetadataFromOldWorktreeMappingSchemaDefaultsLayout(t *testin
 	require.Len(t, got, 1, "mapping count")
 	assert.Equal(t, WorktreeMappingLayoutExplicit, got[0].Layout, "layout")
 	assert.Equal(t, "old_project", got[0].Project, "project")
+	assert.Empty(t, got[0].OriginalProject, "legacy original project")
 	assert.True(t, got[0].Enabled, "enabled")
+}
+
+func TestCopyWorktreeMappingFromSchemaWithoutOriginalProjectDefaultsEmpty(
+	t *testing.T,
+) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	srcPath := filepath.Join(dir, "legacy-with-layout.db")
+	prefix := filepath.Join(dir, "service.worktrees")
+	createWorktreeMappingDBWithoutOriginalProject(t, srcPath, prefix)
+
+	tests := []struct {
+		name string
+		copy func(*DB, string) error
+	}{
+		{
+			name: "resync pre-copy",
+			copy: func(dst *DB, source string) error {
+				return dst.CopyWorktreeProjectMappingsFrom(source)
+			},
+		},
+		{
+			name: "final metadata reconciliation",
+			copy: func(dst *DB, source string) error {
+				return dst.CopySessionMetadataFrom(source)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dst, err := Open(filepath.Join(dir, tt.name+".db"))
+			require.NoError(t, err, "open destination")
+			defer dst.Close()
+			require.NoError(t, tt.copy(dst, srcPath), "copy legacy mapping")
+
+			mappings, err := dst.ListWorktreeProjectMappings(ctx, "host-a.example")
+			require.NoError(t, err, "list copied mappings")
+			require.Len(t, mappings, 1)
+			assert.Equal(t, WorktreeMappingLayoutExplicit, mappings[0].Layout)
+			assert.Empty(t, mappings[0].OriginalProject)
+		})
+	}
+}
+
+func createWorktreeMappingDBWithoutOriginalProject(
+	t *testing.T,
+	path string,
+	prefix string,
+) {
+	t.Helper()
+	conn, err := sql.Open("sqlite3", path)
+	require.NoError(t, err, "open legacy sqlite")
+	defer conn.Close()
+	_, err = conn.Exec(`
+		CREATE TABLE worktree_project_mappings (
+			id INTEGER PRIMARY KEY,
+			machine TEXT NOT NULL,
+			path_prefix TEXT NOT NULL,
+			layout TEXT NOT NULL DEFAULT 'explicit',
+			project TEXT NOT NULL,
+			enabled INTEGER NOT NULL DEFAULT 1,
+			created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+			updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+			UNIQUE(machine, path_prefix)
+		);
+		INSERT INTO worktree_project_mappings (
+			machine, path_prefix, layout, project, enabled
+		) VALUES (
+			'host-a.example', ?, 'explicit', 'service', 1
+		);`, prefix)
+	require.NoError(t, err, "seed legacy worktree mapping")
 }
 
 func createOldWorktreeMappingDB(t *testing.T, path string, prefix string) {
