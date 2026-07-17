@@ -243,6 +243,9 @@ func TestSyncWorkerChildArgsForwardsServeConfigFlags(t *testing.T) {
 // worker mode against an isolated fixture archive and validates the on-the-wire
 // protocol: NDJSON lines, exactly one terminal result, exit 0.
 func TestSyncWorkerRealSpawnEmitsTerminalResult(t *testing.T) {
+	if testing.Short() {
+		t.Skip("real-spawn worker test re-execs the binary; skipped in -short")
+	}
 	cfg := testConfigWithClaudeFixture(t)
 	claudeDir := cfg.AgentDirs[parser.AgentClaude][0]
 
