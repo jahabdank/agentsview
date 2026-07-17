@@ -644,6 +644,57 @@ func TestProjectObservationSessionBatchExplicitEmptyProjectOmitsSnapshot(
 		"an explicit empty source must not become mapped snapshot evidence")
 }
 
+func TestUpsertSessionWithProjectIdentityUsesCurrentTransactionInsertionState(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := context.Background()
+	session := Session{
+		ID:      "atomic-identity",
+		Project: "mapped-project",
+		Machine: "laptop",
+		Agent:   "codex",
+		Cwd:     "/tmp/worktree",
+	}
+	observation := export.ProjectIdentityObservation{
+		SessionID: "atomic-identity",
+		Project:   "mapped-project",
+		Machine:   "laptop",
+		RootPath:  "/tmp/worktree",
+	}
+
+	require.NoError(t, d.UpsertSessionWithProjectIdentity(
+		session, observation, "",
+	))
+	snapshots, err := d.ListSessionProjectIdentitySnapshots(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, snapshots,
+		"fresh empty source must remove its own trigger fallback")
+
+	require.NoError(t, d.UpsertSessionWithProjectIdentity(
+		session, observation, "source-project",
+	))
+	require.NoError(t, d.UpsertSessionWithProjectIdentity(
+		session, observation, "",
+	))
+
+	stored, err := d.GetSession(ctx, "atomic-identity")
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.Equal(t, "mapped-project", stored.Project)
+	observations, err := d.ListProjectIdentityObservations(
+		ctx, []string{"mapped-project"},
+	)
+	require.NoError(t, err)
+	require.Len(t, observations, 1)
+	assert.Equal(t, "mapped-project", observations[0].Project)
+	snapshots, err = d.ListSessionProjectIdentitySnapshots(ctx)
+	require.NoError(t, err)
+	require.Len(t, snapshots, 1)
+	assert.Equal(t, "source-project", snapshots[0].Project,
+		"existing source evidence must survive an empty reparse")
+}
+
 func seedProjectIdentityObservation(t *testing.T, d *DB, project string) {
 	t.Helper()
 	require.NoError(t, d.UpsertProjectIdentityObservation(context.Background(),

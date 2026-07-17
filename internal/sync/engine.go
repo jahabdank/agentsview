@@ -6879,8 +6879,9 @@ func (e *Engine) writeBatch(
 		// incremental updates (writeIncremental), messages
 		// are written first since the session already
 		// exists.
-		sessionInserted, err := e.db.UpsertSessionWithInsertState(s)
-		if err != nil {
+		if err := e.upsertSessionWithProjectIdentity(
+			s, pw.sess.Project,
+		); err != nil {
 			if isIntentionalSessionSkip(err) {
 				if pw.sess.File.Path != "" {
 					e.cacheSkip(
@@ -6895,15 +6896,6 @@ func (e *Engine) writeBatch(
 			failedSessions++
 			continue
 		}
-		if err := e.writeProjectIdentityObservationForSessionWrite(
-			context.Background(), s, pw.sess.Project, sessionInserted,
-		); err != nil {
-			log.Printf(
-				"write project identity observation for %s: %v",
-				s.ID, err,
-			)
-		}
-
 		replaceMessages := shouldReplaceFullParseMessages(
 			pw, forceReplace, stale,
 		)
@@ -7979,17 +7971,6 @@ func (e *Engine) writeProjectIdentityObservationWithSnapshotProject(
 	s db.Session,
 	snapshotProject string,
 ) error {
-	return e.writeProjectIdentityObservationForSessionWrite(
-		ctx, s, snapshotProject, false,
-	)
-}
-
-func (e *Engine) writeProjectIdentityObservationForSessionWrite(
-	ctx context.Context,
-	s db.Session,
-	snapshotProject string,
-	sessionInserted bool,
-) error {
 	obs, ok := e.projectIdentityObservation(s)
 	if !ok {
 		return nil
@@ -8008,8 +7989,8 @@ func (e *Engine) writeProjectIdentityObservationForSessionWrite(
 	}
 	e.projectIdentityMu.Unlock()
 
-	if err := e.db.UpsertProjectIdentityObservationForSessionWrite(
-		ctx, obs, snapshotProject, sessionInserted,
+	if err := e.db.UpsertProjectIdentityObservationWithSnapshotProject(
+		ctx, obs, snapshotProject,
 	); err != nil {
 		return err
 	}
@@ -8018,6 +7999,14 @@ func (e *Engine) writeProjectIdentityObservationForSessionWrite(
 	e.projectIdentityWritten[fingerprint] = struct{}{}
 	e.projectIdentityMu.Unlock()
 	return nil
+}
+
+func (e *Engine) upsertSessionWithProjectIdentity(
+	s db.Session,
+	snapshotProject string,
+) error {
+	obs, _ := e.projectIdentityObservation(s)
+	return e.db.UpsertSessionWithProjectIdentity(s, obs, snapshotProject)
 }
 
 func projectIdentityObservationFingerprint(
@@ -8492,8 +8481,9 @@ func (e *Engine) writeSessionFullWithResolver(
 	if verdict != sessionWriteOK {
 		return errSessionPreserved
 	}
-	sessionInserted, err := e.db.UpsertSessionWithInsertState(s)
-	if err != nil {
+	if err := e.upsertSessionWithProjectIdentity(
+		s, pw.sess.Project,
+	); err != nil {
 		if isIntentionalSessionSkip(err) {
 			if pw.sess.File.Path != "" {
 				e.cacheSkip(
@@ -8506,14 +8496,6 @@ func (e *Engine) writeSessionFullWithResolver(
 		}
 		log.Printf("upsert session %s: %v", s.ID, err)
 		return err
-	}
-	if err := e.writeProjectIdentityObservationForSessionWrite(
-		context.Background(), s, pw.sess.Project, sessionInserted,
-	); err != nil {
-		log.Printf(
-			"write project identity observation for %s: %v",
-			s.ID, err,
-		)
 	}
 	update, findings := computeSignalsAndSecrets(s, msgs)
 	if err := e.db.ReplaceSessionContent(s.ID, msgs, update, findings); err != nil {

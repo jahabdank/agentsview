@@ -1393,30 +1393,38 @@ func upsertSessionArgs(s Session) []any {
 // Sessions that were permanently deleted (in excluded_sessions)
 // or currently in the trash are rejected.
 func (db *DB) UpsertSession(s Session) error {
-	_, err := db.UpsertSessionWithInsertState(s)
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	writer := db.getWriter()
+	_, err := upsertSessionExec(
+		writer.Exec,
+		writer.QueryRow,
+		s,
+	)
 	return err
 }
 
-// UpsertSessionWithInsertState inserts or updates a session and reports
-// whether this write inserted the row, which also means it fired insert-only
-// database triggers.
-func (db *DB) UpsertSessionWithInsertState(s Session) (bool, error) {
+func upsertSessionExec(
+	exec func(string, ...any) (sql.Result, error),
+	queryRow func(string, ...any) rowScanner,
+	s Session,
+) (bool, error) {
 	_ = ValidateAndSanitize(&s, nil, nil)
-
-	db.mu.Lock()
-	defer db.mu.Unlock()
 
 	// Check exclusion/trash state under the write lock to avoid a race with
 	// concurrent DeleteSession/EmptyTrash/RestoreSession.
 	var excluded int
-	_ = db.getWriter().QueryRow(
+	err := queryRow(
 		"SELECT 1 FROM excluded_sessions WHERE id = ?", s.ID,
 	).Scan(&excluded)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("checking exclusion for %s: %w", s.ID, err)
+	}
 	if excluded == 1 {
 		return false, ErrSessionExcluded
 	}
 	var deletedAt sql.NullString
-	err := db.getWriter().QueryRow(
+	err = queryRow(
 		"SELECT deleted_at FROM sessions WHERE id = ?", s.ID,
 	).Scan(&deletedAt)
 	sessionInserted := errors.Is(err, sql.ErrNoRows)
@@ -1434,7 +1442,7 @@ func (db *DB) UpsertSessionWithInsertState(s Session) (bool, error) {
 	// up-to-date and starve the rewrite on the next sync.
 	// New rows are seeded with 0 (the default) and bumped to
 	// the current version once their messages land.
-	_, err = db.getWriter().Exec(
+	_, err = exec(
 		upsertSessionSQL,
 		upsertSessionArgs(s)...,
 	)

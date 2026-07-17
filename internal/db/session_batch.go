@@ -291,35 +291,17 @@ func writeOneSessionBatchTx(
 	write SessionBatchWrite,
 	pendingRecallRevocations *recallEvidenceRevocationEvents,
 ) (int, error) {
-	var excluded int
-	err := tx.QueryRow(
-		"SELECT 1 FROM excluded_sessions WHERE id = ?",
-		write.Session.ID,
-	).Scan(&excluded)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return 0, fmt.Errorf(
-			"checking exclusion for %s: %w",
-			write.Session.ID, err,
-		)
+	sessionInserted, err := upsertSessionExec(
+		tx.Exec,
+		func(query string, args ...any) rowScanner {
+			return tx.QueryRow(query, args...)
+		},
+		write.Session,
+	)
+	if err != nil {
+		return 0, err
 	}
-	if excluded == 1 {
-		return 0, ErrSessionExcluded
-	}
-	var deletedAt sql.NullString
-	err = tx.QueryRow(
-		"SELECT deleted_at FROM sessions WHERE id = ?",
-		write.Session.ID,
-	).Scan(&deletedAt)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return 0, fmt.Errorf(
-			"checking trash for %s: %w",
-			write.Session.ID, err,
-		)
-	}
-	sessionExists := err == nil
-	if deletedAt.Valid {
-		return 0, ErrSessionTrashed
-	}
+	sessionExists := !sessionInserted
 	replacementTranscriptChanged := false
 	if write.ReplaceMessages && sessionExists {
 		stored, err := sessionMessagesTx(
@@ -333,15 +315,6 @@ func writeOneSessionBatchTx(
 		)
 	}
 
-	if _, err := tx.Exec(
-		upsertSessionSQL,
-		upsertSessionArgs(write.Session)...,
-	); err != nil {
-		return 0, fmt.Errorf(
-			"upserting session %s: %w",
-			write.Session.ID, err,
-		)
-	}
 	if write.IdentityObservation.Project != "" {
 		var err error
 		if write.IdentitySnapshotProject == nil {
@@ -352,7 +325,7 @@ func writeOneSessionBatchTx(
 			err = upsertProjectIdentityObservationWithSnapshotProjectTx(
 				tx, write.IdentityObservation,
 				*write.IdentitySnapshotProject,
-				!sessionExists,
+				sessionInserted,
 			)
 		}
 		if err != nil {

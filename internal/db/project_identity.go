@@ -675,21 +675,6 @@ func (db *DB) UpsertProjectIdentityObservationWithSnapshotProject(
 	obs export.ProjectIdentityObservation,
 	snapshotProject string,
 ) error {
-	return db.UpsertProjectIdentityObservationForSessionWrite(
-		ctx, obs, snapshotProject, false,
-	)
-}
-
-// UpsertProjectIdentityObservationForSessionWrite publishes current aggregate
-// evidence and writes source snapshot evidence for one session write. An empty
-// source removes the insert-trigger fallback only when this write inserted the
-// session; reparses preserve every pre-existing immutable snapshot.
-func (db *DB) UpsertProjectIdentityObservationForSessionWrite(
-	ctx context.Context,
-	obs export.ProjectIdentityObservation,
-	snapshotProject string,
-	sessionInserted bool,
-) error {
 	if err := db.requireWritable(); err != nil {
 		return err
 	}
@@ -722,12 +707,54 @@ func (db *DB) UpsertProjectIdentityObservationForSessionWrite(
 		func(ctx context.Context, query string, args ...any) rowScanner {
 			return tx.QueryRowContext(ctx, query, args...)
 		},
-		obs, snapshotProject, sessionInserted,
+		obs, snapshotProject, false,
 	); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("committing project identity observation upsert: %w", err)
+	}
+	return nil
+}
+
+// UpsertSessionWithProjectIdentity atomically writes the current session and
+// aggregate identity while preserving parser-time snapshot evidence. The
+// transaction-local insert result permits removal of only the fallback created
+// by this session write.
+func (db *DB) UpsertSessionWithProjectIdentity(
+	s Session,
+	obs export.ProjectIdentityObservation,
+	snapshotProject string,
+) error {
+	if err := db.requireWritable(); err != nil {
+		return err
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	tx, err := db.getWriter().Begin()
+	if err != nil {
+		return fmt.Errorf("beginning session identity upsert: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	sessionInserted, err := upsertSessionExec(
+		tx.Exec,
+		func(query string, args ...any) rowScanner {
+			return tx.QueryRow(query, args...)
+		},
+		s,
+	)
+	if err != nil {
+		return err
+	}
+	if obs.Project != "" {
+		if err := upsertProjectIdentityObservationWithSnapshotProjectTx(
+			tx, obs, snapshotProject, sessionInserted,
+		); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing session identity upsert: %w", err)
 	}
 	return nil
 }
