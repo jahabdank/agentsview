@@ -1,5 +1,15 @@
 # Activity Project Reclassification Implementation Plan
 
+> **Status (2026-07-17):** Tasks 1-9 are implemented on branch `cool-lillipilli`
+> (parser fix `08e556e7e` through kit-ui pin `4e0452638`), with both Playwright
+> modes passing. A UI/UX review round was applied on top: reserved action slot
+> so the pencil no longer covers the value column, server-normalized target
+> shown before apply, stacked Settings layout buttons, disambiguated candidate
+> labels, accurate pre-version tooltip, and a Settings deep link that preselects
+> the rule's machine. Task 10 remains: rerun whole-branch
+> `make lint`/`make test`/`make test-postgres`, the subagent whole-branch
+> review, scrub, push, and PR.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > superpowers:subagent-driven-development (recommended) or
 > superpowers:executing-plans to implement this plan task-by-task. Steps use
@@ -89,7 +99,7 @@ ______________________________________________________________________
 
 - Consumed by: Tasks 7 and 8 after agentsview pins the merged kit-ui commit.
 
-- [ ] **Step 1: Create an isolated kit-ui worktree and establish its baseline**
+- [x] **Step 1: Create an isolated kit-ui worktree and establish its baseline**
 
     Read kit-ui's repository instructions, create a linked feature worktree from
     the latest locally available `origin/main` without changing the existing
@@ -104,7 +114,7 @@ ______________________________________________________________________
 
     Expected: exit 0 before edits.
 
-- [ ] **Step 2: Write failing browser tests for all three contracts**
+- [x] **Step 2: Write failing browser tests for all three contracts**
 
     Add assertions equivalent to:
 
@@ -126,7 +136,7 @@ ______________________________________________________________________
     hard-coded Modal label, missing custom row, and missing focusable disabled
     semantics.
 
-- [ ] **Step 3: Implement the minimal shared APIs**
+- [x] **Step 3: Implement the minimal shared APIs**
 
     Use these contracts:
 
@@ -159,7 +169,7 @@ ______________________________________________________________________
     rows and is always the row named by `aria-activedescendant` when
     highlighted.
 
-- [ ] **Step 4: Verify, document, commit, scrub, push, and open the kit-ui PR**
+- [x] **Step 4: Verify, document, commit, scrub, push, and open the kit-ui PR**
 
     Run:
 
@@ -199,7 +209,7 @@ ______________________________________________________________________
 
 - Consumed by: resync lifecycle coverage in Task 6.
 
-- [ ] **Step 1: Add failing parser and version tests**
+- [x] **Step 1: Add failing parser and version tests**
 
     Extend the existing table with synthetic cases:
 
@@ -241,7 +251,7 @@ ______________________________________________________________________
 
     Expected: generic nested case and version assertion fail.
 
-- [ ] **Step 2: Add the guarded layout and bump the version**
+- [x] **Step 2: Add the guarded layout and bump the version**
 
     Add this layout after the tool-specific GitHub layout:
 
@@ -255,7 +265,7 @@ ______________________________________________________________________
 
     Set `dataVersion = 68` without changing schema version behavior.
 
-- [ ] **Step 3: Run focused tests and commit**
+- [x] **Step 3: Run focused tests and commit**
 
     Run the Step 1 command, `go fmt ./...`, and `go vet ./internal/parser/...`.
     Expected: exit 0. Commit as
@@ -291,7 +301,7 @@ ______________________________________________________________________
 
 - Consumed by: atomic apply in Task 4 and Settings UI in Task 7.
 
-- [ ] **Step 1: Add failing migration, set-once, carryover, and remote-machine
+- [x] **Step 1: Add failing migration, set-once, carryover, and remote-machine
   tests**
 
     Tests must prove:
@@ -319,7 +329,7 @@ ______________________________________________________________________
 
     Expected: compile failures for the missing field and API contracts.
 
-- [ ] **Step 2: Add the non-destructive column and update every scan/copy path**
+- [x] **Step 2: Add the non-destructive column and update every scan/copy path**
 
     Add:
 
@@ -340,7 +350,7 @@ ______________________________________________________________________
     INSERT, scan, resync copy, and metadata reconciliation statement. Use a
     conditional `originalProjectSelect` for old schemas.
 
-- [ ] **Step 3: Enforce set-once updates and machine discovery**
+- [x] **Step 3: Enforce set-once updates and machine discovery**
 
     The update expression is:
 
@@ -364,7 +374,7 @@ ______________________________________________________________________
     resolve update/delete machine by the globally unique mapping ID at the Huma
     boundary.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
     Run the Step 1 command, `go fmt ./...`, and
     `go vet ./internal/db/... ./internal/server/...`. Expected: exit 0. Commit
@@ -416,7 +426,7 @@ ______________________________________________________________________
 
 - Consumed by: Huma handlers in Task 5.
 
-- [ ] **Step 1: Add failing evaluator, token, atomicity, and identity tests**
+- [x] **Step 1: Add failing evaluator, token, atomicity, and identity tests**
 
     Cover literal observable cases:
 
@@ -444,7 +454,7 @@ ______________________________________________________________________
 
     Expected: compile failures for the new API.
 
-- [ ] **Step 2: Extract a separator-neutral matcher and shared evaluator**
+- [x] **Step 2: Extract a separator-neutral matcher and shared evaluator**
 
     Normalize stored matching paths without consulting the archive host OS:
 
@@ -467,7 +477,7 @@ ______________________________________________________________________
     loads rows once, applies sibling-cwd fallback once, and returns matches plus
     proposed updates.
 
-- [ ] **Step 3: Implement the machine mapping-set token and exact collision
+- [x] **Step 3: Implement the machine mapping-set token and exact collision
   rule**
 
     Hash sorted effective mapping rows with length-prefixed fields:
@@ -481,7 +491,7 @@ ______________________________________________________________________
     exists, and returns its ID. Apply accepts only that returned ID and rejects
     if either the token or exact collision identity changed.
 
-- [ ] **Step 4: Implement one transaction for rule, sessions, and aggregates**
+- [x] **Step 4: Implement one transaction for rule, sessions, and aggregates**
 
     Under the existing DB mutex and one transaction:
 
@@ -496,7 +506,7 @@ ______________________________________________________________________
     rows first so existing triggers record tombstones, then reinsert only
     evidence still supported by visible sessions. Never update snapshot rows.
 
-- [ ] **Step 5: Serialize apply with sync and verify**
+- [x] **Step 5: Serialize apply with sync and verify**
 
     Invoke the DB mutation only inside `Engine.RunExclusive`. Add a channel-based
     test proving watcher/sync work cannot overlap the transaction. Run the Step
@@ -533,7 +543,7 @@ ______________________________________________________________________
 
 - Preview/apply responses use Task 4's authoritative totals and bounded samples.
 
-- [ ] **Step 1: Write failing candidate and handler tests**
+- [x] **Step 1: Write failing candidate and handler tests**
 
     Seed range-in and range-out sessions, two machines, identity-backed sibling
     cwds, an exact-cwd fallback, an unavailable cwd, and two raw labels with the
@@ -554,7 +564,7 @@ ______________________________________________________________________
 
     Expected: missing-method and missing-route failures.
 
-- [ ] **Step 2: Reuse Activity selection and group candidates**
+- [x] **Step 2: Reuse Activity selection and group candidates**
 
     Extract the Activity input resolution into a helper shared by report and
     candidate handlers. Candidate DB selection reuses `activityReportSessions`,
@@ -573,14 +583,14 @@ ______________________________________________________________________
     machine, evidence kind, evidence root, and fallback cwd. Return counts and
     at most 10 sorted examples; represent missing cwd as unavailable.
 
-- [ ] **Step 3: Register writable-only preview and apply routes**
+- [x] **Step 3: Register writable-only preview and apply routes**
 
     The writable guard casts to `*db.DB` and requires a non-nil engine. Preview is
     read-only but local-only because it depends on archive path evidence. Apply
     calls `engine.RunExclusive(func() error { ... })`. Map token conflicts to
     HTTP 409 and invalid drafts to HTTP 400.
 
-- [ ] **Step 4: Generate the client, verify, and commit**
+- [x] **Step 4: Generate the client, verify, and commit**
 
     Run:
 
@@ -623,7 +633,7 @@ ______________________________________________________________________
 - Produces: filtered PG and DuckDB stale-session reconciliation after a project
   scope move.
 
-- [ ] **Step 1: Write failing lifecycle and mirror-move tests**
+- [x] **Step 1: Write failing lifecycle and mirror-move tests**
 
     The lifecycle test creates one live-source and one orphaned session, applies a
     remote-machine mapping, runs a full resync, and asserts both keep the
@@ -653,7 +663,7 @@ ______________________________________________________________________
     Run focused SQLite/DuckDB tests and the `pgtest` matrix. Expected: remote
     resync and PG old-scope cases fail before implementation.
 
-- [ ] **Step 2: Apply mappings for every represented machine during resync**
+- [x] **Step 2: Apply mappings for every represented machine during resync**
 
     After metadata carryover, query distinct mapping machines and invoke
     `ApplyWorktreeProjectMappingsFromSync` for each. Keep the phase non-fatal
@@ -664,7 +674,7 @@ ______________________________________________________________________
     In incremental writes, resolve or reload the persisted current project before
     writing aggregate identity observations. Do not modify immutable snapshots.
 
-- [ ] **Step 3: Reconcile filtered mirror scope moves**
+- [x] **Step 3: Reconcile filtered mirror scope moves**
 
     For each source archive/machine ownership scope, compare mirror session IDs in
     the configured project scope with current local IDs in that same scope.
@@ -672,7 +682,7 @@ ______________________________________________________________________
     candidates. Reuse the DuckDB reconciliation shape in PostgreSQL and preserve
     hard-delete ownership checks.
 
-- [ ] **Step 4: Verify parity and commit**
+- [x] **Step 4: Verify parity and commit**
 
     Run:
 
@@ -714,7 +724,7 @@ ______________________________________________________________________
 
 - Consumed by: Activity modal in Task 8.
 
-- [ ] **Step 1: Pin the merged kit-ui SHA and add failing shared-control tests**
+- [x] **Step 1: Pin the merged kit-ui SHA and add failing shared-control tests**
 
     After the upstream PR merges, replace the package hash with its merge commit
     and run `npm install`. Keep npm's canonical lockfile URL form.
@@ -723,7 +733,7 @@ ______________________________________________________________________
     All, a partial-match custom query can be committed, and empty input cannot.
     Expected: tests fail before wrapper props exist.
 
-- [ ] **Step 2: Implement the backward-compatible wrapper and localize all Modal
+- [x] **Step 2: Implement the backward-compatible wrapper and localize all Modal
   close labels**
 
     Use defaults:
@@ -737,14 +747,14 @@ ______________________________________________________________________
     Pass `closeLabel={m.*()}` at every existing Modal callsite using its existing
     close message; add no new hard-coded English.
 
-- [ ] **Step 3: Add failing Settings interaction tests**
+- [x] **Step 3: Add failing Settings interaction tests**
 
     Assert machine-switch request arguments and stale-response cancellation,
     selected-machine create/apply, original-label rendering, confirmation before
     delete or enabled-to-disabled save, and the existing read-only no-request
     behavior.
 
-- [ ] **Step 4: Implement Settings with kit-ui controls**
+- [x] **Step 4: Implement Settings with kit-ui controls**
 
     Replace new interactive chrome with kit-ui `Typeahead`, `TextInput`, `Button`,
     and `Modal`. Reset editing state on machine changes. The confirmation copy
@@ -752,7 +762,7 @@ ______________________________________________________________________
     orphaned sessions retain stored classification. Do not add controls to the
     read-only informational branch.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
     Run:
 
@@ -803,7 +813,7 @@ ______________________________________________________________________
 
 - Produces: page-owned modal state that survives report refresh failure.
 
-- [ ] **Step 1: Add failing store and breakdown action tests**
+- [x] **Step 1: Add failing store and breakdown action tests**
 
     Tests assert the candidate request receives exactly the same range/filter
     fields as report load; only Project rows have action buttons; fine-pointer
@@ -811,7 +821,7 @@ ______________________________________________________________________
     not-yet-known or read-only server renders a tabbable `aria-disabled` action
     whose activation makes no request.
 
-- [ ] **Step 2: Extract Activity query construction and add refresh result
+- [x] **Step 2: Extract Activity query construction and add refresh result
   semantics**
 
     `queryParams()` returns the generated Activity request object, including
@@ -820,7 +830,7 @@ ______________________________________________________________________
     cache invalidation/reload, preserves the last good report on error, and
     returns `false` instead of hiding the error outcome.
 
-- [ ] **Step 3: Add failing modal state-machine tests**
+- [x] **Step 3: Add failing modal state-machine tests**
 
     Cover one candidate preselection, multiple candidates, unavailable cwd,
     editable prefix debounce/cancellation, full-archive impact totals, warning
@@ -828,7 +838,7 @@ ______________________________________________________________________
     target, mapping-token conflict refresh, exactly one Apply, successful
     report/options reload, applied-refresh-failed state, and refresh-only retry.
 
-- [ ] **Step 4: Implement the page-owned modal and dense-row action**
+- [x] **Step 4: Implement the page-owned modal and dense-row action**
 
     Keep modal state outside the `{#if activity.report}` subtree. The button is an
     absolutely positioned kit-ui `IconButton`; its DOM position and focusability
@@ -839,14 +849,14 @@ ______________________________________________________________________
     exact clicked display label as `original_project`. It clears an accepted
     preview token whenever machine, candidate, prefix, or target changes.
 
-- [ ] **Step 5: Implement focus restoration and failure-safe completion**
+- [x] **Step 5: Implement focus restoration and failure-safe completion**
 
     After apply succeeds, call `refreshAfterReclassification()`. On success, close
     and focus the connected trigger; if the row disappeared, focus the Project
     heading. On failure, keep the modal open with only a refresh retry and never
     call apply again.
 
-- [ ] **Step 6: Add synchronized localized copy and verify**
+- [x] **Step 6: Add synchronized localized copy and verify**
 
     Add identical `activity_reclassify_*` and new `worktree_*` keys to every
     catalog. Use Paraglide plural variants for sessions, candidates, and
@@ -885,7 +895,7 @@ ______________________________________________________________________
 
 - Produces: writable SQLite and read-only DuckDB browser regression coverage.
 
-- [ ] **Step 1: Extend the fixture and prove the new data shape**
+- [x] **Step 1: Extend the fixture and prove the new data shape**
 
     Insert at least two root sessions for one remote machine, including a nested
     cwd. After session insertion, call `UpsertProjectIdentityObservation` with a
@@ -893,7 +903,7 @@ ______________________________________________________________________
     fixture test or observable DB assertion for machine, cwd, project, and
     snapshot evidence.
 
-- [ ] **Step 2: Write the failing writable Playwright workflow**
+- [x] **Step 2: Write the failing writable Playwright workflow**
 
     The committed spec must:
 
@@ -909,14 +919,14 @@ ______________________________________________________________________
     Run the focused Chromium spec. Expected: fail before fixture/API/UI support is
     complete, then pass after wiring.
 
-- [ ] **Step 3: Add coarse-pointer and read-only browser coverage**
+- [x] **Step 3: Add coarse-pointer and read-only browser coverage**
 
     Use a real Chromium touch/coarse-pointer context where supported to assert the
     action is visible without hover. Run the same screen against DuckDB and
     assert the action is present, tabbable, `aria-disabled`, explains the
     writable archive, and sends no candidate or mutation request.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
     Run:
 
