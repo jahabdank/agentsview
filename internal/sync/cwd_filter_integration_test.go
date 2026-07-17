@@ -206,6 +206,55 @@ func TestReconcileWatchRootsCwdFilteredSourceRevokesDeletionProof(t *testing.T) 
 	assertSessionMessageCount(t, env.db, "inside-reconcile", 2)
 }
 
+func TestSyncAllCwdFilterChangeRevokesSkippedSourceDeletionProof(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	env := &testEnv{db: dbtest.OpenTestDB(t), claudeDir: t.TempDir()}
+	newEngine := func(prefixes []string) *sync.Engine {
+		return sync.NewEngine(env.db, sync.EngineConfig{
+			AgentDirs: map[parser.AgentType][]string{
+				parser.AgentClaude: {env.claudeDir},
+			},
+			Machine:            "local",
+			IncludeCwdPrefixes: prefixes,
+		})
+	}
+
+	env.engine = newEngine(nil)
+	t.Cleanup(func() { env.engine.Close() })
+	content := testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarly, "Outside", "/workspace/personal/blog").
+		AddClaudeAssistant(tsEarlyS5, "ok").
+		String()
+	path := env.writeClaudeSessionForProject(
+		t, "/workspace/personal/blog", "outside-periodic.jsonl", content,
+	)
+	env.engine.SyncAll(t.Context(), nil)
+	assertSessionMessageCount(t, env.db, "outside-periodic", 2)
+
+	// Restart with a newly restrictive filter, leaving the source unchanged so
+	// ordinary discovery takes its freshness-skip path. The skipped source must
+	// lose the deletion proof established before the filter changed.
+	env.engine.Close()
+	env.engine = newEngine([]string{"/workspace/work"})
+	env.engine.SyncAll(t.Context(), nil)
+	ownership, err := env.db.ListActiveSessionSourceOwnershipPage(
+		t.Context(), "local", string(parser.AgentClaude), env.claudeDir,
+		db.SessionSourceCursor{},
+	)
+	require.NoError(t, err)
+	assert.Empty(t, ownership,
+		"an unchanged source rejected by the new CWD filter must lose deletion proof")
+
+	require.NoError(t, os.Remove(path))
+	require.NoError(t, env.engine.ReconcileWatchRoots(
+		t.Context(), []string{env.claudeDir}, false,
+	))
+	assertSessionMessageCount(t, env.db, "outside-periodic", 2)
+}
+
 // A full resync where the cwd allow-list vetoes every discovered
 // session is an intentional result, not a broken rebuild: the swap
 // must proceed and the orphan copy must restore the archived rows

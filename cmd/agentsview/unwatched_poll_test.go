@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -111,11 +113,15 @@ func TestUnwatchedPollConcurrentAddDeduplicatesUpdatedRootSet(t *testing.T) {
 		t.Context(), syncer, ticks, func() {}, func(run func()) { run() }, nil,
 	)
 	t.Cleanup(coordinator.Stop)
+	parent := t.TempDir()
+	rootA := requireExistingPollRoot(t, parent, "root-a")
+	rootB := requireExistingPollRoot(t, parent, "root-b")
+	rootC := requireExistingPollRoot(t, parent, "root-c")
 
 	additions := [][]string{
-		{"/root-b", "/root-a"},
-		{"/root-a", "/root-c"},
-		{"/root-c", "/root-b"},
+		{rootB, rootA},
+		{rootA, rootC},
+		{rootC, rootB},
 	}
 	var wg sync.WaitGroup
 	addErrors := make(chan error, len(additions))
@@ -132,7 +138,7 @@ func TestUnwatchedPollConcurrentAddDeduplicatesUpdatedRootSet(t *testing.T) {
 
 	coordinator.Wake()
 	requirePollWithin(t, syncer.wake, time.Second)
-	assert.Equal(t, [][]string{{"/root-a", "/root-b", "/root-c"}}, syncer.snapshot())
+	assert.Equal(t, [][]string{{rootA, rootB, rootC}}, syncer.snapshot())
 }
 
 func TestUnwatchedPollTickUsesRootsAddedAfterStart(t *testing.T) {
@@ -142,15 +148,53 @@ func TestUnwatchedPollTickUsesRootsAddedAfterStart(t *testing.T) {
 		t.Context(), syncer, ticks, func() {}, func(run func()) { run() }, nil,
 	)
 	t.Cleanup(coordinator.Stop)
-	require.NoError(t, coordinator.AddRoots([]string{"/initial"}))
-	require.NoError(t, coordinator.AddRoots([]string{"/runtime"}))
+	parent := t.TempDir()
+	initial := requireExistingPollRoot(t, parent, "initial")
+	runtime := requireExistingPollRoot(t, parent, "runtime")
+	require.NoError(t, coordinator.AddRoots([]string{initial}))
+	require.NoError(t, coordinator.AddRoots([]string{runtime}))
 
 	ticks <- time.Now()
 	requirePollWithin(t, syncer.wake, time.Second)
 
-	assert.Equal(t, [][]string{{"/initial", "/runtime"}}, syncer.snapshot())
+	assert.Equal(t, [][]string{{initial, runtime}}, syncer.snapshot())
 	assert.Equal(t, []bool{false}, syncer.full,
 		"unwatched polling must reconcile the owned scopes authoritatively")
+}
+
+func TestUnwatchedPollSkipsAbsentObligatedRootUntilItReturns(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "provider")
+	require.NoError(t, os.Mkdir(root, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, "session.jsonl"), []byte("session\n"), 0o600,
+	))
+
+	syncer := &recordingUnwatchedPollSyncer{wake: make(chan struct{}, 3)}
+	coordinator := newUnwatchedPollCoordinatorWithTicks(
+		t.Context(), syncer, make(chan time.Time), func() {},
+		func(run func()) { run() }, nil,
+	)
+	t.Cleanup(coordinator.Stop)
+	require.NoError(t, coordinator.AddObligation(pollingObligation{
+		Key: "provider-root", Roots: []string{root},
+	}))
+
+	coordinator.Wake()
+	requirePollWithin(t, syncer.wake, time.Second)
+	assert.Equal(t, [][]string{{root}}, syncer.snapshot())
+
+	require.NoError(t, os.RemoveAll(root))
+	coordinator.Wake()
+	assert.Never(t, func() bool { return len(syncer.snapshot()) > 1 },
+		100*time.Millisecond, 10*time.Millisecond,
+		"an absent root must not become an authoritative empty scope")
+
+	require.NoError(t, os.Mkdir(root, 0o755))
+	coordinator.Wake()
+	requirePollWithin(t, syncer.wake, time.Second)
+	assert.Equal(t, [][]string{{root}, {root}}, syncer.snapshot(),
+		"the polling obligation must remain active for a returning root")
 }
 
 func TestUnwatchedPollObligationUpdatesRemainResponsiveDuringReconciliation(
@@ -172,18 +216,21 @@ func TestUnwatchedPollObligationUpdatesRemainResponsiveDuringReconciliation(
 		}
 		coordinator.Stop()
 	})
+	parent := t.TempDir()
+	initial := requireExistingPollRoot(t, parent, "initial")
+	replacement := requireExistingPollRoot(t, parent, "replacement")
 	require.NoError(t, coordinator.AddObligation(pollingObligation{
-		Key: "initial", Roots: []string{"/initial"},
+		Key: "initial", Roots: []string{initial},
 	}))
 
 	coordinator.Wake()
-	assert.Equal(t, []string{"/initial"},
+	assert.Equal(t, []string{initial},
 		requireReceivePollRoots(t, syncer.started, time.Second))
 
 	addResult := make(chan error, 1)
 	go func() {
 		addResult <- coordinator.AddObligation(pollingObligation{
-			Key: "replacement", Roots: []string{"/replacement"},
+			Key: "replacement", Roots: []string{replacement},
 		})
 	}()
 	require.NoError(t, requireReceivePollResult(t, addResult, time.Second),
@@ -198,10 +245,10 @@ func TestUnwatchedPollObligationUpdatesRemainResponsiveDuringReconciliation(
 	coordinator.Wake()
 
 	close(syncer.release)
-	assert.Equal(t, []string{"/replacement"},
+	assert.Equal(t, []string{replacement},
 		requireReceivePollRoots(t, syncer.started, time.Second))
 	calls, maxActive := syncer.snapshot()
-	assert.Equal(t, [][]string{{"/initial"}, {"/replacement"}}, calls)
+	assert.Equal(t, [][]string{{initial}, {replacement}}, calls)
 	assert.Equal(t, 1, maxActive, "poll reconciliations must remain serialized")
 }
 
@@ -219,7 +266,8 @@ func TestUnwatchedPollStopCancelsAndJoinsActiveReconciliation(t *testing.T) {
 		cancelParent()
 		coordinator.Stop()
 	})
-	require.NoError(t, coordinator.AddRoots([]string{"/owned"}))
+	owned := requireExistingPollRoot(t, t.TempDir(), "owned")
+	require.NoError(t, coordinator.AddRoots([]string{owned}))
 	coordinator.Wake()
 	requirePollWithin(t, syncer.started, time.Second)
 	coordinator.Wake()
@@ -256,7 +304,8 @@ func TestUnwatchedPollParentCancellationCancelsJoinsAndRejectsUpdates(
 		cancelParent()
 		coordinator.Stop()
 	})
-	require.NoError(t, coordinator.AddRoots([]string{"/owned"}))
+	owned := requireExistingPollRoot(t, t.TempDir(), "owned")
+	require.NoError(t, coordinator.AddRoots([]string{owned}))
 	coordinator.Wake()
 	requirePollWithin(t, syncer.started, time.Second)
 
@@ -284,18 +333,21 @@ func TestUnwatchedPollRemoveRootsStopsReconciliationAfterNativeRecovery(t *testi
 		t.Context(), syncer, ticks, func() {}, func(run func()) { run() }, nil,
 	)
 	t.Cleanup(coordinator.Stop)
+	parent := t.TempDir()
+	recovered := requireExistingPollRoot(t, parent, "recovered")
+	stillUnwatched := requireExistingPollRoot(t, parent, "still-unwatched")
 	require.NoError(t, coordinator.AddObligation(pollingObligation{
-		Key: "recovered-watch", Roots: []string{"/recovered"},
+		Key: "recovered-watch", Roots: []string{recovered},
 	}))
 	require.NoError(t, coordinator.AddObligation(pollingObligation{
-		Key: "still-unwatched", Roots: []string{"/still-unwatched"},
+		Key: "still-unwatched", Roots: []string{stillUnwatched},
 	}))
 	require.NoError(t, coordinator.RemoveObligation("recovered-watch"))
 
 	coordinator.Wake()
 	requirePollWithin(t, syncer.wake, time.Second)
 
-	assert.Equal(t, [][]string{{"/still-unwatched"}}, syncer.snapshot())
+	assert.Equal(t, [][]string{{stillUnwatched}}, syncer.snapshot())
 }
 
 func TestUnwatchedPollRemovingOneOverlappingObligationKeepsSharedRoot(t *testing.T) {
@@ -305,11 +357,14 @@ func TestUnwatchedPollRemovingOneOverlappingObligationKeepsSharedRoot(t *testing
 		t.Context(), syncer, ticks, func() {}, func(run func()) { run() }, nil,
 	)
 	t.Cleanup(coordinator.Stop)
+	parent := t.TempDir()
+	shared := requireExistingPollRoot(t, parent, "shared")
+	persistentOnly := requireExistingPollRoot(t, parent, "persistent-only")
 	require.NoError(t, coordinator.AddObligation(pollingObligation{
-		Key: "pending", Roots: []string{"/shared"},
+		Key: "pending", Roots: []string{shared},
 	}))
 	require.NoError(t, coordinator.AddObligation(pollingObligation{
-		Key: "persistent", Roots: []string{"/shared", "/persistent-only"},
+		Key: "persistent", Roots: []string{shared, persistentOnly},
 	}))
 	require.NoError(t, coordinator.RemoveObligation("pending"))
 
@@ -317,7 +372,7 @@ func TestUnwatchedPollRemovingOneOverlappingObligationKeepsSharedRoot(t *testing
 	requirePollWithin(t, syncer.wake, time.Second)
 
 	assert.Equal(t,
-		[][]string{{"/persistent-only", "/shared"}}, syncer.snapshot())
+		[][]string{{persistentOnly, shared}}, syncer.snapshot())
 }
 
 func TestUnwatchedPollEmptyObligationNeverExpandsToFullReconciliation(t *testing.T) {
@@ -411,6 +466,13 @@ func requireReceivePollRoots(
 		require.FailNow(t, "poll coordinator ownership did not arrive before timeout")
 		return nil
 	}
+}
+
+func requireExistingPollRoot(t *testing.T, parent, name string) string {
+	t.Helper()
+	root := filepath.Join(parent, name)
+	require.NoError(t, os.Mkdir(root, 0o755))
+	return root
 }
 
 func requireReceivePollResult(

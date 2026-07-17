@@ -5414,24 +5414,30 @@ func (e *Engine) collectAndBatch(
 
 	var pending []pendingWrite
 	var pendingLeases []*parseRetentionLease
-	baselineSources := make([]db.SessionSourcePath, 0, reconciliationPageSize)
-	baselineSeen := make(map[db.SessionSourcePath]struct{}, reconciliationPageSize)
+	baselineCandidates := make([]db.SessionSourcePath, 0, reconciliationPageSize)
+	baselineAdmission := make(map[db.SessionSourcePath]bool, reconciliationPageSize)
 	runtimeMetrics := reconciliationRuntimeMetricsFor(ctx)
 	flushBaselineSources := func() {
-		if len(baselineSources) == 0 {
+		if len(baselineCandidates) == 0 {
 			return
 		}
-		if err := e.db.BaselineActiveSessionSourcePaths(
-			ctx, e.machine, baselineSources,
+		admitted := make([]db.SessionSourcePath, 0, len(baselineCandidates))
+		for _, source := range baselineCandidates {
+			if baselineAdmission[source] {
+				admitted = append(admitted, source)
+			}
+		}
+		if err := e.db.ReplaceActiveSessionSourceBaselines(
+			ctx, e.machine, baselineCandidates, admitted,
 		); err != nil {
-			log.Printf("baseline successful non-write sources: %v", err)
+			log.Printf("replace successful non-write source baselines: %v", err)
 			stats.RecordFailed()
 			e.poisonSQLiteContainerPass()
 		}
-		baselineSources = baselineSources[:0]
-		clear(baselineSeen)
+		baselineCandidates = baselineCandidates[:0]
+		clear(baselineAdmission)
 	}
-	baselineSuccessfulSource := func(job syncJob) {
+	baselineProcessedSource := func(job syncJob, admitted bool) {
 		source := db.SessionSourcePath{
 			Agent: string(job.agent), FilePath: e.effectiveSourcePath(job.path),
 		}
@@ -5439,18 +5445,21 @@ func (e *Engine) collectAndBatch(
 			return
 		}
 		if tracker := reconciliationBaselineTrackerFor(ctx); tracker != nil {
-			tracker.add(source)
+			if admitted {
+				tracker.add(source)
+			}
 			return
 		}
 		if runtimeMetrics != nil {
 			return
 		}
-		if _, duplicate := baselineSeen[source]; duplicate {
+		if previous, duplicate := baselineAdmission[source]; duplicate {
+			baselineAdmission[source] = previous && admitted
 			return
 		}
-		baselineSeen[source] = struct{}{}
-		baselineSources = append(baselineSources, source)
-		if len(baselineSources) == reconciliationPageSize {
+		baselineAdmission[source] = admitted
+		baselineCandidates = append(baselineCandidates, source)
+		if len(baselineCandidates) == reconciliationPageSize {
 			flushBaselineSources()
 		}
 	}
@@ -5559,7 +5568,14 @@ func (e *Engine) collectAndBatch(
 			stats.RecordSkip()
 			e.noteSQLiteContainerResult(r.path, true)
 			if r.providerFailureCount == 0 {
-				baselineSuccessfulSource(r)
+				admitted, err := e.skippedSourceAllowsCwdFilter(ctx, r)
+				if err != nil {
+					log.Printf("check skipped source cwd admission: %v", err)
+					stats.RecordFailed()
+					e.poisonSQLiteContainerPass()
+				} else {
+					baselineProcessedSource(r, admitted)
+				}
 			}
 			progress.SessionsDone++
 			e.reportProgress(onProgress, progress)
@@ -5605,7 +5621,9 @@ func (e *Engine) collectAndBatch(
 			e.noteSQLiteContainerResult(r.path, true)
 			if r.providerFailureCount == 0 &&
 				e.sourceAllowsParserExclusions(r.processResult) {
-				baselineSuccessfulSource(r)
+				baselineProcessedSource(r, true)
+			} else if r.providerFailureCount == 0 {
+				baselineProcessedSource(r, false)
 			}
 			progress.SessionsDone++
 			e.reportProgress(onProgress, progress)
@@ -5637,6 +5655,9 @@ func (e *Engine) collectAndBatch(
 		)
 		if vetoed > 0 && len(allowed) == 0 {
 			stats.cwdFilteredFiles++
+			if r.providerFailureCount == 0 {
+				baselineProcessedSource(r, false)
+			}
 			progress.SessionsDone++
 			e.reportProgress(onProgress, progress)
 			r.releaseRetention()
@@ -5652,7 +5673,7 @@ func (e *Engine) collectAndBatch(
 			}
 			stats.RecordSynced(1)
 			if r.providerFailureCount == 0 {
-				baselineSuccessfulSource(r)
+				baselineProcessedSource(r, true)
 			}
 			progress.MessagesIndexed += len(
 				r.incremental.msgs,
@@ -5745,27 +5766,48 @@ func (e *Engine) baselinePendingWriteSources(
 		}
 	}
 
+	candidates := make([]db.SessionSourcePath, 0, len(eligible))
+	admitted := make([]db.SessionSourcePath, 0, len(eligible))
+	tracker := reconciliationBaselineTrackerFor(ctx)
+	for source, ok := range eligible {
+		candidates = append(candidates, source)
+		if !ok {
+			continue
+		}
+		if tracker != nil {
+			tracker.add(source)
+			continue
+		}
+		admitted = append(admitted, source)
+	}
+	if tracker != nil || len(candidates) == 0 {
+		return nil
+	}
+
 	sources := make([]db.SessionSourcePath, 0, reconciliationPageSize)
+	admittedSet := make(map[db.SessionSourcePath]struct{}, len(admitted))
+	for _, source := range admitted {
+		admittedSet[source] = struct{}{}
+	}
 	flush := func() error {
 		if len(sources) == 0 {
 			return nil
 		}
-		if err := e.db.BaselineActiveSessionSourcePaths(
-			ctx, e.machine, sources,
+		pageAdmitted := make([]db.SessionSourcePath, 0, len(sources))
+		for _, source := range sources {
+			if _, ok := admittedSet[source]; ok {
+				pageAdmitted = append(pageAdmitted, source)
+			}
+		}
+		if err := e.db.ReplaceActiveSessionSourceBaselines(
+			ctx, e.machine, sources, pageAdmitted,
 		); err != nil {
-			return fmt.Errorf("baseline parsed source batch: %w", err)
+			return fmt.Errorf("replace parsed source baseline batch: %w", err)
 		}
 		sources = sources[:0]
 		return nil
 	}
-	for source, ok := range eligible {
-		if !ok {
-			continue
-		}
-		if tracker := reconciliationBaselineTrackerFor(ctx); tracker != nil {
-			tracker.add(source)
-			continue
-		}
+	for _, source := range candidates {
 		sources = append(sources, source)
 		if len(sources) == reconciliationPageSize {
 			if err := flush(); err != nil {
@@ -5774,6 +5816,33 @@ func (e *Engine) baselinePendingWriteSources(
 		}
 	}
 	return flush()
+}
+
+// skippedSourceAllowsCwdFilter determines whether an unchanged source may
+// retain deletion proof after a configuration restart. A freshness skip has no
+// parser output to run through sourceAllowsParserExclusions, so use the active
+// archived rows for that exact source as the admission evidence instead.
+func (e *Engine) skippedSourceAllowsCwdFilter(
+	ctx context.Context, job syncJob,
+) (bool, error) {
+	if e.cwdFilter.empty() {
+		return true, nil
+	}
+	path := e.effectiveSourcePath(job.path)
+	ids, err := e.db.ListSessionIDsByFilePath(path, string(job.agent))
+	if err != nil {
+		return false, err
+	}
+	for _, id := range ids {
+		session, err := e.db.GetSession(ctx, id)
+		if err != nil {
+			return false, err
+		}
+		if session != nil && !e.cwdFilter.allows(session.Cwd) {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func (e *Engine) linkSubagentSessions(ctx context.Context) error {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -222,7 +223,7 @@ func (c *sharedUnwatchedPollCoordinator) runPollWorker() {
 			if c.workerCtx.Err() != nil {
 				return
 			}
-			roots := c.currentPollRoots()
+			roots := availableUnwatchedPollRoots(c.currentPollRoots())
 			if len(roots) == 0 {
 				continue
 			}
@@ -235,6 +236,16 @@ func (c *sharedUnwatchedPollCoordinator) runPollWorker() {
 			})
 		}
 	}
+}
+
+func availableUnwatchedPollRoots(roots []string) []string {
+	available := make([]string, 0, len(roots))
+	for _, root := range roots {
+		if _, err := os.Stat(root); err == nil {
+			available = append(available, root)
+		}
+	}
+	return available
 }
 
 func unwatchedPollObligationRoots(obligations map[string][]string) []string {
