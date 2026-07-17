@@ -5958,6 +5958,48 @@ func TestFileIdentityChanged(t *testing.T) {
 	assert.False(t, d.FileIdentityChanged(legacyPath, 1, 1), "missing stored identity changed")
 }
 
+func TestGetSessionForIncrementalReturnsImmutableSourceProject(t *testing.T) {
+	d := testDB(t)
+	for _, tc := range []struct {
+		name          string
+		sessionID     string
+		filePath      string
+		sourceProject string
+	}{
+		{
+			name:          "snapshot present",
+			sessionID:     "incremental-source-present",
+			filePath:      "/tmp/incremental-source-present.jsonl",
+			sourceProject: "parser-source",
+		},
+		{
+			name:      "snapshot absent",
+			sessionID: "incremental-source-absent",
+			filePath:  "/tmp/incremental-source-absent.jsonl",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, d.UpsertSessionWithProjectIdentity(
+				Session{
+					ID: tc.sessionID, Project: "mapped-target", Machine: "laptop",
+					Agent: "claude", Cwd: "/tmp/worktree",
+					FilePath: new(tc.filePath), FileSize: new(int64(128)),
+				},
+				export.ProjectIdentityObservation{
+					SessionID: tc.sessionID, Project: "mapped-target",
+					Machine: "laptop", RootPath: "/tmp/worktree",
+				},
+				tc.sourceProject,
+			))
+
+			info, ok := d.GetSessionForIncremental(tc.filePath)
+			require.True(t, ok)
+			assert.Equal(t, "mapped-target", info.Project)
+			assert.Equal(t, tc.sourceProject, info.SourceProject)
+		})
+	}
+}
+
 func TestUpdateSessionIncremental(t *testing.T) {
 	d := testDB(t)
 

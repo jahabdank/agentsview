@@ -659,8 +659,8 @@ func (db *DB) UpsertProjectIdentityObservation(
 	ctx context.Context,
 	obs export.ProjectIdentityObservation,
 ) error {
-	return db.UpsertProjectIdentityObservationWithSnapshotProject(
-		ctx, obs, obs.Project,
+	return db.upsertProjectIdentityObservationWithSnapshotProject(
+		ctx, obs, obs.Project, false,
 	)
 }
 
@@ -674,6 +674,17 @@ func (db *DB) UpsertProjectIdentityObservationWithSnapshotProject(
 	ctx context.Context,
 	obs export.ProjectIdentityObservation,
 	snapshotProject string,
+) error {
+	return db.upsertProjectIdentityObservationWithSnapshotProject(
+		ctx, obs, snapshotProject, true,
+	)
+}
+
+func (db *DB) upsertProjectIdentityObservationWithSnapshotProject(
+	ctx context.Context,
+	obs export.ProjectIdentityObservation,
+	snapshotProject string,
+	allowSnapshotProjectCorrection bool,
 ) error {
 	if err := db.requireWritable(); err != nil {
 		return err
@@ -707,7 +718,7 @@ func (db *DB) UpsertProjectIdentityObservationWithSnapshotProject(
 		func(ctx context.Context, query string, args ...any) rowScanner {
 			return tx.QueryRowContext(ctx, query, args...)
 		},
-		obs, snapshotProject, false,
+		obs, snapshotProject, false, allowSnapshotProjectCorrection,
 	); err != nil {
 		return err
 	}
@@ -729,6 +740,23 @@ func (db *DB) UpsertSessionWithProjectIdentity(
 	if err := db.requireWritable(); err != nil {
 		return err
 	}
+	if strings.TrimSpace(s.ID) == "" {
+		return fmt.Errorf("session id is required")
+	}
+	normalized, err := normalizeProjectIdentityObservation(obs)
+	if err != nil {
+		return err
+	}
+	if normalized.SessionID == "" {
+		return fmt.Errorf("identity observation session id is required")
+	}
+	if normalized.SessionID != s.ID {
+		return fmt.Errorf(
+			"identity observation session id %q does not match session id %q",
+			normalized.SessionID, s.ID,
+		)
+	}
+	obs = normalized
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	tx, err := db.getWriter().Begin()
@@ -748,7 +776,7 @@ func (db *DB) UpsertSessionWithProjectIdentity(
 	}
 	if obs.Project != "" {
 		if err := upsertProjectIdentityObservationWithSnapshotProjectTx(
-			tx, obs, snapshotProject, sessionInserted,
+			tx, obs, snapshotProject, sessionInserted, true,
 		); err != nil {
 			return err
 		}
@@ -764,7 +792,7 @@ func upsertProjectIdentityObservationTx(
 	obs export.ProjectIdentityObservation,
 ) error {
 	return upsertProjectIdentityObservationWithSnapshotProjectTx(
-		tx, obs, obs.Project, false,
+		tx, obs, obs.Project, false, false,
 	)
 }
 
@@ -773,6 +801,7 @@ func upsertProjectIdentityObservationWithSnapshotProjectTx(
 	obs export.ProjectIdentityObservation,
 	snapshotProject string,
 	sessionInserted bool,
+	allowSnapshotProjectCorrection bool,
 ) error {
 	normalized, err := normalizeProjectIdentityObservation(obs)
 	if err != nil {
@@ -793,6 +822,7 @@ func upsertProjectIdentityObservationWithSnapshotProjectTx(
 			return tx.QueryRowContext(ctx, query, args...)
 		},
 		normalized, snapshotProject, sessionInserted,
+		allowSnapshotProjectCorrection,
 	); err != nil {
 		return err
 	}
@@ -806,6 +836,7 @@ func writeSessionProjectIdentitySnapshotExec(
 	obs export.ProjectIdentityObservation,
 	snapshotProject string,
 	sessionInserted bool,
+	allowProjectCorrection bool,
 ) error {
 	snapshotProject = strings.TrimSpace(snapshotProject)
 	if snapshotProject == "" {
@@ -830,7 +861,7 @@ func writeSessionProjectIdentitySnapshotExec(
 		return err
 	}
 	return upsertSessionProjectIdentitySnapshotExec(
-		ctx, exec, queryRow, snapshot,
+		ctx, exec, queryRow, snapshot, allowProjectCorrection,
 	)
 }
 
@@ -989,6 +1020,7 @@ func upsertSessionProjectIdentitySnapshotExec(
 	exec contextExecer,
 	queryRow contextQueryRow,
 	obs export.ProjectIdentityObservation,
+	allowProjectCorrection bool,
 ) error {
 	if obs.SessionID == "" {
 		return nil
@@ -1003,15 +1035,29 @@ func upsertSessionProjectIdentitySnapshotExec(
 	}
 	var existing export.ProjectResolution
 	var existingKey string
+	var existingProject string
 	err := queryRow(ctx, `
-		SELECT remote_resolution, key
+		SELECT remote_resolution, key, project
 		FROM session_project_identity_snapshots
-		WHERE session_id = ?`, obs.SessionID).Scan(&existing, &existingKey)
+		WHERE session_id = ?`, obs.SessionID).Scan(
+		&existing, &existingKey, &existingProject,
+	)
 	if err == nil {
-		if existing == export.ProjectResolutionResolved ||
+		preserveExisting := existing == export.ProjectResolutionResolved ||
 			existing == export.ProjectResolutionAmbiguous ||
 			(obs.RemoteResolution == export.ProjectResolutionUnknown &&
-				(obs.Key == "" || strings.TrimSpace(existingKey) != "")) {
+				(obs.Key == "" || strings.TrimSpace(existingKey) != ""))
+		if preserveExisting {
+			if allowProjectCorrection && existingProject != obs.Project {
+				if _, err := exec.ExecContext(ctx, `
+					UPDATE session_project_identity_snapshots
+					SET project = ?
+					WHERE session_id = ?`, obs.Project, obs.SessionID); err != nil {
+					return fmt.Errorf(
+						"correcting session project identity snapshot label: %w", err,
+					)
+				}
+			}
 			return nil
 		}
 	} else if !errors.Is(err, sql.ErrNoRows) {

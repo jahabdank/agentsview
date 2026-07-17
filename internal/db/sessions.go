@@ -1818,6 +1818,7 @@ func (db *DB) GetSessionVersion(
 type IncrementalInfo struct {
 	ID                   string
 	Project              string
+	SourceProject        string
 	Machine              string
 	Cwd                  string
 	AgentLabel           string
@@ -1887,7 +1888,8 @@ func (db *DB) GetSessionForIncremental(
 	var fs, fm, fi, fd sql.NullInt64
 	var firstMsg, lastEntryUUID sql.NullString
 	err = db.getReader().QueryRow(
-		`SELECT id, project, machine, cwd, agent_label, entrypoint,
+		`SELECT s.id, s.project, COALESCE(snap.project, ''),
+			s.machine, s.cwd, s.agent_label, s.entrypoint,
 			file_size, file_mtime,
 			next_ordinal, last_entry_uuid,
 			file_inode, file_device,
@@ -1895,12 +1897,15 @@ func (db *DB) GetSessionForIncremental(
 			first_message,
 			total_output_tokens, peak_context_tokens,
 			has_total_output_tokens, has_peak_context_tokens
-		 FROM sessions
-		 WHERE file_path = ?
-		   AND deleted_at IS NULL`,
+		 FROM sessions s
+		 LEFT JOIN session_project_identity_snapshots snap
+		   ON snap.session_id = s.id
+		 WHERE s.file_path = ?
+		   AND s.deleted_at IS NULL`,
 		path,
 	).Scan(
-		&info.ID, &info.Project, &info.Machine, &info.Cwd,
+		&info.ID, &info.Project, &info.SourceProject,
+		&info.Machine, &info.Cwd,
 		&info.AgentLabel, &info.Entrypoint,
 		&fs, &fm, &info.NextOrdinal, &lastEntryUUID, &fi, &fd,
 		&info.MsgCount, &info.UserMsgCount,

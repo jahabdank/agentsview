@@ -1635,6 +1635,28 @@ func TestProjectIdentityExplicitEmptyDeleteReinsertClearsNewFallback(
 		"reinsertion must remove the newly triggered mapped fallback")
 }
 
+func TestSessionWithoutIdentityStillUsesOrdinaryUpsert(t *testing.T) {
+	database := openTestDB(t)
+	e := NewEngine(database, EngineConfig{Machine: "laptop"})
+	t.Cleanup(e.Close)
+
+	written, _, failed, _ := e.writeBatch(
+		[]pendingWrite{{sess: parser.ParsedSession{
+			ID: "without-project", Machine: "laptop", Agent: parser.AgentCodex,
+			StartedAt: time.Now(),
+		}}},
+		syncWriteDefault,
+		true,
+	)
+	assert.Equal(t, 0, failed)
+	assert.Equal(t, 1, written)
+
+	stored, err := database.GetSession(context.Background(), "without-project")
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.Empty(t, stored.Project)
+}
+
 func TestProjectIdentityDiscoversLinkedWorktreeRepositoryContext(t *testing.T) {
 	database := openTestDB(t)
 	mainRoot := filepath.Join(t.TempDir(), "main")
@@ -2156,6 +2178,114 @@ func TestProjectIdentityIncrementalAppendUsesPersistedMappedProject(t *testing.T
 				"new or upgraded snapshot must retain parser-time project evidence")
 			assert.NotEmpty(t, snapshots[0].Key,
 				"incremental evidence must create or upgrade the weak snapshot")
+		})
+	}
+}
+
+func TestProjectIdentityIncrementalStatePreservesExplicitSourceProject(
+	t *testing.T,
+) {
+	for _, tc := range []struct {
+		name          string
+		sourceProject string
+	}{
+		{name: "non-empty source", sourceProject: "parser_source"},
+		{name: "explicit empty source"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			database := openTestDB(t)
+			root := t.TempDir()
+			path := filepath.Join(root, "session.jsonl")
+			initial := []byte("initial-record\n")
+			require.NoError(t, os.WriteFile(path, initial, 0o600))
+			initialInfo, err := os.Stat(path)
+			require.NoError(t, err)
+			_, err = database.CreateWorktreeProjectMapping(
+				ctx,
+				db.WorktreeProjectMapping{
+					Machine: "laptop", PathPrefix: root,
+					Layout:  db.WorktreeMappingLayoutExplicit,
+					Project: "mapped_target", Enabled: true,
+				},
+			)
+			require.NoError(t, err)
+
+			e := NewEngine(database, EngineConfig{Machine: "laptop"})
+			t.Cleanup(e.Close)
+			written, _, failed, _ := e.writeBatch(
+				[]pendingWrite{{
+					sess: parser.ParsedSession{
+						ID: "incremental-source", Project: tc.sourceProject,
+						Machine: "laptop", Agent: parser.AgentClaude,
+						Cwd: root, StartedAt: initialInfo.ModTime(),
+						FirstMessage: "initial", MessageCount: 1,
+						File: parser.FileInfo{
+							Path: path, Size: int64(len(initial)),
+							Mtime: initialInfo.ModTime().UnixNano(),
+						},
+					},
+					msgs: []parser.ParsedMessage{{
+						Role: parser.RoleUser, Content: "initial", Ordinal: 0,
+					}},
+				}},
+				syncWriteDefault,
+				true,
+			)
+			require.Equal(t, 0, failed)
+			require.Equal(t, 1, written)
+			incrementalInfo, found := database.GetSessionForIncremental(path)
+			require.True(t, found)
+			assert.Equal(t, int64(len(initial)), incrementalInfo.FileSize)
+			assert.Equal(t, 1, incrementalInfo.MsgCount)
+			assert.Equal(t, db.CurrentDataVersion(),
+				database.GetSessionDataVersion("incremental-source"))
+
+			appended := []byte("appended-record\n")
+			f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+			require.NoError(t, err)
+			_, err = f.Write(appended)
+			require.NoError(t, err)
+			require.NoError(t, f.Close())
+			appendedInfo, err := os.Stat(path)
+			require.NoError(t, err)
+
+			result, ok := e.tryIncrementalJSONL(
+				parser.DiscoveredFile{Agent: parser.AgentClaude, Path: path},
+				appendedInfo,
+				parser.AgentClaude,
+				func(
+					_ string,
+					inc *db.IncrementalInfo,
+				) ([]parser.ParsedMessage, []parser.ClaudeSubagentLink, time.Time, int64, *string, error) {
+					return []parser.ParsedMessage{{
+						Role: parser.RoleAssistant, Content: "appended",
+						Ordinal: inc.NextOrdinal,
+					}}, nil, appendedInfo.ModTime(), int64(len(appended)), nil, nil
+				},
+			)
+			require.True(t, ok)
+			require.NotNil(t, result.incremental)
+			require.NoError(t, e.writeIncremental(result.incremental))
+
+			persisted, err := database.GetSession(ctx, "incremental-source")
+			require.NoError(t, err)
+			require.NotNil(t, persisted)
+			assert.Equal(t, "mapped_target", persisted.Project)
+			observations, err := database.ListProjectIdentityObservations(
+				ctx, []string{"mapped_target"},
+			)
+			require.NoError(t, err)
+			require.Len(t, observations, 1)
+			snapshots, err := database.ListSessionProjectIdentitySnapshots(ctx)
+			require.NoError(t, err)
+			if tc.sourceProject == "" {
+				assert.Empty(t, snapshots,
+					"incremental append must not fabricate mapped source evidence")
+			} else {
+				require.Len(t, snapshots, 1)
+				assert.Equal(t, tc.sourceProject, snapshots[0].Project)
+			}
 		})
 	}
 }

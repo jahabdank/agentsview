@@ -6038,7 +6038,7 @@ func (e *Engine) tryIncrementalJSONL(
 			return processResult{
 				incremental: &incrementalUpdate{
 					sessionID:            inc.ID,
-					project:              inc.Project,
+					project:              inc.SourceProject,
 					machine:              inc.Machine,
 					cwd:                  inc.Cwd,
 					links:                links,
@@ -6127,7 +6127,7 @@ func (e *Engine) tryIncrementalJSONL(
 	return processResult{
 		incremental: &incrementalUpdate{
 			sessionID:            inc.ID,
-			project:              inc.Project,
+			project:              inc.SourceProject,
 			machine:              inc.Machine,
 			cwd:                  inc.Cwd,
 			msgs:                 newMsgs,
@@ -8005,7 +8005,10 @@ func (e *Engine) upsertSessionWithProjectIdentity(
 	s db.Session,
 	snapshotProject string,
 ) error {
-	obs, _ := e.projectIdentityObservation(s)
+	obs, ok := e.projectIdentityObservation(s)
+	if !ok {
+		return e.db.UpsertSession(s)
+	}
 	return e.db.UpsertSessionWithProjectIdentity(s, obs, snapshotProject)
 }
 
