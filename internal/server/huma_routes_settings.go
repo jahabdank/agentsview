@@ -22,6 +22,10 @@ func (s *Server) registerSettingsRoutes() {
 	put(s, group, "/worktree-mappings/{id}", "Update worktree mapping", s.humaUpdateWorktreeMapping)
 	deleteRoute(s, group, "/worktree-mappings/{id}", "Delete worktree mapping", s.humaDeleteWorktreeMapping)
 	post(s, group, "/worktree-mappings/apply", "Apply worktree mappings", s.humaApplyWorktreeMappings)
+	post(s, group, "/worktree-mappings/preview",
+		"Preview worktree project reclassification", s.humaPreviewWorktreeReclassification)
+	post(s, group, "/worktree-mappings/reclassify",
+		"Apply worktree project reclassification", s.humaReclassifyWorktreeProject)
 }
 
 type settingsInput struct {
@@ -47,6 +51,14 @@ type worktreeMappingPathInput struct {
 
 type worktreeMappingApplyInput struct {
 	Body applyWorktreeMappingsRequest
+}
+
+type worktreeReclassificationPreviewInput struct {
+	Body worktreeReclassificationRequest
+}
+
+type worktreeReclassificationApplyInput struct {
+	Body worktreeReclassificationApplyRequest
 }
 
 func (s *Server) humaGetSettings(
@@ -289,6 +301,64 @@ func (s *Server) humaApplyWorktreeMappings(
 			ApplyWorktreeProjectMappingsResult: result,
 		},
 	}, nil
+}
+
+func (s *Server) humaPreviewWorktreeReclassification(
+	ctx context.Context,
+	in *worktreeReclassificationPreviewInput,
+) (*jsonOutput[db.WorktreeReclassificationPreview], error) {
+	localDB, _, err := s.localWorktreeMappingHumaDB()
+	if err != nil {
+		return nil, err
+	}
+	preview, err := localDB.PreviewWorktreeReclassification(ctx, in.Body.draft())
+	if err != nil {
+		return nil, humaWorktreeReclassificationError(err)
+	}
+	return &jsonOutput[db.WorktreeReclassificationPreview]{Body: preview}, nil
+}
+
+func (s *Server) humaReclassifyWorktreeProject(
+	ctx context.Context,
+	in *worktreeReclassificationApplyInput,
+) (*jsonOutput[worktreeReclassificationApplyResponse], error) {
+	localDB, _, err := s.localWorktreeMappingHumaDB()
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(in.Body.MappingToken) == "" {
+		return nil, apiError(http.StatusBadRequest, "mapping_token is required")
+	}
+	draft := in.Body.draft()
+	// The server, not the client, resolves the exact (machine, prefix)
+	// collision. Apply rechecks both this identity and the accepted mapping-set
+	// token under the engine's exclusive write boundary.
+	current, err := localDB.PreviewWorktreeReclassification(ctx, draft)
+	if err != nil {
+		return nil, humaWorktreeReclassificationError(err)
+	}
+	mapping, result, err := s.engine.ApplyWorktreeReclassification(
+		ctx, draft, in.Body.MappingToken, current.ExistingMappingID,
+	)
+	if err != nil {
+		return nil, humaWorktreeReclassificationError(err)
+	}
+	return &jsonOutput[worktreeReclassificationApplyResponse]{
+		Body: worktreeReclassificationApplyResponse{Mapping: mapping, Result: result},
+	}, nil
+}
+
+func humaWorktreeReclassificationError(err error) error {
+	switch {
+	case errors.Is(err, db.ErrWorktreeMappingSetChanged):
+		return apiError(http.StatusConflict, err.Error())
+	case errors.Is(err, db.ErrWorktreeMappingInvalid):
+		return apiError(http.StatusBadRequest, err.Error())
+	case strings.Contains(err.Error(), "required"):
+		return apiError(http.StatusBadRequest, err.Error())
+	default:
+		return internalError("worktree reclassification", err)
+	}
 }
 
 func humaWorktreeMappingError(err error) error {

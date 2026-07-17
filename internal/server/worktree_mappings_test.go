@@ -207,6 +207,111 @@ func TestWorktreeMappingsAPIMalformedIDIsNotFound(t *testing.T) {
 	assertStatus(t, w, http.StatusNotFound)
 }
 
+func TestWorktreePreviewAPIUsesFullArchiveAndBoundsSamples(t *testing.T) {
+	te := setup(t)
+	for i := range 12 {
+		id := "preview-" + strconv.Itoa(i)
+		require.NoError(t, te.db.UpsertSession(db.Session{
+			ID: id, Machine: "host-a.example", Agent: "codex",
+			Project: "branch-" + strconv.Itoa(i),
+			Cwd:     "/srv/worktrees/example/" + id,
+		}), "seed preview session")
+	}
+
+	w := te.post(t, "/api/v1/settings/worktree-mappings/preview", `{
+		"machine": "host-a.example",
+		"path_prefix": "/srv/worktrees/example",
+		"project": "canonical-example",
+		"original_project": "branch-label"
+	}`)
+	assertStatus(t, w, http.StatusOK)
+	preview := decode[db.WorktreeReclassificationPreview](t, w)
+	assert.Equal(t, 12, preview.MatchedSessions)
+	assert.Equal(t, 12, preview.UpdatedSessions)
+	assert.Equal(t, 12, preview.DistinctProjects)
+	assert.Len(t, preview.ProjectSamples, 10)
+	assert.Len(t, preview.SessionSamples, 10)
+	assert.NotEmpty(t, preview.MappingToken)
+
+	w = te.post(t, "/api/v1/settings/worktree-mappings/preview", `{
+		"machine": "host-a.example",
+		"path_prefix": "",
+		"project": "canonical-example"
+	}`)
+	assertStatus(t, w, http.StatusBadRequest)
+}
+
+func TestActivityProjectReclassificationAPIRejectsStaleToken(t *testing.T) {
+	te := setup(t)
+	require.NoError(t, te.db.UpsertSession(db.Session{
+		ID: "stale-session", Machine: "host-a.example", Agent: "codex",
+		Project: "branch-label", Cwd: "/srv/worktrees/example/feature",
+	}))
+
+	previewW := te.post(t, "/api/v1/settings/worktree-mappings/preview", `{
+		"machine": "host-a.example",
+		"path_prefix": "/srv/worktrees/example",
+		"project": "canonical-example",
+		"original_project": "branch-label"
+	}`)
+	assertStatus(t, previewW, http.StatusOK)
+	preview := decode[db.WorktreeReclassificationPreview](t, previewW)
+	_ = postWorktreeMapping(t, te, map[string]any{
+		"machine": "host-a.example", "path_prefix": "/another/root",
+		"project": "another-project",
+	})
+
+	w := te.post(t, "/api/v1/settings/worktree-mappings/reclassify", `{
+		"machine": "host-a.example",
+		"path_prefix": "/srv/worktrees/example",
+		"project": "canonical-example",
+		"original_project": "branch-label",
+		"mapping_token": "`+preview.MappingToken+`"
+	}`)
+	assertStatus(t, w, http.StatusConflict)
+
+	w = te.post(t, "/api/v1/settings/worktree-mappings/preview", `{
+		"machine": "host-a.example",
+		"path_prefix": "/srv/worktrees/example",
+		"project": "canonical-example",
+		"original_project": "branch-label"
+	}`)
+	assertStatus(t, w, http.StatusOK)
+	preview = decode[db.WorktreeReclassificationPreview](t, w)
+	w = te.post(t, "/api/v1/settings/worktree-mappings/reclassify", `{
+		"machine": "host-a.example",
+		"path_prefix": "/srv/worktrees/example",
+		"project": "canonical-example",
+		"original_project": "branch-label",
+		"mapping_token": "`+preview.MappingToken+`"
+	}`)
+	assertStatus(t, w, http.StatusOK)
+	var applied struct {
+		Mapping db.WorktreeProjectMapping          `json:"mapping"`
+		Result  db.WorktreeReclassificationPreview `json:"result"`
+	}
+	decodeInto(t, w, &applied)
+	assert.Equal(t, "canonical_example", applied.Mapping.Project)
+	assert.Equal(t, 1, applied.Result.UpdatedSessions)
+	session, err := te.db.GetSession(context.Background(), "stale-session")
+	require.NoError(t, err)
+	assert.Equal(t, "canonical_example", session.Project)
+}
+
+func TestWorktreePreviewAndReclassificationAPIsRejectRemoteMode(t *testing.T) {
+	te := setupPGMode(t)
+	w := te.post(t, "/api/v1/settings/worktree-mappings/preview", `{
+		"machine": "host-a.example", "path_prefix": "/srv/example",
+		"project": "example"
+	}`)
+	assertStatus(t, w, http.StatusNotImplemented)
+	w = te.post(t, "/api/v1/settings/worktree-mappings/reclassify", `{
+		"machine": "host-a.example", "path_prefix": "/srv/example",
+		"project": "example", "mapping_token": "token"
+	}`)
+	assertStatus(t, w, http.StatusNotImplemented)
+}
+
 func postWorktreeMapping(
 	t *testing.T,
 	te *testEnv,
