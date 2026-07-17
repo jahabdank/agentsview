@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -95,4 +96,39 @@ func TestSwapWindowRejectsDirectWrites(t *testing.T) {
 	ok, err := database.StarSession("keep0")
 	require.NoError(t, err)
 	assert.True(t, ok)
+}
+
+// TestInProcessResyncRejectsConcurrentDirectWrite is the regression for the
+// in-process fallback barrier. It fires a direct write (StarSession) during the
+// reclassify phase, which runs after every preserved-state copy and before the
+// swap's rename. Without the barrier that write lands in the original and is
+// discarded by the swap (silently lost); with it the write is rejected with
+// ErrWriterClosed. The progress hook blocks the resync until the write returns,
+// so the write is guaranteed to land inside that window.
+func TestInProcessResyncRejectsConcurrentDirectWrite(t *testing.T) {
+	e, database, _ := newResyncSplitEngine(t)
+
+	var starErr error
+	var fired atomic.Bool
+	done := make(chan struct{})
+	onProgress := func(p Progress) {
+		if p.Phase == PhaseReclassifying && fired.CompareAndSwap(false, true) {
+			go func() {
+				_, starErr = database.StarSession("keep0")
+				close(done)
+			}()
+			<-done
+		}
+	}
+
+	stats := e.ResyncAll(context.Background(), onProgress)
+	require.False(t, stats.Aborted)
+	require.True(t, fired.Load(), "the concurrent write must have fired mid-resync")
+
+	assert.ErrorIs(t, starErr, db.ErrWriterClosed,
+		"a direct write in the copy-to-swap window must be rejected, not lost")
+	starred, err := database.ListStarredSessionIDs(context.Background())
+	require.NoError(t, err)
+	assert.NotContains(t, starred, "keep0",
+		"a rejected write must not silently land in the swapped archive")
 }

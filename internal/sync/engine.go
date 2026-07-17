@@ -1574,6 +1574,37 @@ func (e *Engine) resyncAllWithOptionsLocked(
 	ops rebuildOperations,
 ) (stats SyncStats, retErr error) {
 	ops = ops.withDefaults()
+
+	// Hold the write barrier for the whole in-process build-and-swap window. The
+	// build reads the original while it stays open, and the swap's
+	// CloseConnections runs only after the copies, so without the barrier a
+	// direct write (star/delete/restore) that bypasses syncMu could land in the
+	// original between the copies and the rename and be discarded by the swap.
+	// The barrier rejects such writes with ErrWriterClosed instead. The worker
+	// arm holds this barrier at the daemon layer (runWorkerResyncBuild) and calls
+	// ResyncBuild directly, so it never reaches this method; this arm covers the
+	// in-process fallback, CLI --full, worker startup, and unified rebuilds. Only
+	// engage it when this call owns the barrier, so an outer owner is not
+	// double-closed or prematurely reopened.
+	ownedBarrier := false
+	if !e.db.WriterClosed() {
+		if cerr := e.db.CloseWriter(); cerr != nil {
+			log.Printf("resync: close writer for barrier: %v", cerr)
+		} else {
+			ownedBarrier = true
+		}
+	}
+	defer func() {
+		// The successful swap's Reopen already restored the writer and cleared
+		// the barrier; reopen here only when we still own a closed writer (build
+		// abort, or a swap that failed before reopening).
+		if ownedBarrier && e.db.WriterClosed() {
+			if rerr := e.db.ReopenWriter(); rerr != nil {
+				log.Printf("resync: reopen writer after barrier: %v", rerr)
+			}
+		}
+	}()
+
 	stats, err := e.resyncBuildLocked(ctx, onProgress, opts, ops)
 	if err != nil || stats.Aborted {
 		return stats, err

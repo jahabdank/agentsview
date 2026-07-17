@@ -3605,6 +3605,13 @@ func (db *DB) ReopenWriter() error {
 	return nil
 }
 
+// WriterClosed reports whether the writer pool is currently closed for a
+// maintenance pass. Callers that conditionally own the write barrier check it to
+// avoid double-closing or reopening a barrier an outer owner holds.
+func (db *DB) WriterClosed() bool {
+	return db.writerClosed.Load()
+}
+
 // Update executes fn within a write lock and transaction.
 // The transaction is committed if fn returns nil, rolled back
 // otherwise.
