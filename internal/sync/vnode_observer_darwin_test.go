@@ -47,6 +47,30 @@ func TestVnodeObserverUsesOneDescriptorRegardlessOfEntries(t *testing.T) {
 		"observer must hold one descriptor per directory, not per entry")
 }
 
+// TestVnodeObserverCloseInterruptsBlockedRun proves Close synchronizes with the
+// run loop: it triggers the shutdown user event so the blocked Kevent returns,
+// Close waits for run() to exit, and no goroutine is left blocked on the kqueue.
+func TestVnodeObserverCloseInterruptsBlockedRun(t *testing.T) {
+	dir := t.TempDir()
+	o, err := newVnodeObserver(func() {})
+	require.NoError(t, err)
+	require.NoError(t, o.Add(dir))
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- o.Close() }()
+	select {
+	case err := <-closeDone:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close did not return; the blocked run loop was not interrupted")
+	}
+	select {
+	case <-o.done:
+	case <-time.After(time.Second):
+		t.Fatal("run loop still active after Close returned")
+	}
+}
+
 func TestVnodeObserverRemoveAndCloseAreIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	o, err := newVnodeObserver(func() {})

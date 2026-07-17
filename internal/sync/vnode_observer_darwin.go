@@ -10,6 +10,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// vnodeObserverShutdownIdent is the EVFILT_USER identifier the observer triggers
+// to interrupt run()'s blocked Kevent on Close. EVFILT_USER lives in a separate
+// keventidentifier namespace from the EVFILT_VNODE file descriptors, so it never
+// collides with a watched fd.
+const vnodeObserverShutdownIdent = 1
+
 // vnodeObserver watches directories for entry-level changes using one
 // EVFILT_VNODE descriptor per directory. It exists for missing-root
 // ancestors, where fsnotify's kqueue backend would open one descriptor per
@@ -23,6 +29,7 @@ type vnodeObserver struct {
 	paths  map[int]string
 	wake   func()
 	closed bool
+	done   chan struct{}
 }
 
 func newVnodeObserver(wake func()) (*vnodeObserver, error) {
@@ -30,11 +37,22 @@ func newVnodeObserver(wake func()) (*vnodeObserver, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create ancestor kqueue: %w", err)
 	}
+	// Register the shutdown user event before run() blocks so Close can wake it
+	// deterministically rather than relying on closing the kqueue mid-Kevent,
+	// which is not guaranteed to interrupt the syscall on Darwin.
+	shutdown := unix.Kevent_t{}
+	unix.SetKevent(&shutdown, vnodeObserverShutdownIdent, unix.EVFILT_USER,
+		unix.EV_ADD|unix.EV_CLEAR)
+	if _, err := unix.Kevent(kq, []unix.Kevent_t{shutdown}, nil, nil); err != nil {
+		_ = unix.Close(kq)
+		return nil, fmt.Errorf("register ancestor shutdown event: %w", err)
+	}
 	o := &vnodeObserver{
 		kq:    kq,
 		fds:   make(map[string]int),
 		paths: make(map[int]string),
 		wake:  wake,
+		done:  make(chan struct{}),
 	}
 	go o.run()
 	return o, nil
@@ -83,17 +101,40 @@ func (o *vnodeObserver) Remove(path string) error {
 
 func (o *vnodeObserver) Close() error {
 	o.mu.Lock()
-	defer o.mu.Unlock()
 	if o.closed {
+		o.mu.Unlock()
 		return nil
 	}
 	o.closed = true
+	trigger := unix.Kevent_t{}
+	unix.SetKevent(&trigger, vnodeObserverShutdownIdent, unix.EVFILT_USER, 0)
+	trigger.Fflags = unix.NOTE_TRIGGER
+	_, triggerErr := unix.Kevent(o.kq, []unix.Kevent_t{trigger}, nil, nil)
+	o.mu.Unlock()
+
+	// The user event interrupts run()'s blocked Kevent deterministically. Only
+	// if triggering somehow failed do we fall back to closing the kqueue to
+	// unblock run(); either way we wait for run() to return before closing the
+	// descriptors it reads, so no in-flight event fires after shutdown.
+	if triggerErr != nil {
+		_ = unix.Close(o.kq)
+	}
+	<-o.done
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	for path, fd := range o.fds {
 		_ = unix.Close(fd)
 		delete(o.fds, path)
 		delete(o.paths, fd)
 	}
-	return unix.Close(o.kq) // wakes run() with EBADF
+	if triggerErr != nil {
+		return nil // the kqueue was already closed as the wake fallback
+	}
+	if err := unix.Close(o.kq); err != nil {
+		return fmt.Errorf("closing ancestor kqueue: %w", err)
+	}
+	return nil
 }
 
 func (o *vnodeObserver) watchedCount() int {
@@ -103,6 +144,7 @@ func (o *vnodeObserver) watchedCount() int {
 }
 
 func (o *vnodeObserver) run() {
+	defer close(o.done)
 	events := make([]unix.Kevent_t, 8)
 	for {
 		n, err := unix.Kevent(o.kq, nil, events, nil)
@@ -112,8 +154,20 @@ func (o *vnodeObserver) run() {
 		if err != nil {
 			return // kq closed
 		}
-		if n > 0 {
+		shutdown := false
+		vnodeEvents := false
+		for i := range n {
+			if events[i].Filter == unix.EVFILT_USER {
+				shutdown = true
+			} else {
+				vnodeEvents = true
+			}
+		}
+		if vnodeEvents {
 			o.wake()
+		}
+		if shutdown {
+			return
 		}
 	}
 }
