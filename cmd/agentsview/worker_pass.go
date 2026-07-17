@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
+	"time"
 
 	"github.com/spf13/pflag"
 	"go.kenn.io/agentsview/internal/config"
@@ -21,6 +23,15 @@ import (
 // unbounded line is a protocol failure, not a reason to grow memory without
 // limit.
 const workerLineMaxBytes = 1 << 20 // 1 MB
+
+// Write-owner lock reacquisition retries with exponential backoff after a worker
+// pass. A contended lock (another process grabbed it during the handoff) is
+// transient, so the daemon keeps retrying rather than stranding itself
+// read-only until restart. A package var so tests can shrink the initial delay.
+var (
+	reacquireBackoffInitial = 250 * time.Millisecond
+	reacquireBackoffMax     = 10 * time.Second
+)
 
 // errWorkerSpawn marks a failure to start the worker process (locating the
 // executable, wiring stdout, or exec). Daemon call sites fall back to the
@@ -61,10 +72,8 @@ func runWorkerWritePass(
 		var workerErr error
 		result, workerErr = launchSyncWorker(ctx, cfg, mode, onLine)
 
-		if err := lock.Reacquire(); err != nil {
-			return fmt.Errorf(
-				"reacquire write lock after %s pass: %w", mode, err,
-			)
+		if err := reacquireWriteOwnerLock(ctx, lock, mode); err != nil {
+			return err
 		}
 		if err := database.ReopenWriter(); err != nil {
 			return fmt.Errorf("reopen writer after %s pass: %w", mode, err)
@@ -72,6 +81,38 @@ func runWorkerWritePass(
 		return workerErr
 	})
 	return result, err
+}
+
+// reacquireWriteOwnerLock retakes the write-owner lock after a worker pass,
+// retrying with exponential backoff until it succeeds or ctx is cancelled. A
+// lock briefly contended by another process is transient; giving up on the
+// first failure would leave the writer closed and every write 500ing until the
+// daemon restarts, so the loop keeps trying and logs each failure loudly. It
+// returns an error only when ctx is cancelled, since the writer stays closed.
+func reacquireWriteOwnerLock(
+	ctx context.Context, lock *writeOwnerLock, mode string,
+) error {
+	backoff := reacquireBackoffInitial
+	for {
+		if err := lock.Reacquire(); err == nil {
+			return nil
+		} else {
+			log.Printf(
+				"reacquire write lock after %s pass failed; retrying in %s: %v",
+				mode, backoff, err,
+			)
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf(
+				"reacquire write lock after %s pass: %w", mode, ctx.Err(),
+			)
+		case <-timer.C:
+		}
+		backoff = min(backoff*2, reacquireBackoffMax)
+	}
 }
 
 // launchSyncWorkerProcess self-execs `sync-worker --mode=<mode>`, decodes the

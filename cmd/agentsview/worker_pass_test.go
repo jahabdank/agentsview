@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -94,6 +95,67 @@ func TestRunWorkerWritePassReacquiresOnWorkerFailure(t *testing.T) {
 	assert.True(t, lock.Held(), "flock reacquired even after worker failure")
 	assert.NoError(t, writeOneSession(database),
 		"writer reopened even after worker failure")
+}
+
+func TestRunWorkerWritePassRetriesReacquireUntilLockFree(t *testing.T) {
+	cfg := testConfigWithClaudeFixture(t)
+	database, lock := openTestWriteDB(t, cfg)
+	engine := sync.NewEngine(database, sync.EngineConfig{})
+	defer engine.Close()
+
+	prevInitial, prevMax := reacquireBackoffInitial, reacquireBackoffMax
+	reacquireBackoffInitial = 5 * time.Millisecond
+	reacquireBackoffMax = 20 * time.Millisecond
+	defer func() {
+		reacquireBackoffInitial, reacquireBackoffMax = prevInitial, prevMax
+	}()
+
+	closeErr := make(chan error, 1)
+	restore := stubLaunchSyncWorker(t, func(
+		_ context.Context, _ config.Config, _ string, _ func(workerLine),
+	) (workerResult, error) {
+		// The daemon released the flock for the pass; a contender grabs it and
+		// holds it briefly so the first reacquire attempts fail, then releases
+		// so the retry loop must recover instead of stranding the writer.
+		contender, err := tryAcquireWriteOwnerLock(cfg.DataDir)
+		require.NoError(t, err, "contender takes the freed lock")
+		go func() {
+			time.Sleep(40 * time.Millisecond)
+			closeErr <- contender.Close()
+		}()
+		return workerResult{Status: "ok", DiscoveryComplete: true}, nil
+	})
+	defer restore()
+
+	result, err := runWorkerWritePass(
+		context.Background(), cfg, engine, database, lock, "audit", nil,
+	)
+	require.NoError(t, err, "pass recovers once the contender releases the lock")
+	require.NoError(t, <-closeErr, "contender released the lock cleanly")
+	assert.Equal(t, "ok", result.Status)
+	assert.True(t, lock.Held(), "flock eventually reacquired")
+	assert.NoError(t, writeOneSession(database), "writer reopened after recovery")
+}
+
+func TestReacquireWriteOwnerLockStopsOnContextCancel(t *testing.T) {
+	cfg := testConfigWithClaudeFixture(t)
+	_, lock := openTestWriteDB(t, cfg)
+	require.NoError(t, lock.Release())
+
+	prevInitial := reacquireBackoffInitial
+	reacquireBackoffInitial = time.Hour // never elapses within the test
+	defer func() { reacquireBackoffInitial = prevInitial }()
+
+	// A contender holds the lock so every reacquire attempt fails.
+	contender, err := tryAcquireWriteOwnerLock(cfg.DataDir)
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, contender.Close()) }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = reacquireWriteOwnerLock(ctx, lock, "audit")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.Canceled)
 }
 
 func TestReadWorkerResultRequiresExactlyOneResult(t *testing.T) {
