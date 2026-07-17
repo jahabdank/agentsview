@@ -702,7 +702,11 @@ func (d *DB) CopySessionMetadataFrom(
 			ON CONFLICT(machine, path_prefix) DO UPDATE SET
 				layout = excluded.layout,
 				project = excluded.project,
-				original_project = excluded.original_project,
+				original_project = CASE
+					WHEN worktree_project_mappings.original_project = ''
+						THEN excluded.original_project
+					ELSE worktree_project_mappings.original_project
+				END,
 				enabled = excluded.enabled,
 				created_at = excluded.created_at,
 				updated_at = excluded.updated_at`); err != nil {

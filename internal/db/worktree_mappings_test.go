@@ -1073,6 +1073,91 @@ func TestWorktreeProjectMappingsFinalMetadataCopyRefreshesStalePrecopy(
 	assert.False(t, got[0].Enabled, "mapping should reflect disabled source row")
 }
 
+func TestCopySessionMetadataFromPreservesExistingMappingOriginalProject(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	tests := []struct {
+		name         string
+		createSource func(*testing.T, string, string)
+		wantProject  string
+		wantEnabled  bool
+	}{
+		{
+			name: "different non-empty source",
+			createSource: func(t *testing.T, path, prefix string) {
+				t.Helper()
+				src, err := Open(path)
+				require.NoError(t, err, "open source")
+				_, err = src.CreateWorktreeProjectMapping(
+					ctx,
+					WorktreeProjectMapping{
+						Machine:         "host-a.example",
+						PathPrefix:      prefix,
+						Project:         "source-service",
+						OriginalProject: "source-label",
+						Enabled:         false,
+					},
+				)
+				require.NoError(t, err, "create source mapping")
+				require.NoError(t, src.Close(), "close source")
+			},
+			wantProject: "source_service",
+			wantEnabled: false,
+		},
+		{
+			name: "legacy source without original project",
+			createSource: func(t *testing.T, path, prefix string) {
+				t.Helper()
+				createWorktreeMappingDBWithoutOriginalProject(t, path, prefix)
+			},
+			wantProject: "service",
+			wantEnabled: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			prefix := filepath.Join(dir, "service.worktrees")
+			srcPath := filepath.Join(dir, "src.db")
+			tt.createSource(t, srcPath, prefix)
+
+			dst, err := Open(filepath.Join(dir, "dst.db"))
+			require.NoError(t, err, "open destination")
+			defer dst.Close()
+			_, err = dst.CreateWorktreeProjectMapping(
+				ctx,
+				WorktreeProjectMapping{
+					Machine:         "host-a.example",
+					PathPrefix:      prefix,
+					Project:         "destination-service",
+					OriginalProject: "destination-label",
+					Enabled:         true,
+				},
+			)
+			require.NoError(t, err, "create destination mapping")
+
+			require.NoError(
+				t,
+				dst.CopySessionMetadataFrom(srcPath),
+				"copy source metadata",
+			)
+
+			mappings, err := dst.ListWorktreeProjectMappings(
+				ctx, "host-a.example",
+			)
+			require.NoError(t, err, "list destination mappings")
+			require.Len(t, mappings, 1)
+			assert.Equal(t, "destination-label", mappings[0].OriginalProject)
+			assert.Equal(t, tt.wantProject, mappings[0].Project,
+				"other source fields are still reconciled")
+			assert.Equal(t, tt.wantEnabled, mappings[0].Enabled,
+				"other source fields are still reconciled")
+		})
+	}
+}
+
 func TestWorktreeProjectMappingsFinalMetadataCopyRemovesDeletedPrecopy(
 	t *testing.T,
 ) {
