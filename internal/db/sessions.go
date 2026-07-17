@@ -1393,6 +1393,14 @@ func upsertSessionArgs(s Session) []any {
 // Sessions that were permanently deleted (in excluded_sessions)
 // or currently in the trash are rejected.
 func (db *DB) UpsertSession(s Session) error {
+	_, err := db.UpsertSessionWithInsertState(s)
+	return err
+}
+
+// UpsertSessionWithInsertState inserts or updates a session and reports
+// whether this write inserted the row, which also means it fired insert-only
+// database triggers.
+func (db *DB) UpsertSessionWithInsertState(s Session) (bool, error) {
 	_ = ValidateAndSanitize(&s, nil, nil)
 
 	db.mu.Lock()
@@ -1405,14 +1413,18 @@ func (db *DB) UpsertSession(s Session) error {
 		"SELECT 1 FROM excluded_sessions WHERE id = ?", s.ID,
 	).Scan(&excluded)
 	if excluded == 1 {
-		return ErrSessionExcluded
+		return false, ErrSessionExcluded
 	}
-	var trashed int
-	_ = db.getWriter().QueryRow(
-		"SELECT 1 FROM sessions WHERE id = ? AND deleted_at IS NOT NULL", s.ID,
-	).Scan(&trashed)
-	if trashed == 1 {
-		return ErrSessionTrashed
+	var deletedAt sql.NullString
+	err := db.getWriter().QueryRow(
+		"SELECT deleted_at FROM sessions WHERE id = ?", s.ID,
+	).Scan(&deletedAt)
+	sessionInserted := errors.Is(err, sql.ErrNoRows)
+	if err != nil && !sessionInserted {
+		return false, fmt.Errorf("checking session %s: %w", s.ID, err)
+	}
+	if deletedAt.Valid {
+		return false, ErrSessionTrashed
 	}
 
 	// data_version is intentionally NOT advanced here. The
@@ -1422,14 +1434,14 @@ func (db *DB) UpsertSession(s Session) error {
 	// up-to-date and starve the rewrite on the next sync.
 	// New rows are seeded with 0 (the default) and bumped to
 	// the current version once their messages land.
-	_, err := db.getWriter().Exec(
+	_, err = db.getWriter().Exec(
 		upsertSessionSQL,
 		upsertSessionArgs(s)...,
 	)
 	if err != nil {
-		return fmt.Errorf("upserting session %s: %w", s.ID, err)
+		return false, fmt.Errorf("upserting session %s: %w", s.ID, err)
 	}
-	return nil
+	return sessionInserted, nil
 }
 
 // insertSessionIfAbsent inserts a session only when no row with its id exists,

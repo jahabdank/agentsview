@@ -352,6 +352,7 @@ func writeOneSessionBatchTx(
 			err = upsertProjectIdentityObservationWithSnapshotProjectTx(
 				tx, write.IdentityObservation,
 				*write.IdentitySnapshotProject,
+				!sessionExists,
 			)
 		}
 		if err != nil {

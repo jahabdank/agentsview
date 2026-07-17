@@ -1476,6 +1476,100 @@ func TestProjectIdentityMappedWriteWithEmptyParserProjectOmitsSnapshot(
 	}
 }
 
+func TestProjectIdentityEmptySourceReparsePreservesExistingSnapshot(
+	t *testing.T,
+) {
+	tests := []struct {
+		name          string
+		writePath     string
+		sourceProject string
+	}{
+		{name: "ordinary", writePath: "ordinary", sourceProject: "feature_login"},
+		{name: "full_session", writePath: "full", sourceProject: "feature_login"},
+		{name: "bulk", writePath: "bulk", sourceProject: "feature_login"},
+		{
+			name:          "bulk_source_equals_target",
+			writePath:     "bulk",
+			sourceProject: "canonical_app",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			database := openTestDB(t)
+			root := t.TempDir()
+			cwd := filepath.Join(root, "feature-login")
+			_, err := database.CreateWorktreeProjectMapping(
+				context.Background(),
+				db.WorktreeProjectMapping{
+					Machine:    "laptop",
+					PathPrefix: root,
+					Project:    "canonical-app",
+					Enabled:    true,
+				},
+			)
+			require.NoError(t, err, "CreateWorktreeProjectMapping")
+
+			e := NewEngine(database, EngineConfig{Machine: "laptop"})
+			write := func(project string) {
+				t.Helper()
+				pw := pendingWrite{sess: parser.ParsedSession{
+					ID:        "mapped-reparse-" + tt.name,
+					Project:   project,
+					Machine:   "laptop",
+					Agent:     parser.AgentCodex,
+					Cwd:       cwd,
+					StartedAt: time.Now(),
+				}}
+				switch tt.writePath {
+				case "ordinary":
+					written, _, failed, _ := e.writeBatch(
+						[]pendingWrite{pw}, syncWriteDefault, true,
+					)
+					require.Equal(t, 0, failed, "ordinary write failures")
+					require.Equal(t, 1, written, "ordinary writes")
+				case "full":
+					require.NoError(t, e.writeSessionFull(pw), "writeSessionFull")
+				case "bulk":
+					written, _, failed, _ := e.writeBatch(
+						[]pendingWrite{pw}, syncWriteBulk, true,
+					)
+					require.Equal(t, 0, failed, "bulk write failures")
+					require.Equal(t, 1, written, "bulk writes")
+				default:
+					require.Fail(t, "unknown write path", tt.writePath)
+				}
+			}
+
+			write(tt.sourceProject)
+			write("")
+
+			session, err := database.GetSession(
+				context.Background(), "mapped-reparse-"+tt.name,
+			)
+			require.NoError(t, err, "GetSession")
+			require.NotNil(t, session)
+			assert.Equal(t, "canonical_app", session.Project)
+
+			observations, err := database.ListProjectIdentityObservations(
+				context.Background(), []string{"canonical_app"},
+			)
+			require.NoError(t, err, "ListProjectIdentityObservations")
+			require.Len(t, observations, 1)
+			assert.Equal(t, "canonical_app", observations[0].Project)
+			assert.Equal(t, cwd, observations[0].RootPath)
+
+			snapshots, err := database.ListSessionProjectIdentitySnapshots(
+				context.Background(),
+			)
+			require.NoError(t, err, "ListSessionProjectIdentitySnapshots")
+			require.Len(t, snapshots, 1)
+			assert.Equal(t, "mapped-reparse-"+tt.name, snapshots[0].SessionID)
+			assert.Equal(t, tt.sourceProject, snapshots[0].Project)
+			assert.Equal(t, cwd, snapshots[0].RootPath)
+		})
+	}
+}
+
 func TestProjectIdentityDiscoversLinkedWorktreeRepositoryContext(t *testing.T) {
 	database := openTestDB(t)
 	mainRoot := filepath.Join(t.TempDir(), "main")

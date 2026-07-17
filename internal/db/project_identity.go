@@ -667,13 +667,28 @@ func (db *DB) UpsertProjectIdentityObservation(
 // UpsertProjectIdentityObservationWithSnapshotProject publishes current
 // aggregate evidence while preserving a separately labelled parser-time
 // snapshot. Only the project label may differ, so both rows retain identical
-// source evidence. An empty snapshot project preserves the aggregate but omits
-// the snapshot rather than inventing a source label; this also removes the
-// target-labelled fallback created by the session insert trigger.
+// source evidence. An empty snapshot project preserves the aggregate and
+// leaves any snapshot unchanged; session insertion paths use the state-aware
+// variant below to remove only their newly created trigger fallback.
 func (db *DB) UpsertProjectIdentityObservationWithSnapshotProject(
 	ctx context.Context,
 	obs export.ProjectIdentityObservation,
 	snapshotProject string,
+) error {
+	return db.UpsertProjectIdentityObservationForSessionWrite(
+		ctx, obs, snapshotProject, false,
+	)
+}
+
+// UpsertProjectIdentityObservationForSessionWrite publishes current aggregate
+// evidence and writes source snapshot evidence for one session write. An empty
+// source removes the insert-trigger fallback only when this write inserted the
+// session; reparses preserve every pre-existing immutable snapshot.
+func (db *DB) UpsertProjectIdentityObservationForSessionWrite(
+	ctx context.Context,
+	obs export.ProjectIdentityObservation,
+	snapshotProject string,
+	sessionInserted bool,
 ) error {
 	if err := db.requireWritable(); err != nil {
 		return err
@@ -707,7 +722,7 @@ func (db *DB) UpsertProjectIdentityObservationWithSnapshotProject(
 		func(ctx context.Context, query string, args ...any) rowScanner {
 			return tx.QueryRowContext(ctx, query, args...)
 		},
-		obs, snapshotProject,
+		obs, snapshotProject, sessionInserted,
 	); err != nil {
 		return err
 	}
@@ -722,7 +737,7 @@ func upsertProjectIdentityObservationTx(
 	obs export.ProjectIdentityObservation,
 ) error {
 	return upsertProjectIdentityObservationWithSnapshotProjectTx(
-		tx, obs, obs.Project,
+		tx, obs, obs.Project, false,
 	)
 }
 
@@ -730,6 +745,7 @@ func upsertProjectIdentityObservationWithSnapshotProjectTx(
 	tx *sql.Tx,
 	obs export.ProjectIdentityObservation,
 	snapshotProject string,
+	sessionInserted bool,
 ) error {
 	normalized, err := normalizeProjectIdentityObservation(obs)
 	if err != nil {
@@ -749,7 +765,7 @@ func upsertProjectIdentityObservationWithSnapshotProjectTx(
 		func(ctx context.Context, query string, args ...any) rowScanner {
 			return tx.QueryRowContext(ctx, query, args...)
 		},
-		normalized, snapshotProject,
+		normalized, snapshotProject, sessionInserted,
 	); err != nil {
 		return err
 	}
@@ -762,9 +778,13 @@ func writeSessionProjectIdentitySnapshotExec(
 	queryRow contextQueryRow,
 	obs export.ProjectIdentityObservation,
 	snapshotProject string,
+	sessionInserted bool,
 ) error {
 	snapshotProject = strings.TrimSpace(snapshotProject)
 	if snapshotProject == "" {
+		if !sessionInserted {
+			return nil
+		}
 		sessionID := strings.TrimSpace(obs.SessionID)
 		if sessionID == "" {
 			return nil
