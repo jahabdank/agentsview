@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -14,9 +15,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestOpenCodeHybridStreamingDiscoveryPropagatesSQLiteFailure(t *testing.T) {
+func TestOpenCodeHybridStreamingDiscoveryToleratesSQLiteFailure(t *testing.T) {
 	root := t.TempDir()
-	writeOpenCodeProviderStorageSession(
+	storagePath := writeOpenCodeProviderStorageSession(
 		t, root, "session", "ses_storage", "project", "Storage",
 	)
 	require.NoError(t, os.WriteFile(
@@ -25,10 +26,35 @@ func TestOpenCodeHybridStreamingDiscoveryPropagatesSQLiteFailure(t *testing.T) {
 	provider, ok := NewProvider(AgentOpenCode, ProviderConfig{Roots: []string{root}})
 	require.True(t, ok)
 
-	err := provider.(StreamingDiscoverer).DiscoverEach(
+	discovered, err := provider.Discover(t.Context())
+	require.NoError(t, err)
+	requireSourcePathsMatch(t, discovered, []string{storagePath})
+	var streamed []SourceRef
+	err = provider.(StreamingDiscoverer).DiscoverEach(
+		t.Context(), func(source SourceRef) error {
+			streamed = append(streamed, source)
+			return nil
+		},
+	)
+	require.NoError(t, err)
+	requireSourcePathsMatch(t, streamed, []string{storagePath})
+	assert.Equal(t, discovered, streamed,
+		"slice and streaming discovery must expose the same surviving sources")
+}
+
+func TestOpenCodeSQLiteOnlyStreamingDiscoveryPropagatesSQLiteFailure(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, "opencode.db"), []byte("not sqlite"), 0o600,
+	))
+	provider, ok := NewProvider(AgentOpenCode, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+
+	_, err := provider.Discover(t.Context())
+	require.Error(t, err)
+	err = provider.(StreamingDiscoverer).DiscoverEach(
 		t.Context(), func(SourceRef) error { return nil },
 	)
-
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "SQLite")
 }
@@ -444,10 +470,16 @@ func TestOpenCodeProviderHybridDiscoveryFiltersSQLiteDuplicate(t *testing.T) {
 	discovered, err := provider.Discover(context.Background())
 	require.NoError(t, err)
 	require.Len(t, discovered, 2)
-	assert.ElementsMatch(t, []string{storagePath, virtualOnly}, []string{
-		discovered[0].DisplayPath,
-		discovered[1].DisplayPath,
-	})
+	wantPaths := []string{storagePath, virtualOnly}
+	requireSourcePathsMatch(t, discovered, wantPaths)
+	var streamed []SourceRef
+	require.NoError(t, provider.(StreamingDiscoverer).DiscoverEach(
+		t.Context(), func(source SourceRef) error {
+			streamed = append(streamed, source)
+			return nil
+		},
+	))
+	requireSourcePathsMatch(t, streamed, wantPaths)
 
 	found, ok, err := provider.FindSource(context.Background(), FindSourceRequest{
 		StoredFilePath: OpenCodeSQLiteVirtualPath(dbPath, "ses_dup"),
@@ -469,6 +501,184 @@ func TestOpenCodeProviderHybridDiscoveryFiltersSQLiteDuplicate(t *testing.T) {
 	require.Len(t, changed, 1)
 	assert.Equal(t, storagePath, changed[0].DisplayPath,
 		"a storage source that appears before rehydration remains canonical")
+}
+
+func TestOpenCodeHybridStreamingDedupUsesStorageTraversalSnapshot(t *testing.T) {
+	root := t.TempDir()
+	storagePath := writeOpenCodeProviderStorageSession(
+		t, root, "session", "ses_storage", "storage-app", "Storage Session",
+	)
+	dbPath, seeder, db := newTestDBAt(t, filepath.Join(root, "opencode.db"))
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	seeder.AddProject("prj_1", "/home/user/code/sqlite-app")
+	seeder.AddSession(
+		"ses_sqlite", "prj_1", "", "SQLite", 1700000000000, 1700000010000,
+	)
+	virtualPath := OpenCodeSQLiteVirtualPath(dbPath, "ses_sqlite")
+	lateStoragePath := filepath.Join(
+		root, "storage", "session", "global", "ses_sqlite.json",
+	)
+	storageRoot := filepath.Join(root, "storage", "session")
+	lateAdds := 0
+	ctx := withStreamingDirectoryReader(t.Context(), func(
+		ctx context.Context, dir string, yield func(os.DirEntry) error,
+	) error {
+		if err := streamDirectoryEntriesDirect(ctx, dir, yield); err != nil {
+			return err
+		}
+		if !samePath(dir, storageRoot) {
+			return nil
+		}
+		lateAdds++
+		return os.WriteFile(lateStoragePath, []byte("{}"), 0o600)
+	})
+	provider, ok := NewProvider(
+		AgentOpenCode, ProviderConfig{Roots: []string{root}},
+	)
+	require.True(t, ok)
+	var paths []string
+
+	err := provider.(StreamingDiscoverer).DiscoverEach(
+		ctx, func(source SourceRef) error {
+			paths = append(paths, source.DisplayPath)
+			return nil
+		},
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, 1, lateAdds,
+		"the late storage file must be added after the storage snapshot completes")
+	assert.Equal(t, []string{storagePath, virtualPath}, paths,
+		"deduplication must use the same storage snapshot that was yielded")
+}
+
+func TestOpenCodeHybridStreamingRetainedHeapDoesNotScaleWithStorageArchive(
+	t *testing.T,
+) {
+	measureRetainedHeap := func(storageSessions int) uint64 {
+		t.Helper()
+		root := t.TempDir()
+		sessionDir := filepath.Join(root, "storage", "session", "global")
+		require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+		for i := range storageSessions {
+			name := fmt.Sprintf(
+				"ses_%05d_%s.json", i, strings.Repeat("x", 160),
+			)
+			require.NoError(t, os.WriteFile(
+				filepath.Join(sessionDir, name), []byte("{}"), 0o600,
+			))
+		}
+		dbPath, seeder, db := newTestDBAt(t, filepath.Join(root, "opencode.db"))
+		seeder.AddProject("prj_1", "/home/user/code/sqlite-app")
+		seeder.AddSession(
+			"ses_sqlite", "prj_1", "", "SQLite", 1700000000000, 1700000010000,
+		)
+		provider, ok := NewProvider(
+			AgentOpenCode, ProviderConfig{Roots: []string{root}},
+		)
+		require.True(t, ok)
+		virtualPath := OpenCodeSQLiteVirtualPath(dbPath, "ses_sqlite")
+
+		runtime.GC()
+		var before runtime.MemStats
+		runtime.ReadMemStats(&before)
+		var retained uint64
+		measured := false
+		err := provider.(StreamingDiscoverer).DiscoverEach(
+			t.Context(), func(source SourceRef) error {
+				if source.DisplayPath != virtualPath {
+					return nil
+				}
+				measured = true
+				runtime.GC()
+				var during runtime.MemStats
+				runtime.ReadMemStats(&during)
+				if during.HeapAlloc > before.HeapAlloc {
+					retained = during.HeapAlloc - before.HeapAlloc
+				}
+				return nil
+			},
+		)
+		require.NoError(t, err)
+		require.True(t, measured,
+			"retained heap must be sampled at the SQLite virtual source")
+		require.NoError(t, db.Close())
+		return retained
+	}
+
+	const retainedGrowthLimit = 256 * 1024
+	smallRetained := measureRetainedHeap(16)
+	largeRetained := measureRetainedHeap(4096)
+	assert.LessOrEqual(t, largeRetained, smallRetained+retainedGrowthLimit,
+		"hybrid deduplication must not retain storage IDs on the Go heap")
+}
+
+func TestOpenCodeHybridStreamingDiskMembershipFailuresPropagate(t *testing.T) {
+	tests := []struct {
+		name   string
+		inject func(context.Context, error) context.Context
+	}{
+		{name: "query", inject: WithDiscoveryDiskMapQueryError},
+		{name: "cleanup", inject: WithDiscoveryDiskMapCleanupError},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			writeOpenCodeProviderStorageSession(
+				t, root, "session", "ses_storage", "storage-app", "Storage Session",
+			)
+			_, seeder, db := newTestDBAt(t, filepath.Join(root, "opencode.db"))
+			t.Cleanup(func() { require.NoError(t, db.Close()) })
+			seeder.AddProject("prj_1", "/home/user/code/sqlite-app")
+			seeder.AddSession(
+				"ses_sqlite", "prj_1", "", "SQLite", 1700000000000, 1700000010000,
+			)
+			provider, ok := NewProvider(
+				AgentOpenCode, ProviderConfig{Roots: []string{root}},
+			)
+			require.True(t, ok)
+			injected := errors.New("injected disk membership " + tt.name)
+
+			err := provider.(StreamingDiscoverer).DiscoverEach(
+				tt.inject(t.Context(), injected), func(SourceRef) error { return nil },
+			)
+
+			require.ErrorIs(t, err, injected)
+		})
+	}
+}
+
+func TestOpenCodeHybridStreamingDiscoveryPropagatesSQLiteCallbackError(
+	t *testing.T,
+) {
+	root := t.TempDir()
+	storagePath := writeOpenCodeProviderStorageSession(
+		t, root, "session", "ses_storage", "storage-app", "Storage Session",
+	)
+	dbPath, seeder, db := newTestDBAt(t, filepath.Join(root, "opencode.db"))
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	seeder.AddProject("prj_1", "/home/user/code/sqlite-app")
+	seeder.AddSession(
+		"ses_sqlite", "prj_1", "", "SQLite", 1700000000000, 1700000010000,
+	)
+	virtualPath := OpenCodeSQLiteVirtualPath(dbPath, "ses_sqlite")
+	provider, ok := NewProvider(AgentOpenCode, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	sentinel := errors.New("stop after SQLite source")
+	var yielded []string
+
+	err := provider.(StreamingDiscoverer).DiscoverEach(
+		t.Context(), func(source SourceRef) error {
+			yielded = append(yielded, source.DisplayPath)
+			if source.DisplayPath == virtualPath {
+				return sentinel
+			}
+			return nil
+		},
+	)
+
+	require.ErrorIs(t, err, sentinel)
+	assert.Equal(t, []string{storagePath, virtualPath}, yielded)
 }
 
 func TestOpenCodeProviderDiscoveryToleratesCorruptSQLiteDB(t *testing.T) {

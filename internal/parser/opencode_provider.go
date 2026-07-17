@@ -389,36 +389,84 @@ func (s openCodeFormatSourceSet) DiscoverEach(
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		src := s.spec.resolve(root)
-		if src.Mode == OpenCodeSourceStorage {
-			if err := s.discoverStorageEach(ctx, root, src, yield); err != nil {
-				return err
-			}
-		}
-		if src.DBPath == "" || !IsRegularFile(src.DBPath) {
-			continue
-		}
-		err := s.spec.streamSQLite(ctx, src.DBPath, func(meta OpenCodeSessionMeta) error {
-			source, ok := s.sqliteSourceRefFromMeta(root, meta)
-			if !ok {
-				return nil
-			}
-			return yield(source)
-		})
-		if err != nil {
-			if ctx.Err() != nil {
-				return err
-			}
-			return fmt.Errorf("stream %s SQLite %s: %w", s.spec.agent, src.DBPath, err)
+		if err := s.discoverRootEach(ctx, root, yield); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+func (s openCodeFormatSourceSet) discoverRootEach(
+	ctx context.Context, root string, yield func(SourceRef) error,
+) (retErr error) {
+	src := s.spec.resolve(root)
+	hasSQLite := src.DBPath != "" && IsRegularFile(src.DBPath)
+	var storageIDs *discoveryDiskMap
+	if src.Mode == OpenCodeSourceStorage && hasSQLite {
+		var err error
+		storageIDs, err = newDiscoveryDiskMapForContext(ctx)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if cleanupErr := storageIDs.close(); cleanupErr != nil {
+				retErr = errors.Join(retErr, cleanupErr)
+			}
+		}()
+	}
+	if src.Mode == OpenCodeSourceStorage {
+		if err := s.discoverStorageEach(ctx, root, src, storageIDs, yield); err != nil {
+			return err
+		}
+	}
+	if !hasSQLite {
+		return nil
+	}
+	var callbackErr error
+	var membershipErr error
+	err := s.spec.streamSQLite(ctx, src.DBPath, func(meta OpenCodeSessionMeta) error {
+		if storageIDs != nil {
+			_, exists, err := storageIDs.get(ctx, meta.SessionID)
+			if err != nil {
+				membershipErr = err
+				return err
+			}
+			if exists {
+				return nil
+			}
+		}
+		source, ok := s.sqliteSourceRefFromMeta(root, meta)
+		if !ok {
+			return nil
+		}
+		callbackErr = yield(source)
+		return callbackErr
+	})
+	if callbackErr != nil {
+		return callbackErr
+	}
+	if membershipErr != nil {
+		return membershipErr
+	}
+	if err == nil {
+		return nil
+	}
+	if ctx.Err() != nil {
+		return err
+	}
+	if src.Mode == OpenCodeSourceStorage {
+		log.Printf("sync %s: skipping unreadable %s: %v",
+			s.spec.agent, src.DBPath, err)
+		return nil
+	}
+	return fmt.Errorf("stream %s SQLite %s: %w", s.spec.agent, src.DBPath, err)
 }
 
 func (s openCodeFormatSourceSet) discoverStorageEach(
 	ctx context.Context,
 	root string,
 	src OpenCodeSource,
+	storageIDs *discoveryDiskMap,
 	yield func(SourceRef) error,
 ) error {
 	var callbackErr error
@@ -435,6 +483,14 @@ func (s openCodeFormatSourceSet) discoverStorageEach(
 			source, ok := s.sourceRef(root, path, false)
 			if !ok {
 				return nil
+			}
+			if storageIDs != nil {
+				id := strings.TrimSuffix(entry.Name(), ".json")
+				if id != "" {
+					if err := storageIDs.put(ctx, id, id, false); err != nil {
+						return err
+					}
+				}
 			}
 			source.ProjectHint = openCodeSessionProject(path)
 			callbackErr = yield(source)

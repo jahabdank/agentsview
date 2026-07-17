@@ -299,8 +299,25 @@ func (s hermesSourceSet) DiscoverEach(ctx context.Context, yield func(SourceRef)
 			return err
 		}
 		if stateDB, sessionsDir, ok := hermesStatePaths(root); ok {
-			if err := s.discoverStateEach(ctx, root, stateDB, yield); err != nil {
-				return err
+			yieldedAny, err := s.discoverStateEach(ctx, root, stateDB, yield)
+			if err != nil {
+				if cause, ok := discoveryYieldCause(err); ok {
+					return cause
+				}
+				if yieldedAny || ctx.Err() != nil {
+					return err
+				}
+				log.Printf(
+					"hermes: state db discovery failed for %s: %v; "+
+						"falling back to transcripts",
+					stateDB, err,
+				)
+				if err := s.discoverTranscriptEach(
+					ctx, root, sessionsDir, "", yield,
+				); err != nil {
+					return err
+				}
+				continue
 			}
 			if err := s.discoverTranscriptEach(ctx, root, sessionsDir, stateDB, yield); err != nil {
 				return err
@@ -317,31 +334,33 @@ func (s hermesSourceSet) DiscoverEach(ctx context.Context, yield func(SourceRef)
 
 func (s hermesSourceSet) discoverStateEach(
 	ctx context.Context, root, stateDB string, yield func(SourceRef) error,
-) error {
+) (bool, error) {
 	conn, err := sql.Open("sqlite3", "file:"+sqliteURIPath(stateDB)+"?mode=ro")
 	if err != nil {
-		return fmt.Errorf("open hermes state db: %w", err)
+		return false, fmt.Errorf("open hermes state db: %w", err)
 	}
 	defer conn.Close()
 	rows, err := conn.QueryContext(ctx, "SELECT id FROM sessions ORDER BY id")
 	if err != nil {
-		return fmt.Errorf("query hermes sessions: %w", err)
+		return false, fmt.Errorf("query hermes sessions: %w", err)
 	}
 	defer rows.Close()
+	yieldedAny := false
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
-			return fmt.Errorf("scan hermes session id: %w", err)
+			return yieldedAny, fmt.Errorf("scan hermes session id: %w", err)
 		}
 		if !IsValidSessionID(id) {
 			continue
 		}
 		observeStreamingDiscoveryBuffer(ctx, 1)
+		yieldedAny = true
 		if err := yield(hermesStateMemberSourceRef(root, stateDB, id)); err != nil {
-			return err
+			return yieldedAny, discoveryYieldError{cause: err}
 		}
 	}
-	return rows.Err()
+	return yieldedAny, rows.Err()
 }
 
 func (s hermesSourceSet) discoverTranscriptEach(
