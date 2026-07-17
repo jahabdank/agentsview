@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net/http"
 	"strings"
@@ -116,6 +117,12 @@ func runPushStream[T any](
 	}
 	result, err := run(nil)
 	if err != nil {
+		if errors.Is(err, db.ErrWriterClosed) {
+			hctx.SetHeader("Retry-After", writerClosedRetryAfterSeconds)
+			writeHumaJSON(hctx, http.StatusServiceUnavailable,
+				map[string]string{"error": err.Error()})
+			return
+		}
 		writeHumaJSON(hctx, http.StatusInternalServerError,
 			map[string]string{"error": err.Error()})
 		return
