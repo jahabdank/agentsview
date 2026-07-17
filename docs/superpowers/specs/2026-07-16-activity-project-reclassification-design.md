@@ -63,6 +63,10 @@ repository, and worktree segments are required. Normal project-name
 normalization still applies, so a repository such as `sample-service` becomes
 `sample_service`.
 
+A cwd that stops at `worktrees/github.com/$OWNER/$REPOSITORY` intentionally does
+not match this layout because it has no worktree segment. The ordinary
+leaf-basename fallback already produces the repository name for that case.
+
 The parser data version advances. Deploying the change requires rebuilding and
 restarting the daemon, after which the designed full resync reparses sessions
 whose source files still exist. Those sessions acquire the repository label
@@ -84,6 +88,8 @@ Classification precedence is explicit:
 
 The same-answer overlap after both pull requests is harmless. A mapping can
 remain enabled even when the parser now derives the same canonical project.
+During a full resync, carryover mappings are reapplied for every represented
+machine, not only the writable archive's local machine.
 
 Settings remains the management surface for listing, editing, disabling,
 deleting, and reapplying rules. Activity is only a more discoverable creation
@@ -144,6 +150,7 @@ in Settings.
 Add a local-only Activity candidate endpoint. Its request contains:
 
 - the clicked project label;
+- the clicked row's opaque project identity key;
 - the current Activity range and filters;
 - the current timezone and automation scope.
 
@@ -190,6 +197,10 @@ resolver, longest-prefix precedence, deletion visibility, and sibling cwd
 fallback as apply and the sync engine. A more-specific existing rule keeps
 winning over a broader draft.
 
+Path normalization follows the stored path's slash style rather than the
+writable archive host's operating system, so a central Unix archive can safely
+evaluate Windows session paths and vice versa.
+
 The response contains authoritative totals only, plus bounded samples:
 
 - matched sessions;
@@ -216,6 +227,10 @@ preview. Another rule can change longest-prefix precedence and is therefore a
 real conflict. New or updated sessions do not invalidate the preview: the
 enabled rule is intended to classify later arrivals, and apply reevaluates the
 current matched set under the write lock.
+
+Preview also resolves an exact `(machine, path_prefix)` collision and returns
+that mapping's ID. Apply may edit only that returned row; callers do not choose
+an unrelated existing mapping ID.
 
 ## Atomic create or edit and apply
 
@@ -246,13 +261,15 @@ returns a conflict and requires a fresh preview.
 The exclusive lock means a broad user-initiated rewrite temporarily blocks the
 watcher and other sync work. This is accepted: SQLite is a single-writer store,
 the operation must be atomic, and the write work is bounded by the matched
-session set disclosed in preview. Evaluation remains machine-scoped and uses
-indexed path matching so lock time does not grow with unrelated machines.
+session set disclosed in preview. Evaluation scans only the selected machine's
+candidate sessions, so unrelated machines do not lengthen the critical section.
 
 ## Project identity consistency
 
 Per-session project identity snapshots are immutable source evidence. A manual
-classification does not rewrite them.
+classification does not rewrite them, including their parser-time source project
+label. Snapshot publication therefore remains source-labelled, while session
+publication and rebuilt aggregate observations follow the current mapped label.
 
 Aggregate observations describe how current project labels relate to repository
 and worktree evidence. After changing session labels, rebuild the aggregates for
@@ -361,6 +378,10 @@ Extend Worktree mappings with:
 - the existing edit, enable, apply, and delete controls scoped to the selected
   machine;
 - confirmation before deleting or disabling a rule.
+
+On read-only stores, Settings keeps the existing local-only informational state.
+It does not list mappings or render disabled management controls; the Activity
+action is the discoverable surface that explains where changes must be made.
 
 The localized confirmation explains:
 
@@ -494,12 +515,17 @@ then the repository gates:
 - `go fmt ./...`
 - `go vet ./...`
 - `make test`
+- `make lint`
 - `make test-postgres`
 - relevant DuckDB integration tests
 - `npm run i18n:compile` from `frontend/`
 - `npm run check` from `frontend/`
 - frontend component tests
 - the committed Playwright reclassification spec
+
+Run `make lint` over the complete branch before each pull request is opened, not
+only after individual implementation tasks, so golangci-lint and NilAway see
+every cross-task code path.
 
 Run the private-data scrub over code, fixtures, commit messages, and pull
 request descriptions. Tests and documentation use reserved example projects,
