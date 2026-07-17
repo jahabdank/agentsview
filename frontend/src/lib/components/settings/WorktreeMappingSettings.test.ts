@@ -62,6 +62,16 @@ function mapping(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 async function flush() {
   await tick();
   await new Promise((resolve) => setTimeout(resolve, 0));
@@ -205,6 +215,143 @@ describe("WorktreeMappingSettings", () => {
     expect(settingsService.postApiV1SettingsWorktreeMappingsApply).toHaveBeenCalledWith({
       requestBody: { machine: "remote-host" },
     });
+  });
+
+  it("does not let a completed save overwrite the newly selected machine", async () => {
+    const save = deferred<unknown>();
+    settingsService.getApiV1SettingsWorktreeMappings
+      .mockResolvedValueOnce(response("local-host"))
+      .mockResolvedValueOnce(response("remote-host", [mapping({ project: "remote-project" })]));
+    settingsService.postApiV1SettingsWorktreeMappings.mockReturnValue(save.promise);
+
+    component = mount(WorktreeMappingSettings, { target: document.body });
+    await flush();
+
+    await fireEvent.input(screen.getByRole("textbox", { name: "Path prefix" }), {
+      target: { value: "/worktrees/local" },
+    });
+    await fireEvent.input(screen.getByRole("textbox", { name: "Project" }), {
+      target: { value: "local-project" },
+    });
+    await fireEvent.click(screen.getByRole("button", { name: "Add mapping" }));
+
+    await fireEvent.click(screen.getByRole("button", { name: "Select machine" }));
+    await fireEvent.mouseDown(screen.getByRole("option", { name: "remote-host" }));
+    await flush();
+    await fireEvent.input(screen.getByRole("textbox", { name: "Path prefix" }), {
+      target: { value: "/worktrees/remote" },
+    });
+    await fireEvent.input(screen.getByRole("textbox", { name: "Project" }), {
+      target: { value: "remote-draft" },
+    });
+
+    save.resolve(mapping({ machine: "local-host", project: "local-project" }));
+    await flush();
+
+    expect(settingsService.getApiV1SettingsWorktreeMappings).toHaveBeenCalledTimes(2);
+    expect(document.body.textContent).toContain("remote-project");
+    expect((screen.getByRole("textbox", { name: "Path prefix" }) as HTMLInputElement).value)
+      .toBe("/worktrees/remote");
+    expect((screen.getByRole("textbox", { name: "Project" }) as HTMLInputElement).value)
+      .toBe("remote-draft");
+    expect(document.body.textContent).not.toContain("local-project");
+  });
+
+  it("does not show a stale apply error after the selected machine changes", async () => {
+    const apply = deferred<unknown>();
+    settingsService.getApiV1SettingsWorktreeMappings
+      .mockResolvedValueOnce(response("local-host", [mapping({ machine: "local-host" })]))
+      .mockResolvedValueOnce(response("remote-host", [mapping({ project: "remote-project" })]));
+    settingsService.postApiV1SettingsWorktreeMappingsApply.mockReturnValue(apply.promise);
+
+    component = mount(WorktreeMappingSettings, { target: document.body });
+    await flush();
+
+    await fireEvent.click(screen.getByRole("button", { name: "Apply mappings" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Select machine" }));
+    await fireEvent.mouseDown(screen.getByRole("option", { name: "remote-host" }));
+    await flush();
+
+    apply.reject(new Error("local apply failed"));
+    await flush();
+
+    expect(document.body.textContent).toContain("remote-project");
+    expect(document.body.textContent).not.toContain("local apply failed");
+    expect((screen.getByRole("button", { name: "Apply mappings" }) as HTMLButtonElement).disabled)
+      .toBe(false);
+  });
+
+  it("does not show a stale apply result after the selected machine changes", async () => {
+    const apply = deferred<unknown>();
+    settingsService.getApiV1SettingsWorktreeMappings
+      .mockResolvedValueOnce(response("local-host", [mapping({ machine: "local-host" })]))
+      .mockResolvedValueOnce(response("remote-host", [mapping({ project: "remote-project" })]));
+    settingsService.postApiV1SettingsWorktreeMappingsApply.mockReturnValue(apply.promise);
+
+    component = mount(WorktreeMappingSettings, { target: document.body });
+    await flush();
+
+    await fireEvent.click(screen.getByRole("button", { name: "Apply mappings" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Select machine" }));
+    await fireEvent.mouseDown(screen.getByRole("option", { name: "remote-host" }));
+    await flush();
+
+    apply.resolve({ machine: "local-host", updated_sessions: 91, matched_sessions: 92 });
+    await flush();
+
+    expect(document.body.textContent).toContain("remote-project");
+    expect(document.body.textContent).not.toContain("91 updated, 92 matched");
+  });
+
+  it("does not show a stale save error after the selected machine changes", async () => {
+    const save = deferred<unknown>();
+    settingsService.getApiV1SettingsWorktreeMappings
+      .mockResolvedValueOnce(response("local-host"))
+      .mockResolvedValueOnce(response("remote-host", [mapping({ project: "remote-project" })]));
+    settingsService.postApiV1SettingsWorktreeMappings.mockReturnValue(save.promise);
+
+    component = mount(WorktreeMappingSettings, { target: document.body });
+    await flush();
+
+    await fireEvent.input(screen.getByRole("textbox", { name: "Path prefix" }), {
+      target: { value: "/worktrees/local" },
+    });
+    await fireEvent.input(screen.getByRole("textbox", { name: "Project" }), {
+      target: { value: "local-project" },
+    });
+    await fireEvent.click(screen.getByRole("button", { name: "Add mapping" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Select machine" }));
+    await fireEvent.mouseDown(screen.getByRole("option", { name: "remote-host" }));
+    await flush();
+
+    save.reject(new Error("local save failed"));
+    await flush();
+
+    expect(document.body.textContent).toContain("remote-project");
+    expect(document.body.textContent).not.toContain("local save failed");
+  });
+
+  it("does not let a completed delete refresh the newly selected machine", async () => {
+    const deletion = deferred<unknown>();
+    settingsService.getApiV1SettingsWorktreeMappings
+      .mockResolvedValueOnce(response("local-host", [mapping({ machine: "local-host" })]))
+      .mockResolvedValueOnce(response("remote-host", [mapping({ project: "remote-project" })]));
+    settingsService.deleteApiV1SettingsWorktreeMappingsId.mockReturnValue(deletion.promise);
+
+    component = mount(WorktreeMappingSettings, { target: document.body });
+    await flush();
+
+    await fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Delete mapping" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Select machine" }));
+    await fireEvent.mouseDown(screen.getByRole("option", { name: "remote-host" }));
+    await flush();
+
+    deletion.resolve(undefined);
+    await flush();
+
+    expect(settingsService.getApiV1SettingsWorktreeMappings).toHaveBeenCalledTimes(2);
+    expect(document.body.textContent).toContain("remote-project");
   });
 
   it("shows remembered original labels and confirms delete", async () => {

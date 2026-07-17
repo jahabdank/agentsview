@@ -105,5 +105,6 @@ describe("ProjectTypeahead", () => {
     await fireEvent.click(screen.getByRole("button"));
     await fireEvent.input(screen.getByRole("combobox"), { target: { value: "   " } });
     expect(screen.queryByRole("option", { name: 'Use project ""' })).toBeNull();
+    expect(screen.queryByRole("option", { name: /^Use project/ })).toBeNull();
   });
 });

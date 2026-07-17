@@ -43,6 +43,7 @@
   let enabled = $state(true);
   let confirmation: Confirmation | null = $state(null);
   const mappingsRead = new LatestRead();
+  let machineGeneration = 0;
   let disposed = false;
 
   const machineOptions = $derived(
@@ -107,12 +108,19 @@
 
   function selectMachine(value: string) {
     if (!value || value === machine) return;
+    machineGeneration += 1;
     machine = value;
     mappings = [];
+    saving = false;
+    applying = false;
     applyMessage = "";
     error = "";
     resetForm();
     void loadMappings(value);
+  }
+
+  function isCurrentMachine(initiatingMachine: string, generation: number) {
+    return !disposed && machine === initiatingMachine && machineGeneration === generation;
   }
 
   function editMapping(mapping: DbWorktreeProjectMapping) {
@@ -150,6 +158,8 @@
   }
 
   async function saveMapping(input: WorktreeMappingRequest, id: number | null) {
+    const initiatingMachine = input.machine ?? machine;
+    const generation = machineGeneration;
     saving = true;
     error = "";
     applyMessage = "";
@@ -166,12 +176,14 @@
           }),
         );
       }
+      if (!isCurrentMachine(initiatingMachine, generation)) return;
       resetForm();
-      await loadMappings(machine);
+      await loadMappings(initiatingMachine);
     } catch (err) {
+      if (!isCurrentMachine(initiatingMachine, generation)) return;
       error = err instanceof Error ? err.message : m.worktree_failed_save();
     } finally {
-      saving = false;
+      if (isCurrentMachine(initiatingMachine, generation)) saving = false;
     }
   }
 
@@ -180,6 +192,8 @@
   }
 
   async function removeMapping(mapping: DbWorktreeProjectMapping) {
+    const initiatingMachine = machine;
+    const generation = machineGeneration;
     saving = true;
     error = "";
     applyMessage = "";
@@ -189,12 +203,14 @@
           id: String(mapping.id),
         }),
       );
+      if (!isCurrentMachine(initiatingMachine, generation)) return;
       if (editingId === mapping.id) resetForm();
-      await loadMappings(machine);
+      await loadMappings(initiatingMachine);
     } catch (err) {
+      if (!isCurrentMachine(initiatingMachine, generation)) return;
       error = err instanceof Error ? err.message : m.worktree_failed_delete();
     } finally {
-      saving = false;
+      if (isCurrentMachine(initiatingMachine, generation)) saving = false;
     }
   }
 
@@ -210,23 +226,27 @@
   }
 
   async function applyMappings() {
+    const initiatingMachine = machine;
+    const generation = machineGeneration;
     applying = true;
     error = "";
     applyMessage = "";
     try {
       const res = await callGenerated(() =>
         SettingsService.postApiV1SettingsWorktreeMappingsApply({
-          requestBody: { machine },
+          requestBody: { machine: initiatingMachine },
         }),
       ) as ApplyWorktreeMappingsResponse;
+      if (!isCurrentMachine(initiatingMachine, generation)) return;
       applyMessage = m.worktree_apply_result({
         updated: res.updated_sessions,
         matched: res.matched_sessions,
       });
     } catch (err) {
+      if (!isCurrentMachine(initiatingMachine, generation)) return;
       error = err instanceof Error ? err.message : m.worktree_failed_apply();
     } finally {
-      applying = false;
+      if (isCurrentMachine(initiatingMachine, generation)) applying = false;
     }
   }
 </script>
