@@ -816,6 +816,90 @@ func rebuildProjectIdentityAggregatesTx(
 	return nil
 }
 
+// reconcileSessionProjectIdentityAggregatesTx republishes only the immutable
+// evidence key carried by sessionID under the supplied current project labels.
+// This is the bounded incremental counterpart to the project-wide rebuild used
+// by explicit bulk reclassification and full resync operations.
+func reconcileSessionProjectIdentityAggregatesTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	sessionID string,
+	projects []string,
+) error {
+	var machine, rootPath, gitRemote string
+	err := tx.QueryRowContext(ctx, `
+		SELECT machine, root_path, git_remote
+		FROM session_project_identity_snapshots
+		WHERE session_id = ?`, sessionID,
+	).Scan(&machine, &rootPath, &gitRemote)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("reading session project identity key: %w", err)
+	}
+
+	seen := make(map[string]struct{}, len(projects))
+	for _, project := range projects {
+		project = strings.TrimSpace(project)
+		if project == "" {
+			continue
+		}
+		if _, ok := seen[project]; ok {
+			continue
+		}
+		seen[project] = struct{}{}
+
+		if _, err := tx.ExecContext(ctx, `
+			DELETE FROM project_identity_observations
+			WHERE project = ? AND machine = ?
+			  AND root_path = ? AND git_remote = ?`,
+			project, machine, rootPath, gitRemote,
+		); err != nil {
+			return fmt.Errorf(
+				"removing stale project identity aggregate key: %w", err,
+			)
+		}
+
+		_, err := tx.ExecContext(ctx, `
+			INSERT INTO project_identity_observations (
+				source_archive_id, source_archive_salt, project, machine,
+				root_path, git_remote, git_remote_name, repository_path,
+				worktree_name, worktree_root_path, worktree_relationship,
+				checkout_state, git_branch, remote_resolution,
+				remote_candidate_count, observed_at, normalized_remote,
+				key_source, key
+			)
+			SELECT '', '', ?, snap.machine,
+				snap.root_path, snap.git_remote, snap.git_remote_name,
+				snap.repository_path, snap.worktree_name,
+				snap.worktree_root_path, snap.worktree_relationship,
+				snap.checkout_state, snap.git_branch,
+				snap.remote_resolution, snap.remote_candidate_count,
+				snap.observed_at, snap.normalized_remote,
+				snap.key_source, snap.key
+			FROM session_project_identity_snapshots snap
+				INDEXED BY idx_session_project_identity_snapshots_evidence
+			WHERE snap.machine = ? AND snap.root_path = ?
+			  AND snap.git_remote = ?
+			  AND EXISTS (
+				SELECT 1 FROM sessions s
+				WHERE s.id = snap.session_id AND s.deleted_at IS NULL
+				  AND s.machine = ? AND s.project = ?
+			  )
+			ORDER BY snap.observed_at DESC, snap.session_id
+			LIMIT 1`,
+			project, machine, rootPath, gitRemote, machine, project,
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"reconciling project identity aggregate key: %w", err,
+			)
+		}
+	}
+	return nil
+}
+
 func upsertSessionProjectIdentitySnapshotExec(
 	ctx context.Context,
 	exec contextExecer,

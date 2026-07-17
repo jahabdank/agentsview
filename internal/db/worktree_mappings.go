@@ -1011,7 +1011,7 @@ func (db *DB) applyWorktreeProjectMappingToSession(
 	}
 	if changed > 0 {
 		update := evaluation.updates[0]
-		if err := rebuildProjectIdentityAggregatesTx(ctx, tx, machine, []string{
+		if err := reconcileSessionProjectIdentityAggregatesTx(ctx, tx, sessionID, []string{
 			update.currentProject,
 			update.nextProject,
 		}); err != nil {

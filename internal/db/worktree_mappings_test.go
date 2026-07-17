@@ -3,11 +3,15 @@ package db
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/agentsview/internal/export"
 )
 
 func TestWorktreeProjectMappingsCRUDNormalizesAndScopesByMachine(t *testing.T) {
@@ -1044,6 +1048,194 @@ func TestApplyWorktreeProjectMappingToSessionFromSyncDoesNotBumpLocalModifiedAt(
 	require.NoError(t, err, "GetSessionFull after")
 	assert.Equal(t, "repo", after.Project, "project")
 	assert.Nil(t, after.LocalModifiedAt, "local_modified_at after")
+}
+
+func TestApplyWorktreeProjectMappingToSessionReconcilesOnlyMovedIdentityKey(
+	t *testing.T,
+) {
+	t.Run("former key keeps another contributor", func(t *testing.T) {
+		d := testDB(t)
+		ctx := context.Background()
+		prefix := filepath.Join(t.TempDir(), "service.worktrees")
+		rootPath := "/srv/repos/service"
+		gitRemote := "https://example.com/example/service.git"
+
+		_, err := d.CreateWorktreeProjectMapping(ctx, WorktreeProjectMapping{
+			Machine: "test-host", PathPrefix: prefix,
+			Project: "target-project", Enabled: true,
+		})
+		require.NoError(t, err)
+		seedMappingIdentitySession(t, d, Session{
+			ID: "retained", Machine: "test-host", Agent: "claude",
+			Project: "source_project", Cwd: "/srv/elsewhere/service",
+		}, export.ProjectIdentityObservation{
+			RootPath: rootPath, GitRemote: gitRemote, GitBranch: "retained",
+			ObservedAt: time.Date(2026, 7, 16, 10, 0, 0, 0, time.UTC),
+		})
+		seedMappingIdentitySession(t, d, Session{
+			ID: "moved", Machine: "test-host", Agent: "claude",
+			Project: "source_project", Cwd: filepath.Join(prefix, "feature"),
+		}, export.ProjectIdentityObservation{
+			RootPath: rootPath, GitRemote: gitRemote, GitBranch: "moved",
+			ObservedAt: time.Date(2026, 7, 16, 11, 0, 0, 0, time.UTC),
+		})
+
+		updated, err := d.ApplyWorktreeProjectMappingToSessionFromSync(
+			ctx, "test-host", "moved", filepath.Join(prefix, "feature"),
+			"source_project",
+		)
+		require.NoError(t, err)
+		require.True(t, updated)
+
+		observations, err := d.ListProjectIdentityObservations(
+			ctx, []string{"source_project", "target_project"},
+		)
+		require.NoError(t, err)
+		require.Len(t, observations, 2)
+		assert.Equal(t, "retained",
+			findIdentityObservation(t, observations, "source_project").GitBranch)
+		assert.Equal(t, "moved",
+			findIdentityObservation(t, observations, "target_project").GitBranch)
+
+		var sourceSnapshots int
+		require.NoError(t, d.getReader().QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM session_project_identity_snapshots
+			WHERE project = ? AND session_id IN (?, ?)`,
+			"source_project", "retained", "moved",
+		).Scan(&sourceSnapshots))
+		assert.Equal(t, 2, sourceSnapshots,
+			"immutable snapshots keep their parser-time project")
+	})
+
+	t.Run("unsupported former key publishes tombstone", func(t *testing.T) {
+		d := testDB(t)
+		ctx := context.Background()
+		prefix := filepath.Join(t.TempDir(), "service.worktrees")
+		_, err := d.CreateWorktreeProjectMapping(ctx, WorktreeProjectMapping{
+			Machine: "test-host", PathPrefix: prefix,
+			Project: "target-project", Enabled: true,
+		})
+		require.NoError(t, err)
+		seedMappingIdentitySession(t, d, Session{
+			ID: "moved", Machine: "test-host", Agent: "claude",
+			Project: "source_project", Cwd: filepath.Join(prefix, "feature"),
+		}, export.ProjectIdentityObservation{
+			RootPath:   "/srv/repos/service",
+			GitRemote:  "https://example.com/example/service.git",
+			ObservedAt: time.Date(2026, 7, 16, 11, 0, 0, 0, time.UTC),
+		})
+		before, err := d.ProjectIdentityPublicationRevision(ctx)
+		require.NoError(t, err)
+
+		updated, err := d.ApplyWorktreeProjectMappingToSessionFromSync(
+			ctx, "test-host", "moved", filepath.Join(prefix, "feature"),
+			"source_project",
+		)
+		require.NoError(t, err)
+		require.True(t, updated)
+		after, err := d.ProjectIdentityPublicationRevision(ctx)
+		require.NoError(t, err)
+
+		observations, err := d.ListProjectIdentityObservations(
+			ctx, []string{"source_project", "target_project"},
+		)
+		require.NoError(t, err)
+		require.Len(t, observations, 1)
+		assert.Equal(t, "target_project", observations[0].Project)
+
+		delta, err := d.LoadProjectIdentityPublicationDelta(
+			ctx, before, after, nil, nil,
+		)
+		require.NoError(t, err)
+		require.Len(t, delta.ObservationDeletes, 1)
+		assert.Equal(t, ProjectIdentityObservationKey{
+			Project: "source_project", Machine: "test-host",
+			RootPath:  "/srv/repos/service",
+			GitRemote: "https://example.com/example/service.git",
+		}, delta.ObservationDeletes[0])
+	})
+}
+
+func TestApplyWorktreeProjectMappingToSessionIdentityWorkIsCardinalityBounded(
+	t *testing.T,
+) {
+	measure := func(t *testing.T, unrelatedKeys int) int64 {
+		t.Helper()
+		d := testDB(t)
+		ctx := context.Background()
+		prefix := filepath.Join(t.TempDir(), "service.worktrees")
+		_, err := d.CreateWorktreeProjectMapping(ctx, WorktreeProjectMapping{
+			Machine: "test-host", PathPrefix: prefix,
+			Project: "target-project", Enabled: true,
+		})
+		require.NoError(t, err)
+		seedMappingIdentitySession(t, d, Session{
+			ID: "moved", Machine: "test-host", Agent: "claude",
+			Project: "source_project", Cwd: filepath.Join(prefix, "feature"),
+		}, export.ProjectIdentityObservation{
+			RootPath:   "/srv/repos/service",
+			GitRemote:  "https://example.com/example/service.git",
+			ObservedAt: time.Date(2026, 7, 16, 11, 0, 0, 0, time.UTC),
+		})
+		for i := range unrelatedKeys {
+			id := fmt.Sprintf("unrelated-%04d", i)
+			seedMappingIdentitySession(t, d, Session{
+				ID: id, Machine: "test-host", Agent: "claude",
+				Project: "source_project", Cwd: "/srv/elsewhere/" + id,
+			}, export.ProjectIdentityObservation{
+				RootPath:   "/srv/repos/" + id,
+				GitRemote:  "https://example.com/example/" + id + ".git",
+				ObservedAt: time.Date(2026, 7, 16, 10, 0, 0, 0, time.UTC),
+			})
+		}
+		before, err := d.ProjectIdentityPublicationRevision(ctx)
+		require.NoError(t, err)
+		updated, err := d.ApplyWorktreeProjectMappingToSessionFromSync(
+			ctx, "test-host", "moved", filepath.Join(prefix, "feature"),
+			"source_project",
+		)
+		require.NoError(t, err)
+		require.True(t, updated)
+		after, err := d.ProjectIdentityPublicationRevision(ctx)
+		require.NoError(t, err)
+		return after - before
+	}
+
+	small := measure(t, 0)
+	large := measure(t, 200)
+	assert.Equal(t, small, large,
+		"one session event must not rewrite unrelated identity keys")
+}
+
+func seedMappingIdentitySession(
+	t *testing.T,
+	d *DB,
+	session Session,
+	identity export.ProjectIdentityObservation,
+) {
+	t.Helper()
+	require.NoError(t, d.UpsertSession(session))
+	identity.SessionID = session.ID
+	identity.Project = session.Project
+	identity.Machine = session.Machine
+	require.NoError(t, d.UpsertProjectIdentityObservation(
+		context.Background(), identity,
+	))
+}
+
+func findIdentityObservation(
+	t *testing.T,
+	observations []export.ProjectIdentityObservation,
+	project string,
+) export.ProjectIdentityObservation {
+	t.Helper()
+	for _, observation := range observations {
+		if observation.Project == project {
+			return observation
+		}
+	}
+	require.FailNow(t, "identity observation not found", project)
+	return export.ProjectIdentityObservation{}
 }
 
 func assertSessionProject(t *testing.T, d *DB, id, want string) {

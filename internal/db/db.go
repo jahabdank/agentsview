@@ -1072,6 +1072,11 @@ CREATE TABLE IF NOT EXISTS session_project_identity_snapshots (
     FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 );
 
+CREATE INDEX IF NOT EXISTS idx_session_project_identity_snapshots_evidence
+    ON session_project_identity_snapshots(
+        machine, root_path, git_remote, observed_at DESC, session_id
+    );
+
 CREATE TABLE IF NOT EXISTS background_migrations (
     name            TEXT PRIMARY KEY,
     state           TEXT NOT NULL,
@@ -2211,6 +2216,10 @@ func (db *DB) migrateColumns() error {
 			key                TEXT NOT NULL DEFAULT '',
 			FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 		);
+		CREATE INDEX IF NOT EXISTS idx_session_project_identity_snapshots_evidence
+			ON session_project_identity_snapshots(
+				machine, root_path, git_remote, observed_at DESC, session_id
+			);
 	`); err != nil {
 		return fmt.Errorf(
 			"creating project identity metadata: %w", err,
