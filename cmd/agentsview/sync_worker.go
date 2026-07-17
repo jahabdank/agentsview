@@ -98,11 +98,13 @@ func runSyncWorkerContext(
 	onProgress := func(p sync.Progress) { emit(workerLine{Progress: &p}) }
 	switch mode {
 	case "startup", "sync", "audit":
-		// "sync" is the live-archive foreground pass and "audit" is the daily
-		// safety-net pass; both share the "startup" body (including the
-		// NeedsResync branch for a stale-version archive). Only the daemon-side
-		// orchestration differs: "startup" runs before the daemon opens the DB,
-		// while "sync" and "audit" run inside a writer handoff.
+		// All three share the sync body. Only "startup" may resync-and-swap: it
+		// runs before the daemon opens the DB, so no live reader pins the old
+		// inode. "sync" (live foreground pass) and "audit" (daily safety net)
+		// run inside a writer handoff while the daemon's readers stay open, so
+		// they must refuse a stale-version archive rather than swap it out from
+		// under those readers; the real resync path is the resync-build flow,
+		// which swaps and resets caches daemon-side.
 		return runSyncWorkerStartup(ctx, cfg, mode, emit, onProgress)
 	case "resync-build":
 		return runSyncWorkerResyncBuild(ctx, cfg, mode, emit, onProgress)
@@ -135,6 +137,14 @@ func runSyncWorkerStartup(
 
 	engine := sync.NewEngine(database, workerEngineConfig(cfg))
 	defer engine.Close()
+
+	if database.NeedsResync() && mode != "startup" {
+		// A resync would CloseConnections + rename the archive file, but the
+		// daemon's reader pool still points at the old inode and only the writer
+		// is reopened by path afterward. Swapping here would strand readers on a
+		// deleted file; refuse and let the resync-build flow do the swap.
+		return refuseWorkerResync(mode, emit)
+	}
 
 	var stats sync.SyncStats
 	if database.NeedsResync() {
@@ -186,6 +196,20 @@ func runSyncWorkerResyncBuild(
 		return fmt.Errorf("sync worker %s: %w", mode, buildErr)
 	}
 	return nil
+}
+
+// refuseWorkerResync emits a failed terminal result for a live-archive worker
+// pass (sync/audit) that found a stale-version archive it must not swap, and
+// returns a matching error so the child exits non-zero. The daemon surfaces the
+// message: a resync is required and only the resync-build flow may perform it.
+func refuseWorkerResync(mode string, emit func(workerLine)) error {
+	const msg = "archive data version changed; a full resync is required. " +
+		"The live-archive worker will not swap the archive out from under the " +
+		"running daemon: restart the daemon to resync at startup, or trigger a " +
+		"resync"
+	result := workerResult{Status: "failed", Error: msg}
+	emit(workerLine{Result: &result})
+	return fmt.Errorf("sync worker %s: %s", mode, msg)
 }
 
 // workerResultFromStats maps engine stats to a terminal result. Cancellation or

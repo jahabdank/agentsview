@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -141,6 +142,56 @@ func TestSyncWorkerResyncBuildModeBuildsReplacement(t *testing.T) {
 	assert.Equal(t, 3, result.Synced)
 	assert.FileExists(t, cfg.DBPath+"-resync",
 		"worker must leave the built replacement for the daemon to swap")
+}
+
+// markArchiveStale drops the archive's user_version so the next open reports
+// NeedsResync, mimicking a parser data-version bump under a running daemon.
+func markArchiveStale(t *testing.T, dbPath string) {
+	t.Helper()
+	conn, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	_, err = conn.Exec("PRAGMA user_version = 0")
+	require.NoError(t, err)
+	require.NoError(t, conn.Close())
+}
+
+// TestSyncWorkerRefusesResyncForLiveArchiveModes locks in the split-brain guard:
+// the live-archive worker passes (sync/audit) run inside the daemon's writer
+// handoff, so they must refuse a stale-version archive instead of swapping the
+// file out from under the daemon's still-open reader pool.
+func TestSyncWorkerRefusesResyncForLiveArchiveModes(t *testing.T) {
+	for _, mode := range []string{"sync", "audit"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := testConfigWithClaudeFixture(t)
+			database, err := db.Open(cfg.DBPath)
+			require.NoError(t, err)
+			engine := sync.NewEngine(database, workerEngineConfig(cfg))
+			require.Equal(t, 3, engine.SyncAll(context.Background(), nil).Synced)
+			engine.Close()
+			require.NoError(t, database.Close())
+			markArchiveStale(t, cfg.DBPath)
+
+			before, err := os.Stat(cfg.DBPath)
+			require.NoError(t, err)
+
+			var out bytes.Buffer
+			err = runSyncWorkerContext(context.Background(), cfg, mode, &out)
+			require.Error(t, err, "a live-archive worker must refuse a stale archive")
+			assert.ErrorContains(t, err, "resync")
+
+			result := decodeSingleResult(t, &out)
+			assert.Equal(t, "failed", result.Status)
+			assert.False(t, result.DiscoveryComplete)
+			assert.Contains(t, result.Error, "resync")
+
+			after, err := os.Stat(cfg.DBPath)
+			require.NoError(t, err)
+			assert.True(t, os.SameFile(before, after),
+				"the archive file must not be swapped out from under the daemon")
+			assert.NoFileExists(t, cfg.DBPath+"-resync",
+				"a refused pass must not stage a replacement archive")
+		})
+	}
 }
 
 func TestSyncWorkerSyncModeSyncsLikeStartup(t *testing.T) {

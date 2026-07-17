@@ -202,6 +202,9 @@ func (s *Server) humaTriggerSync(
 	if err != nil {
 		return nil, err
 	}
+	if err := s.rejectStaleArchiveForSync(); err != nil {
+		return nil, err
+	}
 	return &huma.StreamResponse{Body: func(hctx huma.Context) {
 		stream, ok := newHumaSSEStream(hctx)
 		if !ok {
@@ -216,15 +219,33 @@ func (s *Server) humaTriggerSync(
 	}}, nil
 }
 
+// rejectStaleArchiveForSync fails a foreground /sync when the archive's data
+// version changed, because the worker-backed sync pass refuses to swap a stale
+// archive under the live daemon. It points the caller at /resync, which rebuilds
+// through the resync-build flow; it deliberately does not auto-trigger a resync.
+func (s *Server) rejectStaleArchiveForSync() error {
+	local, ok := s.db.(*db.DB)
+	if !ok || !local.NeedsResync() {
+		return nil
+	}
+	return apiError(
+		http.StatusConflict,
+		"archive data version changed; POST /api/v1/resync to rebuild the "+
+			"archive before syncing",
+	)
+}
+
 func (s *Server) runSyncWithResyncFallback(
 	ctx context.Context, engine *syncpkg.Engine,
 	progress func(syncpkg.Progress),
 ) syncpkg.SyncStats {
 	if s.localSyncRunner != nil {
-		// The worker-backed runner mirrors SyncThenRun's stale-archive routing
-		// internally (worker "sync" mode runs the resync branch). It only
-		// returns an error when the worker ran and reported failure; the stats
-		// still carry that outcome, so log and return them.
+		// The worker-backed "sync" runner refuses a stale-version archive rather
+		// than swap it under the live daemon (see runSyncWorkerStartup); callers
+		// gate on NeedsResync before reaching here and route rebuilds through the
+		// resync-build flow. It only returns an error when the worker ran and
+		// reported failure; the stats still carry that outcome, so log and
+		// return them.
 		stats, err := s.localSyncRunner(ctx, progress)
 		if err != nil && ctx.Err() == nil {
 			log.Printf("foreground local sync: %v", err)
