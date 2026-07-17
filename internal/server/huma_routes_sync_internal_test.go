@@ -43,12 +43,17 @@ type syncRouteFixtureConfig struct {
 	remoteHosts []config.RemoteHost
 	broadcaster *Broadcaster
 	engine      *syncpkg.Engine
+	syncRunner  LocalSyncRunner
 }
 
 type syncRouteFixtureOption func(*syncRouteFixtureConfig)
 
 func withStaleDB() syncRouteFixtureOption {
 	return func(c *syncRouteFixtureConfig) { c.stale = true }
+}
+
+func withLocalSyncRunner(r LocalSyncRunner) syncRouteFixtureOption {
+	return func(c *syncRouteFixtureConfig) { c.syncRunner = r }
 }
 
 func withRemoteHosts(hosts ...config.RemoteHost) syncRouteFixtureOption {
@@ -102,6 +107,9 @@ func newSyncRouteFixture(
 	var serverOptions []Option
 	if cfg.broadcaster != nil {
 		serverOptions = append(serverOptions, WithBroadcaster(cfg.broadcaster))
+	}
+	if cfg.syncRunner != nil {
+		serverOptions = append(serverOptions, WithLocalSyncRunner(cfg.syncRunner))
 	}
 	srv := New(serverConfig, database, cfg.engine, serverOptions...)
 	return &syncRouteFixture{
@@ -1212,6 +1220,28 @@ func TestHumaTriggerSyncLocalNoSyncResyncsStaleDB(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	assert.False(t, f.db.NeedsResync())
 	assertOnlySessionFirstMessageContains(t, f.db, "stale no sync route")
+}
+
+// TestHumaTriggerSyncWorkerBackedRejectsStaleArchive pins the new UX: with the
+// worker-backed runner wired, /sync on a stale archive returns 409 pointing at
+// /resync and never runs the runner, since the worker refuses to swap the
+// archive under the live daemon.
+func TestHumaTriggerSyncWorkerBackedRejectsStaleArchive(t *testing.T) {
+	ran := false
+	f := newSyncRouteFixture(t, withStaleDB(), withLocalSyncRunner(
+		func(context.Context, func(syncpkg.Progress)) (syncpkg.SyncStats, error) {
+			ran = true
+			return syncpkg.SyncStats{}, nil
+		},
+	))
+	require.True(t, f.db.NeedsResync())
+
+	w := serveJSON(t, f.handler, http.MethodPost, "/api/v1/sync", nil)
+
+	require.Equal(t, http.StatusConflict, w.Code, "body: %s", w.Body.String())
+	assert.Contains(t, w.Body.String(), "resync")
+	assert.False(t, ran, "the worker-backed runner must not run for a stale archive")
+	assert.True(t, f.db.NeedsResync(), "a rejected sync must not resync")
 }
 
 func TestForegroundSyncReleasesDeferredStartupMaintenance(t *testing.T) {
