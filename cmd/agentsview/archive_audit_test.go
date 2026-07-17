@@ -121,6 +121,72 @@ func TestArchiveAuditSurfacesWorkerFailureWithoutFallback(t *testing.T) {
 	}
 }
 
+// TestArchiveAuditAttemptLogsWorkerError proves the worker's terminal Error is
+// no longer swallowed: a failed attempt logs the actual error and reports false.
+func TestArchiveAuditAttemptLogsWorkerError(t *testing.T) {
+	logs := captureLogOutput(t)
+	ok := runArchiveAuditAttempt(
+		context.Background(), nil,
+		func(context.Context) error { return errors.New("audit boom") },
+	)
+	assert.False(t, ok, "a failed attempt reports failure")
+	assert.Contains(t, logs.String(), "audit boom",
+		"the worker's terminal error must reach the log")
+}
+
+// TestArchiveAuditAttemptSilentOnCancel proves a failure during shutdown does not
+// log: the cancelled context suppresses the spurious failure line.
+func TestArchiveAuditAttemptSilentOnCancel(t *testing.T) {
+	logs := captureLogOutput(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	ok := runArchiveAuditAttempt(
+		ctx, nil,
+		func(context.Context) error { return errors.New("audit boom") },
+	)
+	assert.False(t, ok)
+	assert.NotContains(t, logs.String(), "audit boom",
+		"a cancelled attempt must not log a failure")
+}
+
+// TestArchiveAuditLoopSuppressesBackoffLogOnShutdown proves the loop stays quiet
+// once the context is cancelled: the "next attempt" backoff line is suppressed.
+func TestArchiveAuditLoopSuppressesBackoffLogOnShutdown(t *testing.T) {
+	logs := captureLogOutput(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	wait := func(ctx context.Context, _ time.Duration) bool {
+		return ctx.Err() == nil
+	}
+	audit := func(context.Context) bool {
+		cancel() // fail this attempt and shut down before the next wait
+		return false
+	}
+	runArchiveAuditLoop(ctx, wait, audit)
+	assert.NotContains(t, logs.String(), "next attempt",
+		"shutdown must not emit a backoff line")
+}
+
+// TestArchiveAuditLoopLogsBackoffWhileRunning proves the backoff line is still
+// logged for a genuine mid-run failure, so suppression is scoped to shutdown.
+func TestArchiveAuditLoopLogsBackoffWhileRunning(t *testing.T) {
+	logs := captureLogOutput(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	attempts := 0
+	wait := func(ctx context.Context, _ time.Duration) bool {
+		return ctx.Err() == nil
+	}
+	audit := func(context.Context) bool {
+		attempts++
+		if attempts >= 2 {
+			cancel()
+		}
+		return false // first attempt fails while the context is still live
+	}
+	runArchiveAuditLoop(ctx, wait, audit)
+	assert.Contains(t, logs.String(), "next attempt",
+		"a live-run failure must log the backoff line")
+}
+
 // TestArchiveAuditLoopStopsOnContextCancel guards the shutdown path: a cancelled
 // context ends the loop without running an audit.
 func TestArchiveAuditLoopStopsOnContextCancel(t *testing.T) {

@@ -2113,15 +2113,33 @@ func startArchiveAudit(
 			}
 		},
 		func(ctx context.Context) bool {
-			ok := false
-			idleTracker.Do(func() {
-				ok = runArchiveAudit(
-					ctx, cfg, engine, database, lock, emitter,
-				) == nil
+			return runArchiveAuditAttempt(ctx, idleTracker, func(ctx context.Context) error {
+				return runArchiveAudit(ctx, cfg, engine, database, lock, emitter)
 			})
-			return ok
 		},
 	)
+}
+
+// runArchiveAuditAttempt runs one audit attempt as idle-tracked work and reports
+// success. It logs the worker's actual error on failure so the terminal Error
+// string is visible in debug.log, but stays quiet once the context is cancelled
+// so shutdown does not emit a spurious failure line.
+func runArchiveAuditAttempt(
+	ctx context.Context,
+	idleTracker *server.IdleTracker,
+	audit func(context.Context) error,
+) bool {
+	ok := false
+	idleTracker.Do(func() {
+		if err := audit(ctx); err != nil {
+			if ctx.Err() == nil {
+				log.Printf("archive audit attempt failed: %v", err)
+			}
+			return
+		}
+		ok = true
+	})
+	return ok
 }
 
 // runArchiveAuditLoop waits, runs one audit attempt, then reschedules from the
@@ -2146,7 +2164,9 @@ func runArchiveAuditLoop(
 			continue
 		}
 		delay = retry
-		log.Printf("archive audit failed; next attempt in %s", retry)
+		if ctx.Err() == nil {
+			log.Printf("archive audit failed; next attempt in %s", retry)
+		}
 		retry = min(retry*2, archiveAuditInterval)
 	}
 }
