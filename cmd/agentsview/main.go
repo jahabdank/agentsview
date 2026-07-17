@@ -160,13 +160,25 @@ func runServe(cfg config.Config, opts serveOptions) {
 	if !opts.SkipInitialSync && !cfg.NoSync && !testing.Testing() {
 		startupProgress.SetPhase("initial sync")
 		result, syncErr := runStartupSyncViaWorker(ctx, cfg, startupProgress)
-		if syncErr != nil {
+		workerStartupResult, workerSyncDone = startupWorkerOutcome(result, syncErr)
+		switch {
+		case syncErr == nil:
+		case errors.Is(syncErr, errWorkerSpawn):
 			log.Printf(
-				"startup sync worker: %v (falling back to in-process)", syncErr,
+				"startup sync worker spawn failed: %v "+
+					"(falling back to in-process initial sync)", syncErr,
 			)
-		} else {
-			workerStartupResult = result
-			workerSyncDone = true
+		default:
+			// The worker ran but reported a non-authoritative terminal result.
+			// Do NOT re-run the archive-scale sync in process: carry the
+			// aborted result forward so the bounded gap reconciliation and
+			// RecordStartupReconciled still open watcher dispatch with the
+			// incomplete stats.
+			log.Printf(
+				"ERROR: startup sync worker ran but did not complete: %v "+
+					"(surfacing incomplete pass; not re-syncing in process)",
+				syncErr,
+			)
 		}
 	}
 
@@ -501,6 +513,13 @@ func runDeferredStartupSyncFallback(
 	}
 	defer done()
 
+	// A foreground `agentsview sync` may have already driven startup
+	// reconciliation through newForegroundSyncRunner; skip the redundant worker
+	// pass in that case, matching RunStartupSyncFallback's own re-run gate.
+	if engine.StartupReconciled() {
+		return false, nil
+	}
+
 	// Route the skipped startup sync through the worker so it does not run at
 	// archive scale in the daemon. Only a spawn failure (or a test binary) falls
 	// back to the in-process path; a worker that ran and reported failure is
@@ -554,6 +573,32 @@ func runStartupSyncViaWorker(
 	return launchSyncWorker(ctx, cfg, "startup", onLine)
 }
 
+// startupWorkerOutcome decides how runServe proceeds after the startup worker.
+// It discriminates a spawn failure (the worker never ran) from a ran-and-failed
+// worker (a valid terminal result reporting incomplete discovery).
+//
+//   - err == nil: the worker completed; carry its result, done = true.
+//   - errors.Is(err, errWorkerSpawn): the worker never ran; done = false so the
+//     caller runs the in-process initial sync fallback.
+//   - any other err: the worker ran but did not complete; done = true with an
+//     aborted result (synthesized when the terminal record is unusable) so the
+//     caller surfaces the incomplete pass through gap reconciliation rather than
+//     re-running the archive-scale sync in process.
+func startupWorkerOutcome(result workerResult, err error) (workerResult, bool) {
+	switch {
+	case err == nil:
+		return result, true
+	case errors.Is(err, errWorkerSpawn):
+		return workerResult{}, false
+	default:
+		if result.Status == "" {
+			result.Status = "aborted"
+		}
+		result.DiscoveryComplete = false
+		return result, true
+	}
+}
+
 // statsFromWorkerResult maps a worker terminal result onto SyncStats for
 // RecordStartupReconciled. Only AuthoritativeDiscoveryComplete() is consulted by
 // the OnStartupReconciled consumer, so Aborted mirrors the worker's
@@ -600,10 +645,19 @@ func newForegroundSyncRunner(
 				ctx, cfg, engine, database, lock, "sync", onLine,
 			)
 			if err == nil {
-				return statsFromWorkerResult(result), nil
+				stats := statsFromWorkerResult(result)
+				// Acknowledge startup so a foreground `agentsview sync` that
+				// drives this pass (SkipInitialSync, DeferStartupMaintenance)
+				// opens watcher dispatch and releases startup maintenance, just
+				// as the in-process SyncThenRun it replaced did. Idempotent, so
+				// it is a no-op for an already-reconciled normal serve.
+				engine.RecordStartupReconciled(stats, nil)
+				return stats, nil
 			}
 			if !errors.Is(err, errWorkerSpawn) {
-				return statsFromWorkerResult(result), err
+				stats := statsFromWorkerResult(result)
+				engine.RecordStartupReconciled(stats, err)
+				return stats, err
 			}
 			log.Printf(
 				"foreground sync worker spawn failed: %v "+

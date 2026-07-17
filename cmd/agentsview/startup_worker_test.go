@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"testing"
@@ -100,6 +101,107 @@ func TestStartupWorkerFailureFallsBackInProcess(t *testing.T) {
 	case <-opened:
 	case <-time.After(2 * time.Second):
 		require.FailNow(t, "in-process fallback did not open dispatch")
+	}
+}
+
+// TestStartupWorkerOutcomeDiscriminatesSpawnFromRanFailed pins the Finding 1
+// contract: a spawn failure asks the caller to fall back in process, while a
+// worker that ran and reported failure is carried forward as an aborted result
+// so the caller surfaces it without re-syncing.
+func TestStartupWorkerOutcomeDiscriminatesSpawnFromRanFailed(t *testing.T) {
+	ok := workerResult{Status: "ok", Synced: 3, DiscoveryComplete: true}
+
+	tests := []struct {
+		name        string
+		result      workerResult
+		err         error
+		wantDone    bool
+		wantAborted bool
+		wantSynced  int
+	}{
+		{
+			name:       "completed",
+			result:     ok,
+			err:        nil,
+			wantDone:   true,
+			wantSynced: 3,
+		},
+		{
+			name:     "spawn failure falls back in process",
+			result:   workerResult{},
+			err:      fmt.Errorf("%w: exec: boom", errWorkerSpawn),
+			wantDone: false,
+		},
+		{
+			name: "ran and failed carries aborted result",
+			result: workerResult{
+				Status: "aborted", Synced: 1, DiscoveryComplete: false,
+			},
+			err:         errors.New("startup worker pass reported aborted"),
+			wantDone:    true,
+			wantAborted: true,
+			wantSynced:  1,
+		},
+		{
+			name:        "ran and failed with unusable result is synthesized",
+			result:      workerResult{},
+			err:         errors.New("startup worker emitted 0 terminal results"),
+			wantDone:    true,
+			wantAborted: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, done := startupWorkerOutcome(tc.result, tc.err)
+			assert.Equal(t, tc.wantDone, done)
+			if !done {
+				// A spawn failure discards the result and falls back in process.
+				return
+			}
+			stats := statsFromWorkerResult(got)
+			assert.Equal(t, tc.wantAborted, stats.Aborted)
+			assert.Equal(t, tc.wantSynced, stats.Synced)
+		})
+	}
+}
+
+// TestStartupWorkerRanFailedSurfacedWithoutResync exercises the Finding 1 daemon
+// path end to end: the worker ran and returned a valid terminal result with a
+// non-spawn error. The daemon must NOT fall back to the in-process initial sync
+// (done stays true), and the gap reconciliation plus RecordStartupReconciled
+// still open watcher dispatch, carrying the worker's aborted stats.
+func TestStartupWorkerRanFailedSurfacedWithoutResync(t *testing.T) {
+	cfg := testConfigWithClaudeFixture(t)
+
+	restore := stubLaunchSyncWorker(t, func(
+		context.Context, config.Config, string, func(workerLine),
+	) (workerResult, error) {
+		return workerResult{Status: "aborted", DiscoveryComplete: false},
+			errors.New("startup worker pass reported aborted")
+	})
+	defer restore()
+
+	result, syncErr := runStartupSyncViaWorker(
+		t.Context(), cfg, newStartupStateWriter(cfg.DataDir, time.Now),
+	)
+	require.Error(t, syncErr)
+	require.False(t, errors.Is(syncErr, errWorkerSpawn),
+		"ran-and-failed must be distinct from spawn failure")
+
+	carried, done := startupWorkerOutcome(result, syncErr)
+	require.True(t, done, "daemon must not re-run the in-process initial sync")
+	stats := statsFromWorkerResult(carried)
+	require.True(t, stats.Aborted, "carried stats must reflect the aborted pass")
+
+	opened := make(chan struct{}, 1)
+	engine := engineWithDispatchHandler(t, cfg, opened)
+	gapErr := engine.ReconcileWatchRoots(t.Context(), reconcileRootPaths(cfg), true)
+	engine.RecordStartupReconciled(stats, gapErr)
+
+	select {
+	case <-opened:
+	case <-time.After(2 * time.Second):
+		require.FailNow(t, "dispatch did not open after ran-and-failed handshake")
 	}
 }
 

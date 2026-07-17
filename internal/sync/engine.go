@@ -2574,6 +2574,24 @@ func (e *Engine) RecordStartupReconciled(stats SyncStats, err error) {
 	e.notifyStartupReconciled()
 }
 
+// StartupReconciled reports whether a startup pass has already completed
+// authoritatively: the startupReconciledReady gate closes only on a successful
+// reconciliation, matching RunStartupSyncFallback's own re-run gate. The
+// deferred fallback consults it to skip a redundant worker pass when a
+// foreground request already drove startup reconciliation. A failed or aborted
+// attempt does not close the gate, so retries still proceed.
+func (e *Engine) StartupReconciled() bool {
+	if e.startupReconciledReady == nil {
+		return true
+	}
+	select {
+	case <-e.startupReconciledReady:
+		return true
+	default:
+		return false
+	}
+}
+
 // AuthoritativeDiscoveryComplete reports whether a full discovery pass
 // completed without cancellation, safety abort, or provider listing failure.
 // Individual parser warnings do not make discovery incomplete.
