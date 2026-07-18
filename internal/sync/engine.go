@@ -1788,11 +1788,12 @@ func (e *Engine) resyncAllWithOptionsLocked(
 		return stats, err
 	}
 
-	// Merge user-managed data and immutable project-identity snapshots from the
-	// old DB. Snapshot copy happens after parsing because the destination rows
-	// reference freshly parsed sessions. Failure must abort the swap: a fresh
-	// database without those snapshots could no longer export stable identity
-	// after a source working directory disappears.
+	// Merge user-managed data and trustworthy immutable project-identity
+	// snapshots from the old DB. Snapshot copy happens after parsing because the
+	// destination rows reference freshly parsed sessions. Pre-source-snapshot
+	// archives retain the fresh parse results instead. Failure must abort the
+	// swap: a fresh database without valid snapshots could no longer export
+	// stable identity after a source working directory disappears.
 	reportResyncPhase(
 		PhaseCopyingMetadata,
 		"Copying user-managed session metadata",

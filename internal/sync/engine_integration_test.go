@@ -18,6 +18,7 @@ import (
 
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/dbtest"
+	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/sync"
 	"go.kenn.io/agentsview/internal/testjsonl"
@@ -1740,6 +1741,94 @@ func TestSyncEngineMappingPreservesParserProjectIdentitySnapshot(t *testing.T) {
 	assert.Equal(t, "mapped-worktree", snapshots[0].SessionID)
 	assert.Equal(t, "feature_login", snapshots[0].Project)
 	assert.Equal(t, sessionCwd, snapshots[0].RootPath)
+}
+
+func TestResyncAllUpgradeKeepsFreshProjectSnapshotAndDropsLegacyOrphan(
+	t *testing.T,
+) {
+	const (
+		legacyDataVersion = 67
+		liveSessionID     = "mapped-worktree-upgrade"
+		orphanSessionID   = "mapped-orphan-upgrade"
+		targetProject     = "canonical_app"
+		sourceProject     = "feature_login"
+	)
+	ctx := context.Background()
+	env := setupSingleAgentTestEnv(t, parser.AgentClaude)
+
+	root := t.TempDir()
+	worktreePrefix := filepath.Join(root, "my-app.worktrees")
+	sessionCwd := filepath.Join(worktreePrefix, "feature-login")
+	_, err := env.db.CreateWorktreeProjectMapping(
+		ctx,
+		db.WorktreeProjectMapping{
+			Machine: "local", PathPrefix: worktreePrefix,
+			Project: targetProject, Enabled: true,
+		},
+	)
+	require.NoError(t, err, "CreateWorktreeProjectMapping")
+
+	content := testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarly, "Upgrade mapped worktree", sessionCwd).
+		AddClaudeAssistant(tsEarlyS5, "ok").
+		String()
+	env.writeClaudeSessionForProject(
+		t, sessionCwd, liveSessionID+".jsonl", content,
+	)
+	runSyncAndAssert(t, env.engine, sync.SyncStats{
+		TotalSessions: 1,
+		Synced:        1,
+	})
+	require.NoError(t, env.db.UpsertSessionWithProjectIdentity(
+		db.Session{
+			ID: orphanSessionID, Project: targetProject,
+			Machine: "local", Agent: "claude", Cwd: "/archived/worktree",
+		},
+		export.ProjectIdentityObservation{
+			SessionID: orphanSessionID, Project: targetProject,
+			Machine: "local", RootPath: "/archived/worktree",
+		},
+		targetProject,
+	))
+
+	dbPath := env.db.Path()
+	require.NoError(t, env.db.CloseConnections(), "CloseConnections")
+	raw, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err, "open legacy archive")
+	require.Equal(t, legacyDataVersion+1, db.CurrentDataVersion())
+	_, err = raw.ExecContext(ctx, fmt.Sprintf(`
+		UPDATE session_project_identity_snapshots
+		SET project = ?
+		WHERE session_id = ?;
+		PRAGMA user_version = %d`, legacyDataVersion),
+		targetProject, liveSessionID,
+	)
+	require.NoError(t, err, "simulate legacy mapped snapshots")
+	require.NoError(t, raw.Close(), "close legacy archive")
+	require.NoError(t, env.db.Reopen(), "Reopen")
+
+	before, err := env.db.ListSessionProjectIdentitySnapshots(ctx)
+	require.NoError(t, err, "list legacy snapshots")
+	require.Len(t, before, 2)
+	for _, snapshot := range before {
+		assert.Equal(t, targetProject, snapshot.Project,
+			"fixture must represent target-labelled legacy evidence")
+	}
+
+	stats := env.engine.ResyncAll(ctx, nil)
+	require.False(t, stats.Aborted, "ResyncAll aborted: %v", stats.Warnings)
+	require.Equal(t, 1, stats.Synced)
+	require.Equal(t, 1, stats.OrphanedCopied)
+	assertSessionProject(t, env.db, liveSessionID, targetProject)
+	assertSessionProject(t, env.db, orphanSessionID, targetProject)
+
+	after, err := env.db.ListSessionProjectIdentitySnapshots(ctx)
+	require.NoError(t, err, "list upgraded snapshots")
+	require.Len(t, after, 1,
+		"unreconstructable orphan evidence must be discarded")
+	assert.Equal(t, liveSessionID, after[0].SessionID)
+	assert.Equal(t, sourceProject, after[0].Project,
+		"metadata copy must retain the freshly parsed source label")
 }
 
 func TestSyncSingleSessionAppliesWorktreeProjectMapping(t *testing.T) {

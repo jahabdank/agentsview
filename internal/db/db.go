@@ -308,12 +308,11 @@ const projectIdentityRemoteScrubCompletedKey = "project_identity_remote_scrub_v1
 // and entrypoint fields on existing Claude rows.)
 // (67: Antigravity CLI reader metadata. Re-parsing populates parent_session_id
 // and relationship_type from agyReader.parentCascadeId in trajectory sidecars.)
-// (68: Generic GitHub worktree layouts. Re-parsing corrects project names for
-// sessions whose worktree paths no longer exist on the local machine.)
-// (69: Parser-source project identity snapshots. Re-parsing replaces snapshots
-// that older mapping behavior could persist with the mapped target label before
-// incremental ingestion is allowed to reuse them.)
-const dataVersion = 69
+// (68: Generic GitHub worktree layouts and parser-source project identity
+// snapshots. Re-parsing corrects project names for affected worktree paths and
+// replaces snapshots that older mapping behavior could persist with the mapped
+// target label before incremental ingestion is allowed to reuse them.)
+const dataVersion = 68
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 

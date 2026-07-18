@@ -931,8 +931,8 @@ func TestMigration_ToolResultEventsTable(t *testing.T) {
 }
 
 func TestCurrentDataVersionProjectIdentitySourceSnapshots(t *testing.T) {
-	assert.Equal(t, 69, CurrentDataVersion(),
-		"legacy project snapshots require a source-aware full reparse")
+	assert.Equal(t, 68, CurrentDataVersion(),
+		"this branch requires one combined parser data version bump")
 }
 
 func TestInsertMessages_PreservesToolResultEvents(t *testing.T) {

@@ -2294,7 +2294,7 @@ func TestProjectIdentityLegacyMappedSnapshotReparsesBeforeIncrementalAppend(
 	t *testing.T,
 ) {
 	const (
-		legacyDataVersion = 68
+		legacyDataVersion = 67
 		sessionID         = "legacy-mapped-snapshot"
 		sourceProject     = "parser-source"
 		targetProject     = "mapped-target"
