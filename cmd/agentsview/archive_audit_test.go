@@ -4,12 +4,16 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/sync"
 )
 
@@ -90,6 +94,35 @@ func TestArchiveAuditEmitsOnDataChange(t *testing.T) {
 		assert.Equal(t, "sessions", scope)
 	default:
 		require.FailNow(t, "an audit with Synced>0 must emit the sessions scope")
+	}
+}
+
+// TestArchiveAuditEmitsOnPartialSuccess proves committed changes reach SSE
+// clients even when the pass also failed: the retry sees those rows as already
+// synchronized and would never re-emit, so the emit must not be gated on a nil
+// error. The error still propagates so the retry obligation is retained.
+func TestArchiveAuditEmitsOnPartialSuccess(t *testing.T) {
+	cfg := testConfigWithClaudeFixture(t)
+	database, lock := openTestWriteDB(t, cfg)
+	engine := sync.NewEngine(database, workerEngineConfig(cfg))
+	t.Cleanup(engine.Close)
+	em := &scopedEmitter{scopes: make(chan string, 1)}
+
+	restore := stubLaunchSyncWorker(t, func(
+		_ context.Context, _ config.Config, _ string, _ func(workerLine),
+	) (workerResult, error) {
+		return workerResult{Status: "failed", Synced: 2, Failed: 1},
+			errors.New("audit worker pass reported failed")
+	})
+	defer restore()
+
+	err := runArchiveAudit(context.Background(), cfg, engine, database, lock, em)
+	require.Error(t, err, "the partial failure must still surface for retry")
+	select {
+	case scope := <-em.scopes:
+		assert.Equal(t, "sessions", scope)
+	default:
+		require.FailNow(t, "an audit that committed sessions must emit even on failure")
 	}
 }
 
@@ -200,8 +233,8 @@ func TestArchiveAuditLoopStopsOnContextCancel(t *testing.T) {
 	assert.False(t, audited, "a cancelled context must stop the loop before auditing")
 }
 
-// TestSyncWorkerAuditModeRunsSyncPass confirms the audit worker mode shares the
-// sync body: it performs a full pass and emits an ok terminal result.
+// TestSyncWorkerAuditModeRunsSyncPass confirms the audit worker mode performs a
+// full authoritative pass over the archive and emits an ok terminal result.
 func TestSyncWorkerAuditModeRunsSyncPass(t *testing.T) {
 	cfg := testConfigWithClaudeFixture(t)
 	var out bytes.Buffer
@@ -210,4 +243,44 @@ func TestSyncWorkerAuditModeRunsSyncPass(t *testing.T) {
 	assert.Equal(t, "ok", result.Status)
 	assert.True(t, result.DiscoveryComplete)
 	assert.Equal(t, 3, result.Synced)
+}
+
+// TestSyncWorkerAuditTombstonesMissedDeletion is the audit's safety-net
+// regression: a source file deleted while no watcher was running must be
+// tombstoned by the daily audit, with the session row preserved in the
+// persistent archive.
+func TestSyncWorkerAuditTombstonesMissedDeletion(t *testing.T) {
+	cfg := testConfigWithClaudeFixture(t)
+	database, err := db.Open(cfg.DBPath)
+	require.NoError(t, err)
+	engine := sync.NewEngine(database, workerEngineConfig(cfg))
+	require.Equal(t, 3, engine.SyncAll(context.Background(), nil).Synced)
+	engine.Close()
+	require.NoError(t, database.Close())
+
+	// Delete one source with no watcher running: only the audit can notice.
+	claudeDir := cfg.AgentDirs[parser.AgentClaude][0]
+	require.NoError(t, os.Remove(
+		filepath.Join(claudeDir, "-home-proj0", "session0.jsonl"),
+	))
+
+	var out bytes.Buffer
+	require.NoError(t, runSyncWorker(cfg, "audit", &out))
+	result := decodeSingleResult(t, &out)
+	assert.Equal(t, "ok", result.Status)
+	assert.Equal(t, 1, result.Tombstoned,
+		"the audit must reconcile the deletion the watcher missed")
+
+	database, err = db.Open(cfg.DBPath)
+	require.NoError(t, err)
+	defer database.Close()
+	var live, total int
+	require.NoError(t, database.Reader().QueryRow(
+		"SELECT COUNT(*) FROM sessions WHERE deleted_at IS NULL",
+	).Scan(&live))
+	require.NoError(t, database.Reader().QueryRow(
+		"SELECT COUNT(*) FROM sessions",
+	).Scan(&total))
+	assert.Equal(t, 2, live, "the deleted source's session must be tombstoned")
+	assert.Equal(t, 3, total, "tombstoning must preserve the archived row")
 }

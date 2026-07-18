@@ -1195,6 +1195,17 @@ func providerChangedPathForceParse(
 			isOpenCodeFormatStoragePath(agent, sourcePath) {
 			return false
 		}
+		// Gemini project-metadata events fan out to every session under
+		// the root. Each session's fingerprint hashes its resolved
+		// project metadata, so the hash-aware freshness check re-parses
+		// only sessions whose resolved project changed; a forced parse
+		// would rewrite the whole archive on every metadata edit. Remove
+		// events keep the force so deletion still re-emits.
+		if eventKind != "remove" &&
+			agent == parser.AgentGemini &&
+			parser.IsGeminiProjectMetadataFile(eventPath) {
+			return false
+		}
 		return true
 	}
 	return eventKind == "remove" &&
@@ -1434,6 +1445,10 @@ const shelleyDBFile = "shelley.db"
 // form the temp database path during resync.
 const resyncTempSuffix = "-resync"
 
+// closeWriterForResyncBarrier indirects db.CloseWriter so tests can inject a
+// barrier-establishment failure.
+var closeWriterForResyncBarrier = func(d *db.DB) error { return d.CloseWriter() }
+
 // ResyncAll builds a fresh database from scratch, syncs all
 // sessions into it, copies insights from the old DB, then
 // atomically swaps the files and reopens the original DB
@@ -1588,11 +1603,22 @@ func (e *Engine) resyncAllWithOptionsLocked(
 	// double-closed or prematurely reopened.
 	ownedBarrier := false
 	if !e.db.WriterClosed() {
-		if cerr := e.db.CloseWriter(); cerr != nil {
-			log.Printf("resync: close writer for barrier: %v", cerr)
-		} else {
-			ownedBarrier = true
+		if cerr := closeWriterForResyncBarrier(e.db); cerr != nil {
+			// CloseWriter's failure posture leaves the DB writer-closed, so
+			// building on would swap against a half-established barrier
+			// while the deferred reopen (gated on ownedBarrier) never runs.
+			// Abort before building instead of continuing without a clean
+			// barrier.
+			stats.Aborted = true
+			stats.Warnings = append(stats.Warnings, fmt.Sprintf(
+				"resync aborted: close writer for barrier: %v", cerr,
+			))
+			e.setLastSyncStats(stats)
+			return stats, fmt.Errorf(
+				"resync: close writer for barrier: %w", cerr,
+			)
 		}
+		ownedBarrier = true
 	}
 	defer func() {
 		// The successful swap's Reopen already restored the writer and cleared
@@ -2674,19 +2700,49 @@ func startupReconciliationSucceeded(
 // RecordStartupReconciled acknowledges a startup pass performed out of process
 // by a sync worker. The daemon calls it after opening the archive, starting the
 // watcher in collecting mode, and running the bounded gap reconciliation, so it
-// reproduces the in-process path's completion semantics: it records the attempt
-// (unblocking the OnStartupReconciled gate), releases startup maintenance, and
-// fires the OnStartupReconciled callback that transitions the watcher out of
-// collecting mode.
+// reproduces the in-process path's completion semantics: it records last-sync
+// bookkeeping and the attempt (unblocking the OnStartupReconciled gate),
+// releases startup maintenance, fires the OnStartupReconciled callback that
+// transitions the watcher out of collecting mode, and emits the "sync" event
+// when the pass changed data.
 //
 // stats carries the worker's discovery outcome (Aborted false means discovery
 // was authoritative); err is the gap reconciliation error, nil when the gap
-// pass completed. All three underlying steps are sync.Once-guarded, so calling
+// pass completed. The reconciliation steps are sync.Once-guarded, so calling
 // this after — or concurrently with — an in-process fallback that already
-// acknowledged startup is a no-op rather than a double-release.
+// acknowledged startup is a no-op rather than a double-release; the last-sync
+// bookkeeping and emit re-run per pass by design.
 func (e *Engine) RecordStartupReconciled(stats SyncStats, err error) {
+	e.RecordStartupReconciledExclusive(stats, err)
+	e.FinishStartupReconciled(stats)
+}
+
+// RecordStartupReconciledExclusive is RecordStartupReconciled's lock-held
+// half. Callers inside RunExclusive use it so the startup-reconciliation gate
+// closes before the exclusive lock is released; a deferred fallback waiting on
+// that lock then observes the completed pass instead of launching a duplicate
+// archive-scale worker. FinishStartupReconciled completes the tail that must
+// run outside the lock.
+func (e *Engine) RecordStartupReconciledExclusive(stats SyncStats, err error) {
+	e.mu.Lock()
+	if err == nil && !stats.Aborted {
+		e.lastSync = time.Now()
+	}
+	e.lastSyncStats = stats
+	e.mu.Unlock()
 	e.recordStartupReconciled(context.Background(), stats, err)
 	e.ReleaseStartupMaintenance()
+}
+
+// FinishStartupReconciled fires the completion tail that the in-process defers
+// run after releasing syncMu: the "sync" emit for a pass that changed data,
+// then the OnStartupReconciled callback. Emitting under the exclusive lock
+// could let an Emitter widen the critical section or deadlock by re-entering
+// sync code, so this must be called after RunExclusive returns.
+func (e *Engine) FinishStartupReconciled(stats SyncStats) {
+	if stats.Synced > 0 {
+		e.emit("sync")
+	}
 	e.notifyStartupReconciled()
 }
 
@@ -2850,10 +2906,20 @@ func (e *Engine) ReconcileWatchRoots(
 	return e.reconcileWatchRoots(ctx, roots, full, false)
 }
 
+// ReconcileWatchRootsWithStats is ReconcileWatchRoots plus the pass outcome:
+// the archive-audit worker uses it so synced and tombstoned counts reach the
+// daemon through the worker protocol.
+func (e *Engine) ReconcileWatchRootsWithStats(
+	ctx context.Context, roots []string, full bool,
+) (SyncStats, int, error) {
+	return e.reconcileScopedWatchRoots(ctx, "", roots, full, false)
+}
+
 func (e *Engine) reconcileWatchRoots(
 	ctx context.Context, roots []string, full, force bool,
 ) error {
-	return e.reconcileScopedWatchRoots(ctx, "", roots, full, force)
+	_, _, err := e.reconcileScopedWatchRoots(ctx, "", roots, full, force)
+	return err
 }
 
 // ReconcileProviderRoots reconciles the given roots for a single provider. It
@@ -2867,12 +2933,13 @@ func (e *Engine) ReconcileProviderRoots(
 	if agent == "" {
 		return e.reconcileWatchRoots(ctx, roots, false, false)
 	}
-	return e.reconcileScopedWatchRoots(ctx, agent, roots, false, false)
+	_, _, err := e.reconcileScopedWatchRoots(ctx, agent, roots, false, false)
+	return err
 }
 
 func (e *Engine) reconcileScopedWatchRoots(
 	ctx context.Context, agent parser.AgentType, roots []string, full, force bool,
-) error {
+) (SyncStats, int, error) {
 	var logicalRoots []string
 	var excludedRemoteRoots int
 	if agent == "" {
@@ -2885,7 +2952,7 @@ func (e *Engine) reconcileScopedWatchRoots(
 			Complete: true,
 			Metrics:  ReconciliationMetrics{ExcludedRemoteRoots: excludedRemoteRoots},
 		})
-		return nil
+		return SyncStats{}, 0, nil
 	}
 	stats, metrics, tombstoned, err := e.reconcileWatchRootsStreamed(
 		ctx, agent, logicalRoots, full, force,
@@ -2905,7 +2972,7 @@ func (e *Engine) reconcileScopedWatchRoots(
 		ProviderFailures: stats.providerFailures,
 		Metrics:          metrics,
 	})
-	return err
+	return stats, tombstoned, err
 }
 
 // ReconcileWatchRootsAfterLostEvents is the watcher-overflow entrypoint. It is

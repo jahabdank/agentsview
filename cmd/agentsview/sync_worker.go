@@ -44,8 +44,14 @@ type workerResult struct {
 	Synced            int    `json:"synced"`
 	Skipped           int    `json:"skipped"`
 	Failed            int    `json:"failed"`
+	Tombstoned        int    `json:"tombstoned,omitempty"`
 	DiscoveryComplete bool   `json:"discoveryComplete"`
 	Error             string `json:"error,omitempty"`
+	// Stats carries the complete public SyncStats payload so the daemon's
+	// /sync and /resync responses keep result parity with in-process passes
+	// (total sessions, orphan counts, warnings, anomalies). The summary
+	// counters above remain the authoritative status inputs.
+	Stats *sync.SyncStats `json:"stats,omitempty"`
 }
 
 // newSyncWorkerCommand registers the hidden self-exec'd worker. The daemon runs
@@ -163,14 +169,36 @@ func runSyncWorkerStartup(
 		return refuseWorkerResync(mode, emit)
 	}
 
-	var stats sync.SyncStats
-	if database.NeedsResync() {
-		stats = engine.ResyncAll(ctx, onProgress)
-	} else {
-		stats = engine.SyncAll(ctx, onProgress)
+	var result workerResult
+	switch {
+	case database.NeedsResync():
+		stats := engine.ResyncAll(ctx, onProgress)
+		if stats.Aborted && ctx.Err() == nil {
+			// Mirror the in-process startup path (runInitialResync,
+			// syncThenRunLocked): a safety-aborted resync still catches up
+			// incrementally against the existing archive instead of leaving
+			// safely applicable updates unsynchronized.
+			stats = engine.SyncAll(ctx, onProgress)
+		}
+		result = workerResultFromStats(ctx, stats)
+	case mode == "audit":
+		// The audit is the safety net for watcher deletions the daemon
+		// missed, so it must run the authoritative reconciliation that
+		// tombstones sessions whose sources disappeared; SyncAll never
+		// tombstones.
+		stats, tombstoned, auditErr := engine.ReconcileWatchRootsWithStats(
+			ctx, reconcileRootPaths(cfg), true,
+		)
+		result = workerResultFromStats(ctx, stats)
+		result.Tombstoned = tombstoned
+		if auditErr != nil && result.Status == "ok" {
+			result.Status = "failed"
+			result.Error = auditErr.Error()
+		}
+	default:
+		result = workerResultFromStats(ctx, engine.SyncAll(ctx, onProgress))
 	}
 
-	result := workerResultFromStats(ctx, stats)
 	emit(workerLine{Result: &result})
 	if result.Status != "ok" || !result.DiscoveryComplete {
 		return fmt.Errorf("sync worker %s: %s", mode, result.Status)
@@ -204,15 +232,49 @@ func runSyncWorkerResyncBuild(
 	defer engine.Close()
 
 	_, stats, buildErr := engine.ResyncBuild(ctx, onProgress)
-	result := workerResultFromStats(ctx, stats)
+	result := resyncBuildResultFromStats(ctx, stats, buildErr)
 	emit(workerLine{Result: &result})
 	if result.Status != "ok" || !result.DiscoveryComplete {
+		if buildErr != nil {
+			return fmt.Errorf("sync worker %s: %w", mode, buildErr)
+		}
 		return fmt.Errorf("sync worker %s: %s", mode, result.Status)
 	}
-	if buildErr != nil {
-		return fmt.Errorf("sync worker %s: %w", mode, buildErr)
-	}
 	return nil
+}
+
+// resyncBuildResultFromStats maps a resync build outcome to a terminal result.
+// Unlike a live sync pass, a completed build tolerates a minority of permanent
+// parse failures: shouldAbortResyncSwap already folded that judgment into
+// stats.Aborted, so Failed alone must not fail the pass and make the daemon
+// discard an otherwise valid replacement of a stale-version archive.
+func resyncBuildResultFromStats(
+	ctx context.Context, stats sync.SyncStats, buildErr error,
+) workerResult {
+	statsCopy := stats
+	result := workerResult{
+		Synced:            stats.Synced,
+		Skipped:           stats.Skipped,
+		Failed:            stats.Failed,
+		DiscoveryComplete: stats.AuthoritativeDiscoveryComplete(),
+		Stats:             &statsCopy,
+	}
+	switch {
+	case ctx.Err() != nil || stats.Aborted:
+		result.Status = "aborted"
+		result.DiscoveryComplete = false
+		if ctx.Err() != nil {
+			result.Error = ctx.Err().Error()
+		}
+	case buildErr != nil || !result.DiscoveryComplete:
+		result.Status = "failed"
+		if buildErr != nil {
+			result.Error = buildErr.Error()
+		}
+	default:
+		result.Status = "ok"
+	}
+	return result
 }
 
 // refuseWorkerResync emits a failed terminal result for a live-archive worker
@@ -235,11 +297,13 @@ func refuseWorkerResync(mode string, emit func(workerLine)) error {
 func workerResultFromStats(
 	ctx context.Context, stats sync.SyncStats,
 ) workerResult {
+	statsCopy := stats
 	result := workerResult{
 		Synced:            stats.Synced,
 		Skipped:           stats.Skipped,
 		Failed:            stats.Failed,
 		DiscoveryComplete: stats.AuthoritativeDiscoveryComplete(),
+		Stats:             &statsCopy,
 	}
 	switch {
 	case ctx.Err() != nil || stats.Aborted:

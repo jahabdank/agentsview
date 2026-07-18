@@ -93,6 +93,10 @@ func TestSyncWorkerStartupModeSyncsAndEmitsTerminalResult(t *testing.T) {
 	assert.Equal(t, "ok", results[0].Status)
 	assert.True(t, results[0].DiscoveryComplete)
 	assert.Equal(t, 3, results[0].Synced)
+	require.NotNil(t, results[0].Stats,
+		"the terminal result must carry the full SyncStats payload")
+	assert.Equal(t, 3, results[0].Stats.TotalSessions,
+		"public SyncStats fields must survive the NDJSON protocol")
 }
 
 func TestSyncWorkerReportsAbortAsFailure(t *testing.T) {
@@ -217,6 +221,103 @@ func TestSyncWorkerNonZeroWhenTerminalResultWriteFails(t *testing.T) {
 	require.Error(t, err, "a dropped terminal result must fail the worker")
 	assert.True(t, w.attempted, "the terminal result write was attempted")
 	assert.ErrorContains(t, err, "terminal result")
+}
+
+// TestSyncWorkerStartupAbortedResyncFallsBackIncremental mirrors the
+// in-process startup path: when the required resync safety-aborts (here: all
+// sources vanished while the old archive has data), the worker must follow up
+// with an incremental sync instead of reporting a bare abort, and the original
+// archive must be preserved.
+func TestSyncWorkerStartupAbortedResyncFallsBackIncremental(t *testing.T) {
+	cfg := testConfigWithClaudeFixture(t)
+	database, err := db.Open(cfg.DBPath)
+	require.NoError(t, err)
+	engine := sync.NewEngine(database, workerEngineConfig(cfg))
+	require.Equal(t, 3, engine.SyncAll(context.Background(), nil).Synced)
+	engine.Close()
+	require.NoError(t, database.Close())
+	markArchiveStale(t, cfg.DBPath)
+
+	// Empty discovery against an archive with data safety-aborts the resync.
+	claudeDir := cfg.AgentDirs[parser.AgentClaude][0]
+	entries, err := os.ReadDir(claudeDir)
+	require.NoError(t, err)
+	for _, entry := range entries {
+		require.NoError(t, os.RemoveAll(filepath.Join(claudeDir, entry.Name())))
+	}
+
+	var out bytes.Buffer
+	require.NoError(t, runSyncWorker(cfg, "startup", &out),
+		"the incremental fallback must complete the pass")
+	result := decodeSingleResult(t, &out)
+	assert.Equal(t, "ok", result.Status,
+		"a safety-aborted resync must fall back to the incremental sync")
+	assert.True(t, result.DiscoveryComplete)
+
+	database, err = db.Open(cfg.DBPath)
+	require.NoError(t, err)
+	defer database.Close()
+	var total int
+	require.NoError(t, database.Reader().QueryRow(
+		"SELECT COUNT(*) FROM sessions",
+	).Scan(&total))
+	assert.Equal(t, 3, total, "the aborted resync must leave the archive intact")
+}
+
+// TestResyncBuildResultFromStatsToleratesMinorityParseFailures pins the
+// resync-build completion semantics: shouldAbortResyncSwap already folds the
+// failure-majority judgment into stats.Aborted, so a completed build with a
+// minority of permanent parse failures is a valid replacement the daemon must
+// not discard.
+func TestResyncBuildResultFromStatsToleratesMinorityParseFailures(t *testing.T) {
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	tests := []struct {
+		name       string
+		ctx        context.Context
+		stats      sync.SyncStats
+		buildErr   error
+		wantStatus string
+	}{
+		{
+			name:       "minority parse failures still ok",
+			ctx:        context.Background(),
+			stats:      sync.SyncStats{Synced: 10, Failed: 2},
+			wantStatus: "ok",
+		},
+		{
+			name:       "safety abort",
+			ctx:        context.Background(),
+			stats:      sync.SyncStats{Aborted: true},
+			wantStatus: "aborted",
+		},
+		{
+			name:       "build error",
+			ctx:        context.Background(),
+			stats:      sync.SyncStats{Synced: 10},
+			buildErr:   errors.New("build boom"),
+			wantStatus: "failed",
+		},
+		{
+			name:       "cancelled context",
+			ctx:        cancelled,
+			stats:      sync.SyncStats{Synced: 10},
+			wantStatus: "aborted",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := resyncBuildResultFromStats(tt.ctx, tt.stats, tt.buildErr)
+			assert.Equal(t, tt.wantStatus, result.Status)
+			if tt.wantStatus == "ok" {
+				assert.True(t, result.DiscoveryComplete)
+				require.NotNil(t, result.Stats)
+				assert.Equal(t, tt.stats.Synced, result.Stats.Synced)
+			} else {
+				assert.NotEqual(t, "ok", result.Status)
+			}
+		})
+	}
 }
 
 func TestSyncWorkerSyncModeSyncsLikeStartup(t *testing.T) {

@@ -1540,8 +1540,8 @@ func TestWatchPollingObligationsKeepPendingAndPersistentReasonsIndependent(t *te
 	)
 
 	assert.Equal(t, []agentsync.PollingObligation{
-		{Key: pendingPath, Roots: []string{shared}},
-		{Key: "persistent:" + shared, Roots: []string{shared}},
+		{Key: pendingPath, Roots: []string{shared}, Probe: pendingPath},
+		{Key: "persistent:" + shared, Roots: []string{shared}, Probe: shared},
 	}, got)
 }
 
@@ -1560,7 +1560,7 @@ func TestWatchPollingObligationsCoverRegistrationFailureByLogicalRoot(t *testing
 	)
 
 	assert.Equal(t, []agentsync.PollingObligation{{
-		Key: watchPath, Roots: []string{syncDir},
+		Key: watchPath, Roots: []string{syncDir}, Probe: watchPath,
 	}}, got)
 }
 

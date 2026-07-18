@@ -659,9 +659,12 @@ func TestPeriodicReconcileCapability(t *testing.T) {
 	}
 	// Shallow-watched providers rely on scheduled reconciliation because
 	// subdirectory changes are invisible to their shallow watch coverage.
-	assert.True(t, optedIn[AgentCowork])
 	assert.True(t, optedIn[AgentOpenHands])
 	assert.True(t, optedIn[AgentAider])
+	// Cowork's provider WatchPlan registers its root recursively
+	// (coworkWatchRoots Recursive:true overrides legacy ShallowWatch), so
+	// scheduled reconciliation would redundantly rescan the whole archive.
+	assert.False(t, optedIn[AgentCowork])
 	// Recursive session roots must NOT opt in: their shallow roots are
 	// supplemental (codex_provider.go WatchPlan registers Recursive:true),
 	// so scheduled reconciliation would rescan the whole session tree.

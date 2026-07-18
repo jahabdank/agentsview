@@ -541,6 +541,16 @@ func (s geminiSourceSet) sourceRefForPathWithProjectMap(
 // the project map once per root and tests can observe how often it runs.
 var buildGeminiProjectMap = BuildGeminiProjectMap
 
+// IsGeminiProjectMetadataFile reports whether path names one of the
+// root-level Gemini project-metadata files whose changes fan out to every
+// session under the root. The Gemini watch plan only emits these names from
+// the non-recursive root watch, so a basename check is sufficient for
+// callers without the root at hand.
+func IsGeminiProjectMetadataFile(path string) bool {
+	base := filepath.Base(path)
+	return base == "projects.json" || base == "trustedFolders.json"
+}
+
 func geminiProjectMetadataPath(root, path string) bool {
 	root = filepath.Clean(root)
 	path = filepath.Clean(path)

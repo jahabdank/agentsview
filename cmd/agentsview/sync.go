@@ -20,6 +20,7 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/remotesync"
+	"go.kenn.io/agentsview/internal/server"
 	"go.kenn.io/agentsview/internal/ssh"
 	"go.kenn.io/agentsview/internal/sync"
 )
@@ -130,6 +131,22 @@ func doSync(cfg SyncConfig) (hadRemoteFailures bool) {
 					onProgress,
 				)
 				if progress != nil {
+					progress.Finish()
+				}
+				if errors.Is(err, errDaemonResyncRequired) {
+					// The archive's data version changed and the
+					// worker-backed daemon refuses to swap it under itself
+					// via /sync; the dedicated resync route rebuilds and
+					// swaps safely, preserving the previously automatic
+					// upgrade behavior.
+					fmt.Println(
+						"Archive data version changed; running full resync via daemon...",
+					)
+					progress = newResyncProgressPrinter(os.Stdout, time.Now)
+					stats, err = runDaemonSync(
+						context.Background(), tr, appCfg.AuthToken, true,
+						progress.Print,
+					)
 					progress.Finish()
 				}
 				if err != nil {
@@ -907,6 +924,11 @@ func printDirectSyncResult(
 	}
 }
 
+// errDaemonResyncRequired marks a /sync rejected because the archive's data
+// version changed: the worker-backed daemon will not swap a stale archive
+// under itself, so the CLI must retry through /api/v1/resync.
+var errDaemonResyncRequired = errors.New("daemon requires a full resync")
+
 func runDaemonSync(
 	ctx context.Context,
 	tr transport,
@@ -936,9 +958,15 @@ func runDaemonSync(
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(resp.Body)
-		return sync.SyncStats{}, fmt.Errorf(
+		httpErr := fmt.Errorf(
 			"HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)),
 		)
+		if !full && resp.Header.Get(server.ResyncRequiredHeader) != "" {
+			return sync.SyncStats{}, fmt.Errorf(
+				"%w: %w", errDaemonResyncRequired, httpErr,
+			)
+		}
+		return sync.SyncStats{}, httpErr
 	}
 	if strings.HasPrefix(
 		resp.Header.Get("Content-Type"), "application/json",

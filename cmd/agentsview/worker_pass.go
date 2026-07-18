@@ -44,10 +44,9 @@ var errWorkerSpawn = errors.New("sync worker spawn failed")
 var launchSyncWorker = launchSyncWorkerProcess
 
 // runWorkerWritePass yields write ownership around a worker run against the live
-// archive: it closes the writer (readers keep serving), releases the write
-// lock, runs the worker, then unconditionally reacquires the lock and reopens
-// the writer. Losing write ownership permanently is worse than a failed pass,
-// so reacquisition and reopen run even when the worker fails.
+// archive under the engine's exclusive sync lock. It performs no sync
+// bookkeeping; foreground and deferred-startup sync passes use
+// runWorkerSyncPass instead so completion is recorded with SyncThenRun parity.
 func runWorkerWritePass(
 	ctx context.Context,
 	cfg config.Config,
@@ -59,28 +58,98 @@ func runWorkerWritePass(
 ) (workerResult, error) {
 	var result workerResult
 	err := engine.RunExclusive(func() error {
-		if err := database.CloseWriter(); err != nil {
-			return fmt.Errorf("close writer for %s pass: %w", mode, err)
-		}
-		if err := lock.Release(); err != nil {
-			// The writer is still closed; restore it so the daemon keeps
-			// writing rather than stranding the archive read-only.
-			_ = database.ReopenWriter()
-			return fmt.Errorf("release write lock for %s pass: %w", mode, err)
-		}
-
 		var workerErr error
-		result, workerErr = launchSyncWorker(ctx, cfg, mode, onLine)
-
-		if err := reacquireWriteOwnerLock(ctx, lock, mode); err != nil {
-			return err
-		}
-		if err := database.ReopenWriter(); err != nil {
-			return fmt.Errorf("reopen writer after %s pass: %w", mode, err)
-		}
+		result, workerErr = workerWritePassLocked(
+			ctx, cfg, database, lock, mode, onLine,
+		)
 		return workerErr
 	})
 	return result, err
+}
+
+// runWorkerSyncPass runs a "sync"-mode worker pass with SyncThenRun-equivalent
+// completion semantics. When skipIfReconciled is set, the startup gate is
+// rechecked while the exclusive lock is held — a foreground pass may have
+// reconciled startup while this caller waited on the lock, and only a
+// lock-held recheck closes that race. A worker that actually ran (spawn
+// succeeded) records reconciliation and last-sync bookkeeping before the lock
+// is released; the emit and startup callback fire after it, mirroring the
+// in-process defer ordering. A spawn failure records nothing so the caller's
+// in-process fallback keeps first-attempt semantics.
+func runWorkerSyncPass(
+	ctx context.Context,
+	cfg config.Config,
+	engine *sync.Engine,
+	database *db.DB,
+	lock *writeOwnerLock,
+	skipIfReconciled bool,
+	onLine func(workerLine),
+) (stats sync.SyncStats, ran bool, err error) {
+	recorded := false
+	err = engine.RunExclusive(func() error {
+		if skipIfReconciled && engine.StartupReconciled() {
+			return nil
+		}
+		ran = true
+		result, workerErr := workerWritePassLocked(
+			ctx, cfg, database, lock, "sync", onLine,
+		)
+		if errors.Is(workerErr, errWorkerSpawn) {
+			return workerErr
+		}
+		stats = statsFromWorkerResult(result)
+		engine.RecordStartupReconciledExclusive(stats, workerErr)
+		recorded = true
+		return workerErr
+	})
+	if recorded {
+		engine.FinishStartupReconciled(stats)
+	}
+	return stats, ran, err
+}
+
+// workerWritePassLocked is the writer-handoff body: it closes the writer
+// (readers keep serving), releases the write lock, runs the worker, then
+// unconditionally reacquires the lock and reopens the writer. Losing write
+// ownership permanently is worse than a failed pass, so reacquisition and
+// reopen run even when the worker fails. The caller holds the engine's
+// exclusive sync lock.
+func workerWritePassLocked(
+	ctx context.Context,
+	cfg config.Config,
+	database *db.DB,
+	lock *writeOwnerLock,
+	mode string,
+	onLine func(workerLine),
+) (workerResult, error) {
+	if err := database.CloseWriter(); err != nil {
+		return workerResult{}, fmt.Errorf("close writer for %s pass: %w", mode, err)
+	}
+	if err := lock.Release(); err != nil {
+		// The writer is still closed; restore it so the daemon keeps
+		// writing rather than stranding the archive read-only.
+		_ = database.ReopenWriter()
+		return workerResult{}, fmt.Errorf(
+			"release write lock for %s pass: %w", mode, err,
+		)
+	}
+
+	result, workerErr := launchSyncWorker(ctx, cfg, mode, onLine)
+
+	// Lock recovery must not die with the caller's context: foreground
+	// syncs pass the HTTP request context, and a client disconnect
+	// during contention would otherwise exit the retry loop with the
+	// writer closed and the lock unreacquired until restart. Recovery
+	// runs on a non-cancellable context; only process exit stops it.
+	if err := reacquireWriteOwnerLock(
+		context.WithoutCancel(ctx), lock, mode,
+	); err != nil {
+		return result, err
+	}
+	if err := database.ReopenWriter(); err != nil {
+		return result, fmt.Errorf("reopen writer after %s pass: %w", mode, err)
+	}
+	return result, workerErr
 }
 
 // reacquireWriteOwnerLock retakes the write-owner lock after a worker pass,

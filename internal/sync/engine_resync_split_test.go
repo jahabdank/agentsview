@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -96,6 +97,32 @@ func TestSwapWindowRejectsDirectWrites(t *testing.T) {
 	ok, err := database.StarSession("keep0")
 	require.NoError(t, err)
 	assert.True(t, ok)
+}
+
+// TestResyncAbortsWhenBarrierCannotBeEstablished pins the CloseWriter failure
+// posture: a resync that cannot establish a clean write barrier must abort
+// before building instead of proceeding toward an unsafe swap, and the original
+// archive must be left untouched.
+func TestResyncAbortsWhenBarrierCannotBeEstablished(t *testing.T) {
+	e, database, _ := newResyncSplitEngine(t)
+
+	prev := closeWriterForResyncBarrier
+	closeWriterForResyncBarrier = func(*db.DB) error {
+		return errors.New("barrier boom")
+	}
+	defer func() { closeWriterForResyncBarrier = prev }()
+
+	stats := e.ResyncAll(context.Background(), nil)
+	assert.True(t, stats.Aborted, "resync must abort without a clean barrier")
+	require.NotEmpty(t, stats.Warnings)
+	assert.Contains(t, stats.Warnings[0], "close writer for barrier")
+	assert.Zero(t, stats.Synced, "no build may run without the barrier")
+
+	page, err := database.ListSessions(context.Background(), db.SessionFilter{})
+	require.NoError(t, err)
+	assert.Len(t, page.Sessions, 3, "original archive must be untouched")
+	assert.NoFileExists(t, e.ResyncTempPath(),
+		"no replacement build may be left behind")
 }
 
 // TestInProcessResyncRejectsConcurrentDirectWrite is the regression for the

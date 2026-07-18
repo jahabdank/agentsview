@@ -1012,7 +1012,7 @@ func (b *darwinWatchBackend) installRootPollingLocked(
 	roots := appendWatchScopeRoots(nil, state.plan.Scopes)
 	if b.onPollingRequired != nil {
 		return b.onPollingRequired(PollingObligation{
-			Key: state.plan.Path, Roots: roots,
+			Key: state.plan.Path, Roots: roots, Probe: state.plan.Path,
 		})
 	}
 	if b.onCoverageDegraded != nil {

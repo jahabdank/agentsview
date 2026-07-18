@@ -498,7 +498,7 @@ func (b *fsnotifyBackend) requireRuntimePolling(roots []string) {
 			continue
 		}
 		if err := required(PollingObligation{
-			Key: "fsnotify-runtime:" + root, Roots: scopes,
+			Key: "fsnotify-runtime:" + root, Roots: scopes, Probe: root,
 		}); err != nil {
 			b.reportError(fmt.Errorf(
 				"transfer fsnotify coverage for %s to polling: %w", root, err,

@@ -234,6 +234,12 @@ func (s *Server) humaPGPush(
 	if err != nil {
 		return nil, err
 	}
+	// Reject before the stream body flushes a 200: SSE clients (the daemon
+	// CLI always negotiates SSE) must see the 503 + Retry-After, not a
+	// generic error event.
+	if local.WriterClosed() {
+		return nil, writerClosedError()
+	}
 	pgCfg, err := s.pgPushConfig(in.Body)
 	if err != nil {
 		return nil, apiError(http.StatusBadRequest, err.Error())
@@ -303,6 +309,11 @@ func (s *Server) humaDuckDBPush(
 	local, err := s.localPushTarget()
 	if err != nil {
 		return nil, err
+	}
+	// Reject before the stream body flushes a 200 so SSE clients see the
+	// 503 + Retry-After (mirrors humaPGPush).
+	if local.WriterClosed() {
+		return nil, writerClosedError()
 	}
 	duckCfg, err := s.duckDBPushConfig(in.Body)
 	if err != nil {

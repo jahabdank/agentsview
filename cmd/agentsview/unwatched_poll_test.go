@@ -197,6 +197,46 @@ func TestUnwatchedPollSkipsAbsentObligatedRootUntilItReturns(t *testing.T) {
 		"the polling obligation must remain active for a returning root")
 }
 
+// TestUnwatchedPollDefersScopesWhileProbePathMissing is the nested-root
+// regression (Gemini's <root>/tmp): the obligation's reconciliation scope is
+// the configured <root>, but its physical watcher path is <root>/tmp. While
+// the physical path is missing, polling must defer the scope entirely instead
+// of authoritatively reconciling the still-present <root>, which would
+// tombstone every session under the vanished subtree.
+func TestUnwatchedPollDefersScopesWhileProbePathMissing(t *testing.T) {
+	configured := t.TempDir()
+	physical := filepath.Join(configured, "tmp")
+	require.NoError(t, os.Mkdir(physical, 0o755))
+
+	syncer := &recordingUnwatchedPollSyncer{wake: make(chan struct{}, 3)}
+	coordinator := newUnwatchedPollCoordinatorWithTicks(
+		t.Context(), syncer, make(chan time.Time), func() {},
+		func(run func()) { run() }, nil,
+	)
+	t.Cleanup(coordinator.Stop)
+	require.NoError(t, coordinator.AddObligation(pollingObligation{
+		Key: physical, Roots: []string{configured}, Probe: physical,
+	}))
+
+	coordinator.Wake()
+	requirePollWithin(t, syncer.wake, time.Second)
+	assert.Equal(t, [][]string{{configured}}, syncer.snapshot(),
+		"an available probe reconciles the configured scope")
+
+	require.NoError(t, os.RemoveAll(physical))
+	coordinator.Wake()
+	assert.Never(t, func() bool { return len(syncer.snapshot()) > 1 },
+		100*time.Millisecond, 10*time.Millisecond,
+		"a missing physical watcher path must defer its reconciliation "+
+			"scopes even though the configured root still exists")
+
+	require.NoError(t, os.Mkdir(physical, 0o755))
+	coordinator.Wake()
+	requirePollWithin(t, syncer.wake, time.Second)
+	assert.Equal(t, [][]string{{configured}, {configured}}, syncer.snapshot(),
+		"the deferred scope must resume once the physical path returns")
+}
+
 func TestUnwatchedPollObligationUpdatesRemainResponsiveDuringReconciliation(
 	t *testing.T,
 ) {

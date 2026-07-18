@@ -36,6 +36,14 @@ type unwatchedPollAdd struct {
 type pollingObligation struct {
 	Key   string
 	Roots []string
+	// Probe mirrors sync.PollingObligation.Probe: the physical watcher path
+	// whose availability gates this obligation's reconciliation Roots. When
+	// it is missing, the roots are deferred rather than reconciled
+	// authoritatively — a nested physical root (Gemini's <root>/tmp) can
+	// vanish while its configured scope <root> still exists, and reconciling
+	// the scope then would tombstone every session under the missing
+	// subtree. Empty means the Roots themselves are probed.
+	Probe string
 }
 
 type sharedUnwatchedPollCoordinator struct {
@@ -53,11 +61,13 @@ type sharedUnwatchedPollCoordinator struct {
 	pollWake chan struct{}
 	pollDone chan struct{}
 	pollMu   sync.Mutex
-	// pollRoots is the latest complete snapshot owned by the coordinator loop.
-	pollRoots []string
-	stop      chan struct{}
-	done      chan struct{}
-	stopOnce  sync.Once
+	// pollObligations is the latest complete snapshot owned by the
+	// coordinator loop; each entry keeps its probe so availability is
+	// evaluated per obligation at poll time.
+	pollObligations []pollingObligation
+	stop            chan struct{}
+	done            chan struct{}
+	stopOnce        sync.Once
 }
 
 func newUnwatchedPollCoordinator(
@@ -126,7 +136,9 @@ func (c *sharedUnwatchedPollCoordinator) updateRoots(
 ) error {
 	request := unwatchedPollAdd{
 		obligation: pollingObligation{
-			Key: obligation.Key, Roots: append([]string(nil), obligation.Roots...),
+			Key:   obligation.Key,
+			Roots: append([]string(nil), obligation.Roots...),
+			Probe: obligation.Probe,
 		},
 		remove: remove,
 		done:   make(chan struct{}),
@@ -162,7 +174,7 @@ func (c *sharedUnwatchedPollCoordinator) run() {
 	defer c.stopTicker()
 	go c.runPollWorker()
 	defer func() { <-c.pollDone }()
-	obligations := make(map[string][]string)
+	obligations := make(map[string]pollingObligation)
 	for {
 		select {
 		case <-c.ctx.Done():
@@ -173,14 +185,11 @@ func (c *sharedUnwatchedPollCoordinator) run() {
 			if request.remove {
 				delete(obligations, request.obligation.Key)
 			} else {
-				obligations[request.obligation.Key] = append(
-					[]string(nil), request.obligation.Roots...,
-				)
+				obligations[request.obligation.Key] = request.obligation
 			}
-			roots := unwatchedPollObligationRoots(obligations)
-			c.setPollRoots(roots)
+			c.setPollObligations(obligations)
 			if c.onRootsOwned != nil {
-				c.onRootsOwned(roots)
+				c.onRootsOwned(unwatchedPollObligationRoots(obligations))
 			}
 			close(request.done)
 		case <-c.ticks:
@@ -189,16 +198,25 @@ func (c *sharedUnwatchedPollCoordinator) run() {
 	}
 }
 
-func (c *sharedUnwatchedPollCoordinator) setPollRoots(roots []string) {
+func (c *sharedUnwatchedPollCoordinator) setPollObligations(
+	obligations map[string]pollingObligation,
+) {
+	snapshot := make([]pollingObligation, 0, len(obligations))
+	for _, obligation := range obligations {
+		snapshot = append(snapshot, obligation)
+	}
+	slices.SortFunc(snapshot, func(a, b pollingObligation) int {
+		return strings.Compare(a.Key, b.Key)
+	})
 	c.pollMu.Lock()
-	c.pollRoots = append(c.pollRoots[:0], roots...)
+	c.pollObligations = snapshot
 	c.pollMu.Unlock()
 }
 
-func (c *sharedUnwatchedPollCoordinator) currentPollRoots() []string {
+func (c *sharedUnwatchedPollCoordinator) currentPollObligations() []pollingObligation {
 	c.pollMu.Lock()
 	defer c.pollMu.Unlock()
-	return append([]string(nil), c.pollRoots...)
+	return append([]pollingObligation(nil), c.pollObligations...)
 }
 
 func (c *sharedUnwatchedPollCoordinator) requestPoll() {
@@ -223,7 +241,7 @@ func (c *sharedUnwatchedPollCoordinator) runPollWorker() {
 			if c.workerCtx.Err() != nil {
 				return
 			}
-			roots := availableUnwatchedPollRoots(c.currentPollRoots())
+			roots := availableUnwatchedPollRoots(c.currentPollObligations())
 			if len(roots) == 0 {
 				continue
 			}
@@ -238,20 +256,35 @@ func (c *sharedUnwatchedPollCoordinator) runPollWorker() {
 	}
 }
 
-func availableUnwatchedPollRoots(roots []string) []string {
-	available := make([]string, 0, len(roots))
-	for _, root := range roots {
-		if _, err := os.Stat(root); err == nil {
-			available = append(available, root)
+// availableUnwatchedPollRoots selects the reconciliation roots whose
+// obligation is currently pollable. An obligation with a probe path is gated
+// on that physical path: while it is missing, its roots are deferred entirely
+// rather than authoritatively reconciled, because the configured scope can
+// still exist while the physical subtree holding every session is gone.
+func availableUnwatchedPollRoots(obligations []pollingObligation) []string {
+	owned := make(map[string]struct{})
+	for _, obligation := range obligations {
+		if obligation.Probe != "" {
+			if _, err := os.Stat(obligation.Probe); err != nil {
+				continue
+			}
+		}
+		for _, root := range obligation.Roots {
+			if root == "" {
+				continue
+			}
+			if _, err := os.Stat(root); err == nil {
+				owned[root] = struct{}{}
+			}
 		}
 	}
-	return available
+	return unwatchedPollRoots(owned)
 }
 
-func unwatchedPollObligationRoots(obligations map[string][]string) []string {
+func unwatchedPollObligationRoots(obligations map[string]pollingObligation) []string {
 	owned := make(map[string]struct{})
-	for _, roots := range obligations {
-		for _, root := range roots {
+	for _, obligation := range obligations {
+		for _, root := range obligation.Roots {
 			if root != "" {
 				owned[root] = struct{}{}
 			}

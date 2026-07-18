@@ -15,21 +15,24 @@ import (
 
 func TestScheduledReconcileTargetsSelectsOnlyOptedInProviders(t *testing.T) {
 	home := t.TempDir()
+	aiderDir := filepath.Join(home, "aider")
 	coworkDir := filepath.Join(home, "cowork")
 	claudeDir := filepath.Join(home, "claude")
+	require.NoError(t, os.MkdirAll(aiderDir, 0o755))
 	require.NoError(t, os.MkdirAll(coworkDir, 0o755))
 	require.NoError(t, os.MkdirAll(claudeDir, 0o755))
 
 	cfg := config.Config{
 		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentAider:  {aiderDir},
 			parser.AgentCowork: {coworkDir},
 			parser.AgentClaude: {claudeDir},
 		},
 	}
 	targets := scheduledReconcileTargets(cfg)
 	require.Len(t, targets, 1, "only the opted-in provider is scheduled")
-	assert.Equal(t, parser.AgentCowork, targets[0].Agent)
-	assert.Equal(t, []string{coworkDir}, targets[0].Roots)
+	assert.Equal(t, parser.AgentAider, targets[0].Agent)
+	assert.Equal(t, []string{aiderDir}, targets[0].Roots)
 }
 
 type fakeScheduledEngine struct {

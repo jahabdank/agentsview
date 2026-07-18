@@ -72,6 +72,14 @@ type WatchCallback func(context.Context, WatchBatch) error
 type PollingObligation struct {
 	Key   string
 	Roots []string
+	// Probe is the physical watcher path whose availability gates this
+	// obligation's reconciliation Roots. For nested provider roots (e.g.
+	// Gemini's <root>/tmp) the physical path differs from the configured
+	// reconciliation scope; probing the scope instead would let polling
+	// authoritatively reconcile a present <root> while the missing physical
+	// subtree holds every session, tombstoning all of them. Empty means the
+	// Roots themselves are the physical paths to probe.
+	Probe string
 }
 
 // WatcherOptions configures runtime ownership handoffs that are not needed by

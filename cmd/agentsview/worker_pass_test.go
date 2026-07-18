@@ -137,6 +137,162 @@ func TestRunWorkerWritePassRetriesReacquireUntilLockFree(t *testing.T) {
 	assert.NoError(t, writeOneSession(database), "writer reopened after recovery")
 }
 
+// TestRunWorkerSyncPassRecordsSyncBookkeeping pins SyncThenRun parity for the
+// worker-backed foreground sync: the full SyncStats payload reaches the
+// caller, last-sync state feeds /sync/status, startup is reconciled, and the
+// "sync" event is emitted for subscribers.
+func TestRunWorkerSyncPassRecordsSyncBookkeeping(t *testing.T) {
+	cfg := testConfigWithClaudeFixture(t)
+	database, lock := openTestWriteDB(t, cfg)
+	em := &scopedEmitter{scopes: make(chan string, 4)}
+	engine := sync.NewEngine(database, sync.EngineConfig{Emitter: em})
+	defer engine.Close()
+
+	workerStats := sync.SyncStats{
+		TotalSessions:  5,
+		Synced:         3,
+		OrphanedCopied: 2,
+		Warnings:       []string{"one warning"},
+	}
+	restore := stubLaunchSyncWorker(t, func(
+		_ context.Context, _ config.Config, mode string, _ func(workerLine),
+	) (workerResult, error) {
+		assert.Equal(t, "sync", mode)
+		return workerResult{
+			Status: "ok", Synced: 3, DiscoveryComplete: true,
+			Stats: &workerStats,
+		}, nil
+	})
+	defer restore()
+
+	stats, ran, err := runWorkerSyncPass(
+		context.Background(), cfg, engine, database, lock, false, nil,
+	)
+	require.NoError(t, err)
+	assert.True(t, ran)
+	assert.Equal(t, 5, stats.TotalSessions,
+		"the full SyncStats payload must survive the worker protocol")
+	assert.Equal(t, 2, stats.OrphanedCopied)
+	assert.Equal(t, []string{"one warning"}, stats.Warnings)
+	assert.False(t, engine.LastSync().IsZero(),
+		"last-sync state must reflect the worker-backed pass")
+	assert.Equal(t, stats, engine.LastSyncStats())
+	assert.True(t, engine.StartupReconciled())
+	select {
+	case scope := <-em.scopes:
+		assert.Equal(t, "sync", scope)
+	default:
+		require.FailNow(t, "a worker-backed sync with changes must emit the sync event")
+	}
+}
+
+// TestRunWorkerSyncPassLockHeldRecheckSkipsDuplicate is the regression for the
+// deferred-startup race: the timer fires while a foreground worker pass is
+// still running, so the pre-lock StartupReconciled check reads false. The
+// foreground pass records reconciliation before releasing the exclusive lock,
+// and the deferred pass rechecks the gate while holding it, so exactly one
+// archive-scale worker runs.
+func TestRunWorkerSyncPassLockHeldRecheckSkipsDuplicate(t *testing.T) {
+	cfg := testConfigWithClaudeFixture(t)
+	database, lock := openTestWriteDB(t, cfg)
+	engine := sync.NewEngine(database, sync.EngineConfig{})
+	defer engine.Close()
+
+	launches := make(chan struct{}, 2)
+	release := make(chan struct{})
+	restore := stubLaunchSyncWorker(t, func(
+		_ context.Context, _ config.Config, _ string, _ func(workerLine),
+	) (workerResult, error) {
+		launches <- struct{}{}
+		<-release
+		return workerResult{Status: "ok", Synced: 1, DiscoveryComplete: true}, nil
+	})
+	defer restore()
+
+	require.False(t, engine.StartupReconciled(),
+		"the deferred fallback's pre-lock gate must read false mid-race")
+
+	type passOutcome struct {
+		ran bool
+		err error
+	}
+	foreground := make(chan passOutcome, 1)
+	go func() {
+		_, ran, err := runWorkerSyncPass(
+			context.Background(), cfg, engine, database, lock, false, nil,
+		)
+		foreground <- passOutcome{ran: ran, err: err}
+	}()
+	<-launches // the foreground worker is running and holds the exclusive lock
+
+	deferred := make(chan passOutcome, 1)
+	go func() {
+		_, ran, err := runWorkerSyncPass(
+			context.Background(), cfg, engine, database, lock, true, nil,
+		)
+		deferred <- passOutcome{ran: ran, err: err}
+	}()
+	// Let the deferred pass reach the exclusive lock before the foreground
+	// worker finishes, then release the worker.
+	time.Sleep(100 * time.Millisecond)
+	close(release)
+
+	fg := <-foreground
+	require.NoError(t, fg.err)
+	assert.True(t, fg.ran)
+	df := <-deferred
+	require.NoError(t, df.err)
+	assert.False(t, df.ran,
+		"the deferred pass must skip after the foreground pass reconciled startup")
+	assert.Len(t, launches, 0,
+		"exactly one archive-scale worker may launch across the race")
+	assert.True(t, lock.Held(), "flock restored after both passes")
+	assert.NoError(t, writeOneSession(database), "writer restored after both passes")
+}
+
+func TestRunWorkerWritePassRecoversLockAfterRequestCancel(t *testing.T) {
+	cfg := testConfigWithClaudeFixture(t)
+	database, lock := openTestWriteDB(t, cfg)
+	engine := sync.NewEngine(database, sync.EngineConfig{})
+	defer engine.Close()
+
+	prevInitial, prevMax := reacquireBackoffInitial, reacquireBackoffMax
+	reacquireBackoffInitial = 5 * time.Millisecond
+	reacquireBackoffMax = 20 * time.Millisecond
+	defer func() {
+		reacquireBackoffInitial, reacquireBackoffMax = prevInitial, prevMax
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	closeErr := make(chan error, 1)
+	restore := stubLaunchSyncWorker(t, func(
+		_ context.Context, _ config.Config, _ string, _ func(workerLine),
+	) (workerResult, error) {
+		// The client disconnects mid-pass while a contender briefly holds the
+		// freed lock: recovery must still reacquire and reopen the writer.
+		contender, err := tryAcquireWriteOwnerLock(cfg.DataDir)
+		require.NoError(t, err, "contender takes the freed lock")
+		cancel()
+		go func() {
+			time.Sleep(40 * time.Millisecond)
+			closeErr <- contender.Close()
+		}()
+		return workerResult{Status: "ok", DiscoveryComplete: true}, nil
+	})
+	defer restore()
+
+	result, err := runWorkerWritePass(
+		ctx, cfg, engine, database, lock, "sync", nil,
+	)
+	require.NoError(t, err,
+		"recovery must survive request cancellation during contention")
+	require.NoError(t, <-closeErr, "contender released the lock cleanly")
+	assert.Equal(t, "ok", result.Status)
+	assert.True(t, lock.Held(), "flock reacquired despite cancelled request")
+	assert.NoError(t, writeOneSession(database),
+		"writer reopened despite cancelled request")
+}
+
 func TestReacquireWriteOwnerLockStopsOnContextCancel(t *testing.T) {
 	cfg := testConfigWithClaudeFixture(t)
 	_, lock := openTestWriteDB(t, cfg)

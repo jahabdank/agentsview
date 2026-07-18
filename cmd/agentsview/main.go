@@ -294,7 +294,9 @@ func runServe(cfg config.Config, opts serveOptions) {
 				},
 				OnPollingRequired: func(obligation sync.PollingObligation) error {
 					return unwatchedPoller.AddObligation(pollingObligation{
-						Key: obligation.Key, Roots: obligation.Roots,
+						Key:   obligation.Key,
+						Roots: obligation.Roots,
+						Probe: obligation.Probe,
 					})
 				},
 				OnPollingReleased: unwatchedPoller.RemoveObligation,
@@ -530,7 +532,10 @@ func runDeferredStartupSyncFallback(
 
 	// A foreground `agentsview sync` may have already driven startup
 	// reconciliation through newForegroundSyncRunner; skip the redundant worker
-	// pass in that case, matching RunStartupSyncFallback's own re-run gate.
+	// pass in that case. This is only the fast path: a foreground worker still
+	// in flight records reconciliation before releasing the exclusive lock, and
+	// runWorkerSyncPass rechecks the gate while holding that lock, so the timer
+	// firing mid-pass cannot launch a second archive-scale worker.
 	if engine.StartupReconciled() {
 		return false, nil
 	}
@@ -541,16 +546,11 @@ func runDeferredStartupSyncFallback(
 	// surfaced without re-running. Both paths acknowledge startup so the watcher
 	// leaves collecting mode.
 	if !testing.Testing() {
-		result, err := runWorkerWritePass(
-			ctx, cfg, engine, database, lock, "sync", nil,
+		_, ran, err := runWorkerSyncPass(
+			ctx, cfg, engine, database, lock, true, nil,
 		)
-		if err == nil {
-			engine.RecordStartupReconciled(statsFromWorkerResult(result), nil)
-			return true, nil
-		}
-		if !errors.Is(err, errWorkerSpawn) {
-			engine.RecordStartupReconciled(statsFromWorkerResult(result), err)
-			return true, err
+		if err == nil || !errors.Is(err, errWorkerSpawn) {
+			return ran, err
 		}
 		log.Printf(
 			"deferred startup sync worker spawn failed: %v "+
@@ -614,11 +614,19 @@ func startupWorkerOutcome(result workerResult, err error) (workerResult, bool) {
 	}
 }
 
-// statsFromWorkerResult maps a worker terminal result onto SyncStats for
-// RecordStartupReconciled. Only AuthoritativeDiscoveryComplete() is consulted by
-// the OnStartupReconciled consumer, so Aborted mirrors the worker's
-// DiscoveryComplete; the counts are carried for reporting parity.
+// statsFromWorkerResult maps a worker terminal result onto SyncStats. The
+// worker carries the complete public SyncStats payload so /sync and /resync
+// responses keep parity with in-process passes; the summary counters are the
+// fallback for a terminal record without one. Either way, Aborted mirrors the
+// worker's DiscoveryComplete verdict: providerFailures does not cross the
+// worker protocol, and AuthoritativeDiscoveryComplete() must stay accurate on
+// the daemon side.
 func statsFromWorkerResult(r workerResult) sync.SyncStats {
+	if r.Stats != nil {
+		stats := *r.Stats
+		stats.Aborted = !r.DiscoveryComplete
+		return stats
+	}
 	return sync.SyncStats{
 		Synced:  r.Synced,
 		Skipped: r.Skipped,
@@ -656,22 +664,15 @@ func newForegroundSyncRunner(
 					progress(*l.Progress)
 				}
 			}
-			result, err := runWorkerWritePass(
-				ctx, cfg, engine, database, lock, "sync", onLine,
+			// runWorkerSyncPass records completion with SyncThenRun parity:
+			// startup acknowledgement (watcher dispatch, startup maintenance)
+			// closes before the exclusive lock is released, and last-sync
+			// state plus the "sync" emit fire after it, so /sync/status and
+			// SSE subscribers observe the worker-backed pass.
+			stats, _, err := runWorkerSyncPass(
+				ctx, cfg, engine, database, lock, false, onLine,
 			)
-			if err == nil {
-				stats := statsFromWorkerResult(result)
-				// Acknowledge startup so a foreground `agentsview sync` that
-				// drives this pass (SkipInitialSync, DeferStartupMaintenance)
-				// opens watcher dispatch and releases startup maintenance, just
-				// as the in-process SyncThenRun it replaced did. Idempotent, so
-				// it is a no-op for an already-reconciled normal serve.
-				engine.RecordStartupReconciled(stats, nil)
-				return stats, nil
-			}
-			if !errors.Is(err, errWorkerSpawn) {
-				stats := statsFromWorkerResult(result)
-				engine.RecordStartupReconciled(stats, err)
+			if err == nil || !errors.Is(err, errWorkerSpawn) {
 				return stats, err
 			}
 			log.Printf(
@@ -701,6 +702,15 @@ func newForegroundResyncRunner(
 				ctx, cfg, engine, database, progress,
 			)
 			if !spawnFailed {
+				if stats.Aborted && ctx.Err() == nil {
+					// Mirror syncThenRunLocked: a safety-aborted resync still
+					// catches up incrementally so safely applicable updates
+					// land instead of surfacing the bare abort. The worker
+					// "sync" mode refuses stale archives, so this warm,
+					// skip-cache-bounded pass runs in process like the
+					// pre-worker path it preserves.
+					return engine.SyncAll(ctx, progress), nil
+				}
 				return stats, err
 			}
 			log.Printf(
@@ -732,6 +742,7 @@ func runWorkerResyncBuild(
 	}
 	var result workerResult
 	var launchErr error
+	var doneStats sync.SyncStats
 	barrierErr := engine.RunExclusive(func() error {
 		if cerr := database.CloseWriter(); cerr != nil {
 			return fmt.Errorf("close writer for resync build: %w", cerr)
@@ -754,7 +765,17 @@ func runWorkerResyncBuild(
 		}
 		// The swap's reopen restored the writer and cleared the barrier;
 		// re-baseline the caches that referenced the replaced database.
-		return engine.ResetCachesAfterSwap()
+		if cerr := engine.ResetCachesAfterSwap(); cerr != nil {
+			return cerr
+		}
+		// Record the completed resync with ResyncAll parity before the
+		// exclusive lock is released: last-sync state feeds /sync/status
+		// hydration, and the closed startup gate keeps the deferred startup
+		// fallback from launching another archive-scale pass. The emit and
+		// startup callback fire after the lock below.
+		doneStats = statsFromWorkerResult(result)
+		engine.RecordStartupReconciledExclusive(doneStats, nil)
+		return nil
 	})
 	if barrierErr != nil {
 		if errors.Is(barrierErr, errWorkerSpawn) {
@@ -762,7 +783,8 @@ func runWorkerResyncBuild(
 		}
 		return statsFromWorkerResult(result), barrierErr, false
 	}
-	return statsFromWorkerResult(result), nil, false
+	engine.FinishStartupReconciled(doneStats)
+	return doneStats, nil, false
 }
 
 func newStartupReconciliationHandler(
@@ -1534,11 +1556,16 @@ func watchPollingObligations(
 	unwatchedDirs []string,
 ) []sync.PollingObligation {
 	byKey := make(map[string][]string)
+	probes := make(map[string]string)
 	represented := make(map[string]struct{})
-	add := func(key string, roots ...string) {
+	// The probe is the physical path whose availability gates the
+	// obligation's reconciliation roots: the watch root's own path for
+	// root-keyed groups, the dir itself for persistent dirs.
+	add := func(key, probe string, roots ...string) {
 		if key == "" {
 			return
 		}
+		probes[key] = filepath.Clean(probe)
 		for _, root := range roots {
 			if root == "" {
 				continue
@@ -1554,29 +1581,31 @@ func watchPollingObligations(
 			result = results[i]
 		}
 		if !result.MissingRootLifecycleOwned {
-			add(root.path, root.pendingPollingDirs...)
+			add(root.path, root.path, root.pendingPollingDirs...)
 		}
 		for _, dir := range root.persistentPollingDirs {
-			add("persistent:"+filepath.Clean(dir), dir)
+			add("persistent:"+filepath.Clean(dir), dir, dir)
 		}
 		if i >= len(results) {
 			continue
 		}
 		if result.Unwatched > 0 || result.BudgetExhausted ||
 			result.ResourceExhausted || result.Err != nil {
-			add(root.path, root.syncDirs()...)
+			add(root.path, root.path, root.syncDirs()...)
 		}
 	}
 	for _, dir := range unwatchedDirs {
 		dir = filepath.Clean(dir)
 		if _, ok := represented[dir]; !ok {
-			add("persistent:"+dir, dir)
+			add("persistent:"+dir, dir, dir)
 		}
 	}
 	obligations := make([]sync.PollingObligation, 0, len(byKey))
 	for key, roots := range byKey {
 		slices.Sort(roots)
-		obligations = append(obligations, sync.PollingObligation{Key: key, Roots: roots})
+		obligations = append(obligations, sync.PollingObligation{
+			Key: key, Roots: roots, Probe: probes[key],
+		})
 	}
 	slices.SortFunc(obligations, func(a, b sync.PollingObligation) int {
 		return strings.Compare(a.Key, b.Key)
@@ -2171,11 +2200,14 @@ func runArchiveAuditLoop(
 	}
 }
 
-// runArchiveAudit executes one audit attempt: a full sync pass in a worker
-// process via runWorkerWritePass, never in the daemon. It emits "sessions" when
-// the audit changed data (Synced > 0) and returns an error on spawn failure or a
-// ran-and-failed worker so the caller retries with backoff; it never falls back
-// to an in-process pass.
+// runArchiveAudit executes one audit attempt: a full authoritative
+// reconciliation in a worker process via runWorkerWritePass, never in the
+// daemon. It emits "sessions" whenever the terminal result reports committed
+// changes — synced or tombstoned — even when the pass also failed, because the
+// retry sees those rows as already synchronized and would never re-notify SSE
+// clients or the embedding scheduler. It returns an error on spawn failure or
+// a ran-and-failed worker so the caller retries with backoff; it never falls
+// back to an in-process pass.
 func runArchiveAudit(
 	ctx context.Context,
 	cfg config.Config,
@@ -2187,13 +2219,10 @@ func runArchiveAudit(
 	result, err := runWorkerWritePass(
 		ctx, cfg, engine, database, lock, "audit", nil,
 	)
-	if err != nil {
-		return err
-	}
-	if result.Synced > 0 && emitter != nil {
+	if (result.Synced > 0 || result.Tombstoned > 0) && emitter != nil {
 		emitter.Emit("sessions")
 	}
-	return nil
+	return err
 }
 
 // scheduledSyncEngine is the reconciliation surface the scheduled pass needs.

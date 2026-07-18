@@ -8602,5 +8602,50 @@ func TestEngine_ClassifyPathsProviderSidecarKeepsExistingGeminiSources(
 	require.Len(t, files, 1)
 	assert.Equal(t, sessionPath, files[0].Path)
 	assert.Equal(t, parser.AgentGemini, files[0].Agent)
-	assert.True(t, files[0].ForceParse)
+	assert.False(t, files[0].ForceParse,
+		"metadata fan-out relies on hash-aware freshness, not forced parses")
+}
+
+func TestProviderChangedPathForceParseGeminiMetadata(t *testing.T) {
+	sessionPath := filepath.Join("root", "tmp", "alias", "chats", "session-1.json")
+	tests := []struct {
+		name      string
+		eventPath string
+		eventKind string
+		want      bool
+	}{
+		{
+			name:      "projects.json write fan-out is not forced",
+			eventPath: filepath.Join("root", "projects.json"),
+			eventKind: "write",
+			want:      false,
+		},
+		{
+			name:      "trustedFolders.json write fan-out is not forced",
+			eventPath: filepath.Join("root", "trustedFolders.json"),
+			eventKind: "write",
+			want:      false,
+		},
+		{
+			name:      "projects.json remove keeps the force",
+			eventPath: filepath.Join("root", "projects.json"),
+			eventKind: "remove",
+			want:      true,
+		},
+		{
+			name:      "session event for another session stays forced",
+			eventPath: filepath.Join("root", "tmp", "alias", "chats", "session-2.json"),
+			eventKind: "write",
+			want:      true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := providerChangedPathForceParse(
+				parser.AgentGemini, sessionPath, tt.eventPath, tt.eventKind,
+				parser.ProviderMigrationProviderAuthoritative,
+			)
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }

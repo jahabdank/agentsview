@@ -1240,6 +1240,8 @@ func TestHumaTriggerSyncWorkerBackedRejectsStaleArchive(t *testing.T) {
 
 	require.Equal(t, http.StatusConflict, w.Code, "body: %s", w.Body.String())
 	assert.Contains(t, w.Body.String(), "resync")
+	assert.Equal(t, "true", w.Header().Get(ResyncRequiredHeader),
+		"the rejection must carry the machine-readable resync signal for the CLI")
 	assert.False(t, ran, "the worker-backed runner must not run for a stale archive")
 	assert.True(t, f.db.NeedsResync(), "a rejected sync must not resync")
 }

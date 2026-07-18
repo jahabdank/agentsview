@@ -219,6 +219,11 @@ func (s *Server) humaTriggerSync(
 	}}, nil
 }
 
+// ResyncRequiredHeader marks a /sync rejection that requires a full resync, so
+// the CLI can retry through /api/v1/resync instead of surfacing a raw HTTP
+// error. The body remains the human-readable explanation.
+const ResyncRequiredHeader = "X-Agentsview-Resync-Required"
+
 // rejectStaleArchiveForSync fails a worker-backed /sync when the archive's data
 // version changed, because the worker sync pass refuses to swap a stale archive
 // under the live daemon. It points the caller at /resync, which rebuilds through
@@ -233,10 +238,13 @@ func (s *Server) rejectStaleArchiveForSync() error {
 	if !ok || !local.NeedsResync() {
 		return nil
 	}
-	return apiError(
-		http.StatusConflict,
-		"archive data version changed; POST /api/v1/resync to rebuild the "+
-			"archive before syncing",
+	return huma.ErrorWithHeaders(
+		apiError(
+			http.StatusConflict,
+			"archive data version changed; POST /api/v1/resync to rebuild the "+
+				"archive before syncing",
+		),
+		http.Header{ResyncRequiredHeader: []string{"true"}},
 	)
 }
 

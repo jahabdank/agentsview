@@ -1607,7 +1607,8 @@ func TestDarwinWatcherFallbackTransfersMissingRootPollingBeforeRecovery(t *testi
 		Key: darwinFallbackPollingKey, Roots: []string{missing, present},
 	}, requireReceiveWithin(t, polling, time.Second))
 	waitForDarwinBatch(t, batches, func(batch WatchBatch) bool { return batch.FullSync })
-	assert.Equal(t, PollingObligation{Key: missing, Roots: []string{missing}},
+	assert.Equal(t,
+		PollingObligation{Key: missing, Roots: []string{missing}, Probe: missing},
 		requireReceiveWithin(t, polling, time.Second),
 		"the skipped root must own polling before generic fallback polling is released")
 	assert.Equal(t, darwinFallbackPollingKey, requireReceiveWithin(t, released, time.Second))
@@ -2234,7 +2235,8 @@ func TestDarwinWatcherMissingRecursiveSymlinkStaysPolled(t *testing.T) {
 	waitForDarwinBatch(t, batches, func(batch WatchBatch) bool {
 		return slices.Contains(batch.ReconcileRoots, ancestor)
 	})
-	assert.Equal(t, PollingObligation{Key: root, Roots: []string{ancestor}},
+	assert.Equal(t,
+		PollingObligation{Key: root, Roots: []string{ancestor}, Probe: root},
 		requireReceiveWithin(t, required, time.Second))
 	require.True(t, firstRootInspection.Load())
 	backend.mu.Lock()
@@ -2326,7 +2328,8 @@ func TestDarwinWatcherPendingLossWinsOverActivationAcknowledgement(t *testing.T)
 
 	assert.Equal(t, darwinRootLossCollecting, state.phase)
 	assert.False(t, state.active)
-	assert.Equal(t, PollingObligation{Key: root, Roots: []string{ancestor}},
+	assert.Equal(t,
+		PollingObligation{Key: root, Roots: []string{ancestor}, Probe: root},
 		requireReceiveWithin(t, required, time.Second))
 	requireReceiveWithin(t, closed, time.Second)
 }
