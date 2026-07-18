@@ -310,7 +310,10 @@ const projectIdentityRemoteScrubCompletedKey = "project_identity_remote_scrub_v1
 // and relationship_type from agyReader.parentCascadeId in trajectory sidecars.)
 // (68: Generic GitHub worktree layouts. Re-parsing corrects project names for
 // sessions whose worktree paths no longer exist on the local machine.)
-const dataVersion = 68
+// (69: Parser-source project identity snapshots. Re-parsing replaces snapshots
+// that older mapping behavior could persist with the mapped target label before
+// incremental ingestion is allowed to reuse them.)
+const dataVersion = 69
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 

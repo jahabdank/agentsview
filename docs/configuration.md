@@ -630,9 +630,9 @@ Settings, or directly from the Activity project breakdown (see
 
 - Mappings are explicit; there is no auto-discovery.
 - Each rule is scoped to one machine. The machine selector manages rules for
-  the local machine and for any remotely synced machine; rules always live in
-  the writable archive that ingests that machine's sessions, never on the
-  source machine itself.
+  the local machine and for any remotely synced machine. Rules live in the
+  writable archive that ingests that machine's sessions, which may be the
+  source machine's local SQLite archive or a separate collector archive.
 - Each rule applies whenever a session's `cwd` falls under the configured
   prefix, on both new sessions as they sync and (via the **Apply** button)
   already-imported sessions. Prefixes match on directory boundaries, so

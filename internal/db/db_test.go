@@ -930,10 +930,11 @@ func TestMigration_ToolResultEventsTable(t *testing.T) {
 		"expected tool_result_events table after reopen")
 }
 
-func TestCurrentDataVersionGenericGitHubWorktrees(t *testing.T) {
-	assert.Equal(t, 68, CurrentDataVersion(),
-		"generic GitHub worktree parsing requires a data version bump")
+func TestCurrentDataVersionProjectIdentitySourceSnapshots(t *testing.T) {
+	assert.Equal(t, 69, CurrentDataVersion(),
+		"legacy project snapshots require a source-aware full reparse")
 }
+
 func TestInsertMessages_PreservesToolResultEvents(t *testing.T) {
 	d := testDB(t)
 	insertSession(t, d, "s-events", "proj")

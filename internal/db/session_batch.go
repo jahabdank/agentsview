@@ -291,6 +291,25 @@ func writeOneSessionBatchTx(
 	write SessionBatchWrite,
 	pendingRecallRevocations *recallEvidenceRevocationEvents,
 ) (int, error) {
+	if write.IdentityObservation.Project != "" {
+		normalized, err := normalizeProjectIdentityObservation(
+			write.IdentityObservation,
+		)
+		if err != nil {
+			return 0, err
+		}
+		if normalized.SessionID == "" {
+			normalized.SessionID = write.Session.ID
+		}
+		if normalized.SessionID != write.Session.ID {
+			return 0, fmt.Errorf(
+				"identity observation session id %q does not match session id %q",
+				normalized.SessionID, write.Session.ID,
+			)
+		}
+		write.IdentityObservation = normalized
+	}
+
 	sessionInserted, err := upsertSessionExec(
 		tx.Exec,
 		func(query string, args ...any) rowScanner {

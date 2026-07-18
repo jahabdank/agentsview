@@ -2290,6 +2290,114 @@ func TestProjectIdentityIncrementalStatePreservesExplicitSourceProject(
 	}
 }
 
+func TestProjectIdentityLegacyMappedSnapshotReparsesBeforeIncrementalAppend(
+	t *testing.T,
+) {
+	const (
+		legacyDataVersion = 68
+		sessionID         = "legacy-mapped-snapshot"
+		sourceProject     = "parser-source"
+		targetProject     = "mapped-target"
+		machine           = "laptop"
+	)
+	ctx := context.Background()
+	database := openTestDB(t)
+	root := t.TempDir()
+	path := filepath.Join(root, "session.jsonl")
+	initial := []byte("initial-record\n")
+	require.NoError(t, os.WriteFile(path, initial, 0o600))
+	initialInfo, err := os.Stat(path)
+	require.NoError(t, err)
+	_, err = database.CreateWorktreeProjectMapping(
+		ctx,
+		db.WorktreeProjectMapping{
+			Machine: machine, PathPrefix: root,
+			Layout:  db.WorktreeMappingLayoutExplicit,
+			Project: targetProject, Enabled: true,
+		},
+	)
+	require.NoError(t, err)
+	require.NoError(t, database.UpsertSession(db.Session{
+		ID: sessionID, Project: targetProject, Machine: machine,
+		Agent: "claude", Cwd: root, FirstMessage: strPtr("initial"),
+		MessageCount: 1, UserMessageCount: 1,
+		FilePath: strPtr(path), FileSize: int64Ptr(initialInfo.Size()),
+		FileMtime: int64Ptr(initialInfo.ModTime().UnixNano()),
+	}))
+	require.NoError(t, database.UpsertProjectIdentityObservationWithSnapshotProject(
+		ctx,
+		export.ProjectIdentityObservation{
+			SessionID: sessionID, Project: targetProject,
+			Machine: machine, RootPath: root,
+		},
+		targetProject,
+	))
+	require.Greater(t, db.CurrentDataVersion(), legacyDataVersion,
+		"legacy target-labelled snapshots need a data-version upgrade")
+	require.NoError(t, database.SetSessionDataVersion(
+		sessionID, legacyDataVersion,
+	))
+
+	appended := []byte("appended-record\n")
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	require.NoError(t, err)
+	_, err = f.Write(appended)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	appendedInfo, err := os.Stat(path)
+	require.NoError(t, err)
+
+	e := NewEngine(database, EngineConfig{Machine: machine})
+	t.Cleanup(e.Close)
+	parseCalled := false
+	_, ok := e.tryIncrementalJSONL(
+		parser.DiscoveredFile{Agent: parser.AgentClaude, Path: path},
+		appendedInfo,
+		parser.AgentClaude,
+		func(
+			_ string,
+			_ *db.IncrementalInfo,
+		) ([]parser.ParsedMessage, []parser.ClaudeSubagentLink, time.Time, int64, *string, error) {
+			parseCalled = true
+			return nil, nil, time.Time{}, 0, nil, nil
+		},
+	)
+	assert.False(t, ok,
+		"legacy snapshots must fall through to a source-aware full parse")
+	assert.False(t, parseCalled,
+		"stale source evidence must be rejected before incremental parsing")
+
+	written, _, failed, _ := e.writeBatch(
+		[]pendingWrite{{
+			sess: parser.ParsedSession{
+				ID: sessionID, Project: sourceProject,
+				Machine: machine, Agent: parser.AgentClaude,
+				Cwd: root, FirstMessage: "initial", MessageCount: 2,
+				UserMessageCount: 1,
+				File: parser.FileInfo{
+					Path: path, Size: appendedInfo.Size(),
+					Mtime: appendedInfo.ModTime().UnixNano(),
+				},
+			},
+			msgs: []parser.ParsedMessage{
+				{Role: parser.RoleUser, Content: "initial", Ordinal: 0},
+				{Role: parser.RoleAssistant, Content: "appended", Ordinal: 1},
+			},
+		}},
+		syncWriteDefault,
+		true,
+	)
+	require.Equal(t, 0, failed)
+	require.Equal(t, 1, written)
+	assert.Equal(t, db.CurrentDataVersion(),
+		database.GetSessionDataVersion(sessionID))
+	snapshots, err := database.ListSessionProjectIdentitySnapshots(ctx)
+	require.NoError(t, err)
+	require.Len(t, snapshots, 1)
+	assert.Equal(t, sourceProject, snapshots[0].Project,
+		"the required full parse must replace fabricated mapped evidence")
+}
+
 func TestProjectIdentityIncrementalRemoteAppendSkipsLiveDiscovery(t *testing.T) {
 	database := openTestDB(t)
 	e := NewEngine(database, EngineConfig{

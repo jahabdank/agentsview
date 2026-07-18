@@ -644,6 +644,89 @@ func TestProjectObservationSessionBatchExplicitEmptyProjectOmitsSnapshot(
 		"an explicit empty source must not become mapped snapshot evidence")
 }
 
+func TestSessionBatchWritesRejectMismatchedIdentityOwnership(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name       string
+		writeBatch func(*DB, []SessionBatchWrite) (SessionBatchResult, error)
+		wantErr    bool
+	}{
+		{
+			name: "savepoint batch",
+			writeBatch: func(
+				d *DB, writes []SessionBatchWrite,
+			) (SessionBatchResult, error) {
+				return d.WriteSessionBatch(writes)
+			},
+		},
+		{
+			name: "atomic batch",
+			writeBatch: func(
+				d *DB, writes []SessionBatchWrite,
+			) (SessionBatchResult, error) {
+				return d.WriteSessionBatchAtomic(writes)
+			},
+			wantErr: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := testDB(t)
+			recordedAt := time.Date(2026, 7, 17, 8, 0, 0, 0, time.UTC)
+			require.NoError(t, d.UpsertSession(Session{
+				ID: "unrelated", Project: "unrelated-target",
+				Machine: "laptop", Agent: "codex", Cwd: "/tmp/unrelated",
+			}))
+			require.NoError(t, d.UpsertProjectIdentityObservationWithSnapshotProject(
+				ctx,
+				export.ProjectIdentityObservation{
+					SessionID: "unrelated", Project: "unrelated-target",
+					Machine: "laptop", RootPath: "/tmp/unrelated",
+					ObservedAt: recordedAt,
+				},
+				"unrelated-source",
+			))
+			before, err := d.ListSessionProjectIdentitySnapshots(ctx)
+			require.NoError(t, err)
+			require.Len(t, before, 1)
+
+			candidateSource := "candidate-source"
+			result, err := tc.writeBatch(d, []SessionBatchWrite{{
+				Session: Session{
+					ID: "candidate", Project: "candidate-target",
+					Machine: "laptop", Agent: "codex", Cwd: "/tmp/candidate",
+				},
+				IdentityObservation: export.ProjectIdentityObservation{
+					SessionID: "unrelated", Project: "candidate-target",
+					Machine: "laptop", RootPath: "/tmp/candidate",
+					ObservedAt: recordedAt.Add(time.Minute),
+				},
+				IdentitySnapshotProject: &candidateSource,
+				DataVersion:             CurrentDataVersion(),
+				ReplaceMessages:         true,
+			}})
+			if tc.wantErr {
+				assert.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, 1, result.FailedSessions)
+			assert.Equal(t, 0, result.WrittenSessions)
+			require.Len(t, result.Errors, 1)
+			assert.ErrorContains(t, result.Errors[0],
+				"does not match session id")
+
+			candidate, getErr := d.GetSession(ctx, "candidate")
+			require.NoError(t, getErr)
+			assert.Nil(t, candidate,
+				"invalid identity ownership must reject the session write")
+			after, listErr := d.ListSessionProjectIdentitySnapshots(ctx)
+			require.NoError(t, listErr)
+			assert.Equal(t, before, after,
+				"invalid identity ownership must not relabel another session")
+		})
+	}
+}
+
 func TestUpsertSessionWithProjectIdentityUsesCurrentTransactionInsertionState(
 	t *testing.T,
 ) {
