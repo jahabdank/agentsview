@@ -237,6 +237,48 @@ func TestUnwatchedPollDefersScopesWhileProbePathMissing(t *testing.T) {
 		"the deferred scope must resume once the physical path returns")
 }
 
+// TestUnwatchedPollDefersSharedScopeWhileAnyProbeMissing pins the shared-scope
+// gating: Gemini's shallow <root> metadata plan and recursive <root>/tmp plan
+// both reconcile the configured <root>. While <root>/tmp is missing, the
+// present shallow plan must not make <root> pollable, or authoritative
+// reconciliation would tombstone every session under the vanished subtree.
+func TestUnwatchedPollDefersSharedScopeWhileAnyProbeMissing(t *testing.T) {
+	configured := t.TempDir()
+	sessions := filepath.Join(configured, "tmp")
+	require.NoError(t, os.Mkdir(sessions, 0o755))
+
+	syncer := &recordingUnwatchedPollSyncer{wake: make(chan struct{}, 3)}
+	coordinator := newUnwatchedPollCoordinatorWithTicks(
+		t.Context(), syncer, make(chan time.Time), func() {},
+		func(run func()) { run() }, nil,
+	)
+	t.Cleanup(coordinator.Stop)
+	require.NoError(t, coordinator.AddObligation(pollingObligation{
+		Key: configured, Roots: []string{configured}, Probe: configured,
+	}))
+	require.NoError(t, coordinator.AddObligation(pollingObligation{
+		Key: sessions, Roots: []string{configured}, Probe: sessions,
+	}))
+
+	coordinator.Wake()
+	requirePollWithin(t, syncer.wake, time.Second)
+	assert.Equal(t, [][]string{{configured}}, syncer.snapshot(),
+		"with every probe available the shared scope reconciles")
+
+	require.NoError(t, os.RemoveAll(sessions))
+	coordinator.Wake()
+	assert.Never(t, func() bool { return len(syncer.snapshot()) > 1 },
+		100*time.Millisecond, 10*time.Millisecond,
+		"a missing session subtree must defer the shared scope even though "+
+			"the metadata plan's probe still exists")
+
+	require.NoError(t, os.Mkdir(sessions, 0o755))
+	coordinator.Wake()
+	requirePollWithin(t, syncer.wake, time.Second)
+	assert.Equal(t, [][]string{{configured}, {configured}}, syncer.snapshot(),
+		"the shared scope must resume once every probe returns")
+}
+
 func TestUnwatchedPollObligationUpdatesRemainResponsiveDuringReconciliation(
 	t *testing.T,
 ) {

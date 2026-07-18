@@ -257,28 +257,42 @@ func (c *sharedUnwatchedPollCoordinator) runPollWorker() {
 }
 
 // availableUnwatchedPollRoots selects the reconciliation roots whose
-// obligation is currently pollable. An obligation with a probe path is gated
+// obligations are currently pollable. An obligation with a probe path is gated
 // on that physical path: while it is missing, its roots are deferred entirely
 // rather than authoritatively reconciled, because the configured scope can
 // still exist while the physical subtree holding every session is gone.
+//
+// A root shared by several obligations is gated on every probe that references
+// it, not just one: Gemini's shallow <root> metadata plan and recursive
+// <root>/tmp plan both reconcile <root>, and the present shallow plan must not
+// make <root> pollable while the subtree holding every session is missing.
 func availableUnwatchedPollRoots(obligations []pollingObligation) []string {
-	owned := make(map[string]struct{})
+	candidates := make(map[string]struct{})
+	blocked := make(map[string]struct{})
 	for _, obligation := range obligations {
+		probeMissing := false
 		if obligation.Probe != "" {
 			if _, err := os.Stat(obligation.Probe); err != nil {
-				continue
+				probeMissing = true
 			}
 		}
 		for _, root := range obligation.Roots {
 			if root == "" {
 				continue
 			}
+			if probeMissing {
+				blocked[root] = struct{}{}
+				continue
+			}
 			if _, err := os.Stat(root); err == nil {
-				owned[root] = struct{}{}
+				candidates[root] = struct{}{}
 			}
 		}
 	}
-	return unwatchedPollRoots(owned)
+	for root := range blocked {
+		delete(candidates, root)
+	}
+	return unwatchedPollRoots(candidates)
 }
 
 func unwatchedPollObligationRoots(obligations map[string]pollingObligation) []string {
