@@ -248,6 +248,11 @@ func runSyncWorkerResyncBuild(
 // parse failures: shouldAbortResyncSwap already folded that judgment into
 // stats.Aborted, so Failed alone must not fail the pass and make the daemon
 // discard an otherwise valid replacement of a stale-version archive.
+//
+// Operational failures (buildErr) classify as "failed" even when the engine
+// also set stats.Aborted, such as a temp-DB create failure: "aborted" is
+// reserved for cancellation and explicit no-error safety aborts, because the
+// daemon responds to "aborted" by falling back to an incremental sync.
 func resyncBuildResultFromStats(
 	ctx context.Context, stats sync.SyncStats, buildErr error,
 ) workerResult {
@@ -260,17 +265,18 @@ func resyncBuildResultFromStats(
 		Stats:             &statsCopy,
 	}
 	switch {
-	case ctx.Err() != nil || stats.Aborted:
+	case ctx.Err() != nil:
 		result.Status = "aborted"
 		result.DiscoveryComplete = false
-		if ctx.Err() != nil {
-			result.Error = ctx.Err().Error()
-		}
-	case buildErr != nil || !result.DiscoveryComplete:
+		result.Error = ctx.Err().Error()
+	case buildErr != nil:
 		result.Status = "failed"
-		if buildErr != nil {
-			result.Error = buildErr.Error()
-		}
+		result.Error = buildErr.Error()
+	case stats.Aborted:
+		result.Status = "aborted"
+		result.DiscoveryComplete = false
+	case !result.DiscoveryComplete:
+		result.Status = "failed"
 	default:
 		result.Status = "ok"
 	}

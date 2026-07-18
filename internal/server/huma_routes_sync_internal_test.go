@@ -39,11 +39,12 @@ type syncRouteFixture struct {
 }
 
 type syncRouteFixtureConfig struct {
-	stale       bool
-	remoteHosts []config.RemoteHost
-	broadcaster *Broadcaster
-	engine      *syncpkg.Engine
-	syncRunner  LocalSyncRunner
+	stale        bool
+	remoteHosts  []config.RemoteHost
+	broadcaster  *Broadcaster
+	engine       *syncpkg.Engine
+	syncRunner   LocalSyncRunner
+	resyncRunner LocalResyncRunner
 }
 
 type syncRouteFixtureOption func(*syncRouteFixtureConfig)
@@ -54,6 +55,10 @@ func withStaleDB() syncRouteFixtureOption {
 
 func withLocalSyncRunner(r LocalSyncRunner) syncRouteFixtureOption {
 	return func(c *syncRouteFixtureConfig) { c.syncRunner = r }
+}
+
+func withLocalResyncRunner(r LocalResyncRunner) syncRouteFixtureOption {
+	return func(c *syncRouteFixtureConfig) { c.resyncRunner = r }
 }
 
 func withRemoteHosts(hosts ...config.RemoteHost) syncRouteFixtureOption {
@@ -110,6 +115,10 @@ func newSyncRouteFixture(
 	}
 	if cfg.syncRunner != nil {
 		serverOptions = append(serverOptions, WithLocalSyncRunner(cfg.syncRunner))
+	}
+	if cfg.resyncRunner != nil {
+		serverOptions = append(serverOptions,
+			WithLocalResyncRunner(cfg.resyncRunner))
 	}
 	srv := New(serverConfig, database, cfg.engine, serverOptions...)
 	return &syncRouteFixture{
@@ -1244,6 +1253,42 @@ func TestHumaTriggerSyncWorkerBackedRejectsStaleArchive(t *testing.T) {
 		"the rejection must carry the machine-readable resync signal for the CLI")
 	assert.False(t, ran, "the worker-backed runner must not run for a stale archive")
 	assert.True(t, f.db.NeedsResync(), "a rejected sync must not resync")
+}
+
+// TestHumaTriggerSyncWorkerRunnerErrorRejectsStream pins the failure UX: a
+// worker-backed runner that ran and reported failure must surface an SSE
+// "error" event (or an error status without SSE) instead of a "done" event
+// that makes the failed pass look successful.
+func TestHumaTriggerSyncWorkerRunnerErrorRejectsStream(t *testing.T) {
+	f := newSyncRouteFixture(t, withLocalSyncRunner(
+		func(context.Context, func(syncpkg.Progress)) (syncpkg.SyncStats, error) {
+			return syncpkg.SyncStats{}, errors.New("sync worker pass reported failed")
+		},
+	))
+
+	w := serveJSON(t, f.handler, http.MethodPost, "/api/v1/sync", nil)
+
+	body := w.Body.String()
+	assert.Contains(t, body, "event: error")
+	assert.Contains(t, body, "sync worker pass reported failed")
+	assert.NotContains(t, body, "event: done",
+		"a failed worker pass must not be reported as a completed sync")
+}
+
+func TestHumaTriggerResyncWorkerRunnerErrorRejectsStream(t *testing.T) {
+	f := newSyncRouteFixture(t, withLocalResyncRunner(
+		func(context.Context, func(syncpkg.Progress)) (syncpkg.SyncStats, error) {
+			return syncpkg.SyncStats{}, errors.New("resync build reported failed")
+		},
+	))
+
+	w := serveJSON(t, f.handler, http.MethodPost, "/api/v1/resync", nil)
+
+	body := w.Body.String()
+	assert.Contains(t, body, "event: error")
+	assert.Contains(t, body, "resync build reported failed")
+	assert.NotContains(t, body, "event: done",
+		"a failed worker resync must not be reported as a completed resync")
 }
 
 func TestForegroundSyncReleasesDeferredStartupMaintenance(t *testing.T) {

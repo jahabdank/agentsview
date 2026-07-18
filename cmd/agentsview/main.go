@@ -698,20 +698,23 @@ func newForegroundResyncRunner(
 		ctx context.Context, progress func(sync.Progress),
 	) (sync.SyncStats, error) {
 		if !testing.Testing() {
-			stats, err, spawnFailed := runWorkerResyncBuild(
+			result, err, spawnFailed := runWorkerResyncBuild(
 				ctx, cfg, engine, database, progress,
 			)
 			if !spawnFailed {
-				if stats.Aborted && ctx.Err() == nil {
+				if result.Status == "aborted" && ctx.Err() == nil {
 					// Mirror syncThenRunLocked: a safety-aborted resync still
 					// catches up incrementally so safely applicable updates
 					// land instead of surfacing the bare abort. The worker
 					// "sync" mode refuses stale archives, so this warm,
 					// skip-cache-bounded pass runs in process like the
-					// pre-worker path it preserves.
+					// pre-worker path it preserves. Only the worker's explicit
+					// "aborted" verdict takes this path: operational build
+					// failures report "failed" and must surface their error
+					// rather than masquerade as a successful incremental sync.
 					return engine.SyncAll(ctx, progress), nil
 				}
-				return stats, err
+				return statsFromWorkerResult(result), err
 			}
 			log.Printf(
 				"foreground resync worker spawn failed: %v "+
@@ -726,15 +729,17 @@ func newForegroundResyncRunner(
 // write barrier, then swaps it in and resets caches. It closes the writer for the
 // whole build-and-swap window (readers keep serving, direct writes fail with
 // ErrWriterClosed) without releasing the write-owner flock: the worker never
-// opens the live archive writable. spawnFailed is true only when the worker
-// could not be launched, so the caller falls back in process.
+// opens the live archive writable. The worker's terminal result is returned so
+// the caller can distinguish an explicit safety abort (Status "aborted") from
+// an operational failure. spawnFailed is true only when the worker could not
+// be launched, so the caller falls back in process.
 func runWorkerResyncBuild(
 	ctx context.Context,
 	cfg config.Config,
 	engine *sync.Engine,
 	database *db.DB,
 	progress func(sync.Progress),
-) (stats sync.SyncStats, err error, spawnFailed bool) {
+) (workerResult, error, bool) {
 	relay := func(l workerLine) {
 		if l.Progress != nil && progress != nil {
 			progress(*l.Progress)
@@ -779,12 +784,12 @@ func runWorkerResyncBuild(
 	})
 	if barrierErr != nil {
 		if errors.Is(barrierErr, errWorkerSpawn) {
-			return sync.SyncStats{}, barrierErr, true
+			return workerResult{}, barrierErr, true
 		}
-		return statsFromWorkerResult(result), barrierErr, false
+		return result, barrierErr, false
 	}
 	engine.FinishStartupReconciled(doneStats)
-	return doneStats, nil, false
+	return result, nil, false
 }
 
 func newStartupReconciliationHandler(

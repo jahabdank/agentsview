@@ -208,13 +208,22 @@ func (s *Server) humaTriggerSync(
 	return &huma.StreamResponse{Body: func(hctx huma.Context) {
 		stream, ok := newHumaSSEStream(hctx)
 		if !ok {
-			stats := s.runSyncWithResyncFallback(ctx, engine, nil)
+			stats, err := s.runSyncWithResyncFallback(ctx, engine, nil)
+			if err != nil {
+				writeHumaJSON(hctx, http.StatusInternalServerError,
+					apiErrorResponse{Message: err.Error()})
+				return
+			}
 			writeHumaJSON(hctx, http.StatusOK, stats)
 			return
 		}
-		stats := s.runSyncWithResyncFallback(ctx, engine, func(p syncpkg.Progress) {
+		stats, err := s.runSyncWithResyncFallback(ctx, engine, func(p syncpkg.Progress) {
 			stream.SendJSON("progress", p)
 		})
+		if err != nil {
+			stream.SendJSON("error", map[string]string{"error": err.Error()})
+			return
+		}
 		stream.SendJSON("done", stats)
 	}}, nil
 }
@@ -251,24 +260,27 @@ func (s *Server) rejectStaleArchiveForSync() error {
 func (s *Server) runSyncWithResyncFallback(
 	ctx context.Context, engine *syncpkg.Engine,
 	progress func(syncpkg.Progress),
-) syncpkg.SyncStats {
+) (syncpkg.SyncStats, error) {
 	if s.localSyncRunner != nil {
 		// The worker-backed "sync" runner refuses a stale-version archive rather
 		// than swap it under the live daemon (see runSyncWorkerStartup); callers
 		// gate on NeedsResync before reaching here and route rebuilds through the
 		// resync-build flow. It only returns an error when the worker ran and
-		// reported failure; the stats still carry that outcome, so log and
-		// return them.
+		// reported failure, so propagate it to the caller instead of reporting
+		// the failed pass as a successful sync.
 		stats, err := s.localSyncRunner(ctx, progress)
-		if err != nil && ctx.Err() == nil {
-			log.Printf("foreground local sync: %v", err)
+		if err != nil {
+			if ctx.Err() == nil {
+				log.Printf("foreground local sync: %v", err)
+			}
+			return stats, err
 		}
-		return stats
+		return stats, nil
 	}
 	stats, _ := engine.SyncThenRun(
 		ctx, false, progress, func(bool) error { return nil },
 	)
-	return stats
+	return stats, nil
 }
 
 func (s *Server) humaTriggerResync(
@@ -282,13 +294,22 @@ func (s *Server) humaTriggerResync(
 	return &huma.StreamResponse{Body: func(hctx huma.Context) {
 		stream, ok := newHumaSSEStream(hctx)
 		if !ok {
-			stats := s.runResyncWithFallback(ctx, engine, nil)
+			stats, err := s.runResyncWithFallback(ctx, engine, nil)
+			if err != nil {
+				writeHumaJSON(hctx, http.StatusInternalServerError,
+					apiErrorResponse{Message: err.Error()})
+				return
+			}
 			writeHumaJSON(hctx, http.StatusOK, stats)
 			return
 		}
-		stats := s.runResyncWithFallback(ctx, engine, func(p syncpkg.Progress) {
+		stats, err := s.runResyncWithFallback(ctx, engine, func(p syncpkg.Progress) {
 			stream.SendJSON("progress", p)
 		})
+		if err != nil {
+			stream.SendJSON("error", map[string]string{"error": err.Error()})
+			return
+		}
 		stream.SendJSON("done", stats)
 	}}, nil
 }
@@ -296,22 +317,25 @@ func (s *Server) humaTriggerResync(
 func (s *Server) runResyncWithFallback(
 	ctx context.Context, engine *syncpkg.Engine,
 	progress func(syncpkg.Progress),
-) syncpkg.SyncStats {
+) (syncpkg.SyncStats, error) {
 	if s.localResyncRunner != nil {
 		// The worker-backed runner builds the replacement archive in a child
 		// process behind a write barrier and swaps it in. It only returns an
-		// error when the worker ran and reported failure; the stats still carry
-		// that outcome, so log and return them.
+		// error when the worker ran and reported failure, so propagate it to
+		// the caller instead of reporting the failed pass as a success.
 		stats, err := s.localResyncRunner(ctx, progress)
-		if err != nil && ctx.Err() == nil {
-			log.Printf("foreground resync: %v", err)
+		if err != nil {
+			if ctx.Err() == nil {
+				log.Printf("foreground resync: %v", err)
+			}
+			return stats, err
 		}
-		return stats
+		return stats, nil
 	}
 	stats, _ := engine.SyncThenRun(
 		ctx, true, progress, func(bool) error { return nil },
 	)
-	return stats
+	return stats, nil
 }
 
 func (s *Server) humaSyncRemotes(
@@ -842,6 +866,8 @@ func (s *Server) resyncBeforeSessionSync(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	s.runResyncWithFallback(ctx, engine, nil)
+	if _, err := s.runResyncWithFallback(ctx, engine, nil); err != nil {
+		return err
+	}
 	return ctx.Err()
 }

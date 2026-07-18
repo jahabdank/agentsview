@@ -41,6 +41,52 @@ const (
 	darwinFallbackPollingKey = "watcher-fallback"
 )
 
+// darwinFallbackPollPlan preserves one physical watch plan's path-to-scope
+// mapping for global fallback polling. Each plan becomes its own polling
+// obligation with the physical path as Probe: a nested physical root (Gemini's
+// <root>/tmp) can be missing while its configured scope <root> exists, and a
+// probe on the collapsed scope roots would let authoritative reconciliation
+// tombstone every session under the absent subtree.
+type darwinFallbackPollPlan struct {
+	path  string
+	roots []string
+}
+
+// darwinFallbackPollingObligationKey names the per-plan fallback obligation so
+// each plan can be registered and released independently.
+func darwinFallbackPollingObligationKey(path string) string {
+	return darwinFallbackPollingKey + ":" + path
+}
+
+// appendFallbackPollPlan adds a plan's scope roots under its physical path,
+// merging into an existing entry for the same path.
+func appendFallbackPollPlan(
+	plans []darwinFallbackPollPlan, path string, scopes []WatchScope,
+) []darwinFallbackPollPlan {
+	roots := appendWatchScopeRoots(nil, scopes)
+	if len(roots) == 0 {
+		return plans
+	}
+	for i := range plans {
+		if plans[i].path == path {
+			merged := plans[i].roots
+			for _, root := range roots {
+				if !slices.Contains(merged, root) {
+					merged = append(merged, root)
+				}
+			}
+			slices.Sort(merged)
+			plans[i].roots = merged
+			return plans
+		}
+	}
+	plans = append(plans, darwinFallbackPollPlan{path: path, roots: roots})
+	slices.SortFunc(plans, func(a, b darwinFallbackPollPlan) int {
+		return strings.Compare(a.path, b.path)
+	})
+	return plans
+}
+
 type darwinBackendLifecycle uint8
 
 const (
@@ -175,7 +221,7 @@ type darwinWatchBackend struct {
 	retryInitial           time.Duration
 	retryMax               time.Duration
 	fallbackPrepared       bool
-	fallbackPollRoots      []string
+	fallbackPollPlans      []darwinFallbackPollPlan
 	fallbackRetryAt        time.Time
 	fallbackRetryDelay     time.Duration
 	fallbackStreamCount    int
@@ -380,13 +426,13 @@ func (b *darwinWatchBackend) prepareStartupFallbackLocked(
 		delete(b.streams, root)
 		b.removeRootLocked(root, true)
 	}
-	var pollRoots []string
+	var pollPlans []darwinFallbackPollPlan
 	for i, plan := range roots {
 		plan.Path = filepath.Clean(plan.Path)
 		if !plan.Recursive {
 			continue
 		}
-		pollRoots = appendWatchScopeRoots(pollRoots, plan.Scopes)
+		pollPlans = appendFallbackPollPlan(pollPlans, plan.Path, plan.Scopes)
 		results[i] = RecursiveWatchResult{Watched: 1}
 		state := b.logical[plan.Path]
 		if state != nil {
@@ -396,7 +442,7 @@ func (b *darwinWatchBackend) prepareStartupFallbackLocked(
 		}
 	}
 	b.fallbackPrepared = true
-	b.fallbackPollRoots = pollRoots
+	b.fallbackPollPlans = pollPlans
 	b.fallbackPhase.Store(uint32(darwinFallbackCollecting))
 	b.nativeOpen.Store(false)
 }
@@ -494,8 +540,8 @@ func (b *darwinWatchBackend) Start() error {
 	} else {
 		if b.fallbackPrepared {
 			for _, state := range b.logical {
-				b.fallbackPollRoots = appendWatchScopeRoots(
-					b.fallbackPollRoots, state.plan.Scopes,
+				b.fallbackPollPlans = appendFallbackPollPlan(
+					b.fallbackPollPlans, state.plan.Path, state.plan.Scopes,
 				)
 			}
 		}
@@ -1058,20 +1104,20 @@ func (b *darwinWatchBackend) processFallbackTransition() bool {
 	}
 
 	b.mu.Lock()
-	pollRoots := append([]string(nil), b.fallbackPollRoots...)
+	pollPlans := append([]darwinFallbackPollPlan(nil), b.fallbackPollPlans...)
 	pollingOwned := b.fallbackPollingOwned
 	b.mu.Unlock()
-	if len(pollRoots) > 0 {
+	if len(pollPlans) > 0 {
 		var err error
 		if !pollingOwned {
-			err = b.requireFallbackPolling(pollRoots)
+			err = b.requireFallbackPolling(pollPlans)
 		}
 		if err != nil {
 			b.mu.Lock()
 			if !b.fallbackDegradedLogged {
 				log.Printf(
 					"watcher: backend=%s fallback=%s polling registration failed root_count=%d",
-					b.Name(), fallbackReasonLabel(reason), len(pollRoots),
+					b.Name(), fallbackReasonLabel(reason), len(pollPlans),
 				)
 				b.fallbackDegradedLogged = true
 			}
@@ -1098,11 +1144,13 @@ func (b *darwinWatchBackend) prepareRuntimeFallback() {
 	b.rootTransitions.Inc()
 	b.fallbackStreamCount = len(b.streams)
 	b.fallbackShallowCount = len(b.shallow) + len(b.ancestors)
-	var pollRoots []string
+	var pollPlans []darwinFallbackPollPlan
 	for _, state := range b.logical {
-		pollRoots = appendWatchScopeRoots(pollRoots, state.plan.Scopes)
+		pollPlans = appendFallbackPollPlan(
+			pollPlans, state.plan.Path, state.plan.Scopes,
+		)
 	}
-	b.fallbackPollRoots = pollRoots
+	b.fallbackPollPlans = pollPlans
 	b.fallbackPrepared = true
 	b.mu.Unlock()
 }
@@ -1185,7 +1233,7 @@ func (b *darwinWatchBackend) openFallbackDispatch() {
 	}
 	streams := b.fallbackStreamCount
 	shallow := b.fallbackShallowCount
-	pollRoots := len(b.fallbackPollRoots)
+	pollRoots := len(b.fallbackPollPlans)
 	b.mu.Unlock()
 	log.Printf(
 		"watcher: backend=%s recursive_streams=%d shallow_roots=%d fallback=%s reconcile=full polling_roots=%d native_drops=%d pending_overflows=%d root_transitions=%d fallback_activations=%d",
@@ -1195,16 +1243,27 @@ func (b *darwinWatchBackend) openFallbackDispatch() {
 	)
 }
 
-func (b *darwinWatchBackend) requireFallbackPolling(roots []string) error {
+// requireFallbackPolling registers one polling obligation per physical watch
+// plan, with the plan's path as Probe, so a missing physical subtree defers
+// its scope roots instead of letting authoritative reconciliation tombstone
+// the sessions under it. Registration is idempotent per key, so a partial
+// failure is safe to retry with the full plan set.
+func (b *darwinWatchBackend) requireFallbackPolling(
+	plans []darwinFallbackPollPlan,
+) error {
 	b.mu.Lock()
 	required := b.onPollingRequired
 	degraded := b.onCoverageDegraded
 	b.mu.Unlock()
 	if required != nil {
-		if err := required(PollingObligation{
-			Key: darwinFallbackPollingKey, Roots: roots,
-		}); err != nil {
-			return err
+		for _, plan := range plans {
+			if err := required(PollingObligation{
+				Key:   darwinFallbackPollingObligationKey(plan.path),
+				Roots: plan.roots,
+				Probe: plan.path,
+			}); err != nil {
+				return err
+			}
 		}
 		b.mu.Lock()
 		b.fallbackPollingKeyed = true
@@ -1212,6 +1271,22 @@ func (b *darwinWatchBackend) requireFallbackPolling(roots []string) error {
 		return nil
 	}
 	if degraded != nil {
+		// The degraded callback carries no probe and its only darwin consumers
+		// (the PG push loops) widen non-authoritative push polling; the
+		// daemon's authoritative reconciliation consumer always registers
+		// keyed obligations above. Handing over every scope root here keeps
+		// that coverage, and stat-gating on a one-shot registration would
+		// silently drop a scope forever if its physical path is briefly
+		// absent.
+		var roots []string
+		for _, plan := range plans {
+			for _, root := range plan.roots {
+				if !slices.Contains(roots, root) {
+					roots = append(roots, root)
+				}
+			}
+		}
+		slices.Sort(roots)
 		return degraded(roots)
 	}
 	return errors.New("no degraded coverage owner")
@@ -1423,24 +1498,28 @@ func (b *darwinWatchBackend) processNativeRecoveryHandoff() {
 	pollingOwned := b.fallbackPollingOwned
 	pollingKeyed := b.fallbackPollingKeyed
 	release := b.onPollingReleased
+	releasePlans := append([]darwinFallbackPollPlan(nil), b.fallbackPollPlans...)
 	b.mu.Unlock()
 
 	if pollingOwned && pollingKeyed && release != nil {
-		if err := release(darwinFallbackPollingKey); err != nil {
-			b.mu.Lock()
-			b.reportErrorLocked(fmt.Errorf("release fallback polling: %w", err))
-			b.scheduleFallbackRetryLocked(time.Now())
-			b.mu.Unlock()
-			return
+		for _, plan := range releasePlans {
+			key := darwinFallbackPollingObligationKey(plan.path)
+			if err := release(key); err != nil {
+				b.mu.Lock()
+				b.reportErrorLocked(fmt.Errorf("release fallback polling: %w", err))
+				b.scheduleFallbackRetryLocked(time.Now())
+				b.mu.Unlock()
+				return
+			}
 		}
 	}
 
 	b.mu.Lock()
 	if b.fallbackRecoveryFailed.Load() {
-		pollRoots := append([]string(nil), b.fallbackPollRoots...)
+		pollPlans := append([]darwinFallbackPollPlan(nil), b.fallbackPollPlans...)
 		b.mu.Unlock()
-		if len(pollRoots) > 0 {
-			if err := b.requireFallbackPolling(pollRoots); err != nil {
+		if len(pollPlans) > 0 {
+			if err := b.requireFallbackPolling(pollPlans); err != nil {
 				b.mu.Lock()
 				b.reportErrorLocked(fmt.Errorf("restore fallback polling: %w", err))
 				b.scheduleFallbackRetryLocked(time.Now())
@@ -1460,7 +1539,7 @@ func (b *darwinWatchBackend) processNativeRecoveryHandoff() {
 	b.fallbackPollingKeyed = false
 	b.fallbackPrepared = false
 	b.fallbackDegradedLogged = false
-	b.fallbackPollRoots = nil
+	b.fallbackPollPlans = nil
 	b.fallbackRetryAt = time.Time{}
 	b.fallbackRetryDelay = 0
 	b.fallbackReason.Store(uint32(darwinFallbackReasonNone))

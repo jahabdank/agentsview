@@ -299,6 +299,13 @@ func TestResyncBuildResultFromStatsToleratesMinorityParseFailures(t *testing.T) 
 			wantStatus: "failed",
 		},
 		{
+			name:       "operational failure that also set aborted",
+			ctx:        context.Background(),
+			stats:      sync.SyncStats{Aborted: true},
+			buildErr:   errors.New("create resync temp db: boom"),
+			wantStatus: "failed",
+		},
+		{
 			name:       "cancelled context",
 			ctx:        cancelled,
 			stats:      sync.SyncStats{Synced: 10},

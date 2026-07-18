@@ -48,8 +48,8 @@ func TestVnodeObserverUsesOneDescriptorRegardlessOfEntries(t *testing.T) {
 }
 
 // TestVnodeObserverCloseInterruptsBlockedRun proves Close synchronizes with the
-// run loop: it triggers the shutdown user event so the blocked Kevent returns,
-// Close waits for run() to exit, and no goroutine is left blocked on the kqueue.
+// run loop: it writes the self-pipe wake so the blocked Kevent returns, Close
+// waits for run() to exit, and no goroutine is left blocked on the kqueue.
 func TestVnodeObserverCloseInterruptsBlockedRun(t *testing.T) {
 	dir := t.TempDir()
 	o, err := newVnodeObserver(func() {})
@@ -69,6 +69,41 @@ func TestVnodeObserverCloseInterruptsBlockedRun(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("run loop still active after Close returned")
 	}
+}
+
+// TestVnodeObserverConcurrentCloseWaitsForTeardown proves a concurrent second
+// Close does not return before the first finishes: every Close returns only
+// after run() exited and the descriptors are torn down.
+func TestVnodeObserverConcurrentCloseWaitsForTeardown(t *testing.T) {
+	dir := t.TempDir()
+	o, err := newVnodeObserver(func() {})
+	require.NoError(t, err)
+	require.NoError(t, o.Add(dir))
+
+	const closers = 4
+	results := make(chan error, closers)
+	for range closers {
+		go func() { results <- o.Close() }()
+	}
+	for range closers {
+		select {
+		case err := <-results:
+			require.NoError(t, err)
+			select {
+			case <-o.done:
+			default:
+				t.Fatal("Close returned while the run loop was still active")
+			}
+			select {
+			case <-o.closeDone:
+			default:
+				t.Fatal("Close returned before teardown completed")
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("concurrent Close did not return")
+		}
+	}
+	assert.Equal(t, 0, o.watchedCount())
 }
 
 func TestVnodeObserverRemoveAndCloseAreIdempotent(t *testing.T) {

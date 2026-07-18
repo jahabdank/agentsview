@@ -1466,10 +1466,14 @@ func TestDarwinWatcherFallbackRecoversNativeStreamsAndReleasesPolling(t *testing
 	sinksMu.Unlock()
 	initialSink([]fsevents.Event{{Flags: fseventFlagKernelDropped}})
 
-	assert.Equal(t, PollingObligation{Key: "watcher-fallback", Roots: []string{root}},
-		requireReceiveWithin(t, polling, time.Second))
+	assert.Equal(t, PollingObligation{
+		Key:   darwinFallbackPollingObligationKey(root),
+		Roots: []string{root},
+		Probe: root,
+	}, requireReceiveWithin(t, polling, time.Second))
 	waitForDarwinBatch(t, batches, func(batch WatchBatch) bool { return batch.FullSync })
-	assert.Equal(t, "watcher-fallback", requireReceiveWithin(t, released, time.Second))
+	assert.Equal(t, darwinFallbackPollingObligationKey(root),
+		requireReceiveWithin(t, released, time.Second))
 	require.Eventually(t, func() bool {
 		return backend.fallbackPhaseValue() == darwinFallbackInactive &&
 			darwinFallbackReason(backend.fallbackReason.Load()) == darwinFallbackReasonNone
@@ -1535,8 +1539,11 @@ func TestDarwinWatcherFallbackKeepsPollingUntilNativeRetrySucceeds(t *testing.T)
 	require.NoError(t, watcher.Start())
 
 	backend.requestFallback(darwinFallbackNativeDrop)
-	assert.Equal(t, PollingObligation{Key: darwinFallbackPollingKey, Roots: []string{root}},
-		requireReceiveWithin(t, polling, time.Second))
+	assert.Equal(t, PollingObligation{
+		Key:   darwinFallbackPollingObligationKey(root),
+		Roots: []string{root},
+		Probe: root,
+	}, requireReceiveWithin(t, polling, time.Second))
 	waitForDarwinBatch(t, batches, func(batch WatchBatch) bool { return batch.FullSync })
 	requireReceiveWithin(t, failedRecovery, time.Second)
 	select {
@@ -1545,7 +1552,8 @@ func TestDarwinWatcherFallbackKeepsPollingUntilNativeRetrySucceeds(t *testing.T)
 	default:
 	}
 
-	assert.Equal(t, darwinFallbackPollingKey, requireReceiveWithin(t, released, time.Second))
+	assert.Equal(t, darwinFallbackPollingObligationKey(root),
+		requireReceiveWithin(t, released, time.Second))
 	require.Eventually(t, func() bool {
 		return backend.fallbackPhaseValue() == darwinFallbackInactive
 	}, time.Second, time.Millisecond)
@@ -1604,14 +1612,25 @@ func TestDarwinWatcherFallbackTransfersMissingRootPollingBeforeRecovery(t *testi
 
 	backend.requestFallback(darwinFallbackNativeDrop)
 	assert.Equal(t, PollingObligation{
-		Key: darwinFallbackPollingKey, Roots: []string{missing, present},
+		Key:   darwinFallbackPollingObligationKey(missing),
+		Roots: []string{missing},
+		Probe: missing,
+	}, requireReceiveWithin(t, polling, time.Second),
+		"each watch plan owns its own fallback obligation probed on its path")
+	assert.Equal(t, PollingObligation{
+		Key:   darwinFallbackPollingObligationKey(present),
+		Roots: []string{present},
+		Probe: present,
 	}, requireReceiveWithin(t, polling, time.Second))
 	waitForDarwinBatch(t, batches, func(batch WatchBatch) bool { return batch.FullSync })
 	assert.Equal(t,
 		PollingObligation{Key: missing, Roots: []string{missing}, Probe: missing},
 		requireReceiveWithin(t, polling, time.Second),
 		"the skipped root must own polling before generic fallback polling is released")
-	assert.Equal(t, darwinFallbackPollingKey, requireReceiveWithin(t, released, time.Second))
+	assert.Equal(t, darwinFallbackPollingObligationKey(missing),
+		requireReceiveWithin(t, released, time.Second))
+	assert.Equal(t, darwinFallbackPollingObligationKey(present),
+		requireReceiveWithin(t, released, time.Second))
 	require.Eventually(t, func() bool {
 		backend.mu.Lock()
 		defer backend.mu.Unlock()
@@ -1659,7 +1678,11 @@ func TestDarwinWatcherStartupCreateFailureSelectsRecursiveFallbackOnce(t *testin
 		{Watched: 1},
 	}, results)
 	assert.Equal(t, int32(1), creates.Load(), "one failed stream selects global fallback")
-	assert.Equal(t, []string{first, missing, second}, backend.fallbackPollRoots)
+	assert.Equal(t, []darwinFallbackPollPlan{
+		{path: first, roots: []string{first}},
+		{path: missing, roots: []string{missing}},
+		{path: second, roots: []string{second}},
+	}, backend.fallbackPollPlans)
 	assert.Equal(t, uint32(1), backend.fallbackActivations.Load())
 }
 

@@ -10,12 +10,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// vnodeObserverShutdownIdent is the EVFILT_USER identifier the observer triggers
-// to interrupt run()'s blocked Kevent on Close. EVFILT_USER lives in a separate
-// keventidentifier namespace from the EVFILT_VNODE file descriptors, so it never
-// collides with a watched fd.
-const vnodeObserverShutdownIdent = 1
-
 // vnodeObserver watches directories for entry-level changes using one
 // EVFILT_VNODE descriptor per directory. It exists for missing-root
 // ancestors, where fsnotify's kqueue backend would open one descriptor per
@@ -30,6 +24,16 @@ type vnodeObserver struct {
 	wake   func()
 	closed bool
 	done   chan struct{}
+	// wakeR/wakeW form a self-pipe registered with EVFILT_READ. Close writes a
+	// byte to interrupt run()'s blocked Kevent: unlike closing the kqueue
+	// mid-syscall, which Darwin does not guarantee to interrupt, a pipe write
+	// always fires the read filter.
+	wakeR int
+	wakeW int
+	// closeDone closes when the first Close finishes tearing down, so
+	// concurrent Close calls wait for the teardown instead of returning while
+	// descriptors are still live.
+	closeDone chan struct{}
 }
 
 func newVnodeObserver(wake func()) (*vnodeObserver, error) {
@@ -37,22 +41,42 @@ func newVnodeObserver(wake func()) (*vnodeObserver, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create ancestor kqueue: %w", err)
 	}
-	// Register the shutdown user event before run() blocks so Close can wake it
-	// deterministically rather than relying on closing the kqueue mid-Kevent,
-	// which is not guaranteed to interrupt the syscall on Darwin.
-	shutdown := unix.Kevent_t{}
-	unix.SetKevent(&shutdown, vnodeObserverShutdownIdent, unix.EVFILT_USER,
-		unix.EV_ADD|unix.EV_CLEAR)
-	if _, err := unix.Kevent(kq, []unix.Kevent_t{shutdown}, nil, nil); err != nil {
+	var pipeFds [2]int
+	if err := unix.Pipe(pipeFds[:]); err != nil {
 		_ = unix.Close(kq)
+		return nil, fmt.Errorf("create ancestor wake pipe: %w", err)
+	}
+	closeAll := func() {
+		_ = unix.Close(pipeFds[0])
+		_ = unix.Close(pipeFds[1])
+		_ = unix.Close(kq)
+	}
+	for _, fd := range pipeFds {
+		unix.CloseOnExec(fd)
+	}
+	// Nonblocking write end: Close's wake write must never block on a full
+	// pipe; a pending byte already guarantees the wake.
+	if err := unix.SetNonblock(pipeFds[1], true); err != nil {
+		closeAll()
+		return nil, fmt.Errorf("configure ancestor wake pipe: %w", err)
+	}
+	// Register the wake pipe before run() blocks so Close can interrupt the
+	// blocked Kevent deterministically.
+	shutdown := unix.Kevent_t{}
+	unix.SetKevent(&shutdown, pipeFds[0], unix.EVFILT_READ, unix.EV_ADD)
+	if _, err := unix.Kevent(kq, []unix.Kevent_t{shutdown}, nil, nil); err != nil {
+		closeAll()
 		return nil, fmt.Errorf("register ancestor shutdown event: %w", err)
 	}
 	o := &vnodeObserver{
-		kq:    kq,
-		fds:   make(map[string]int),
-		paths: make(map[int]string),
-		wake:  wake,
-		done:  make(chan struct{}),
+		kq:        kq,
+		fds:       make(map[string]int),
+		paths:     make(map[int]string),
+		wake:      wake,
+		done:      make(chan struct{}),
+		wakeR:     pipeFds[0],
+		wakeW:     pipeFds[1],
+		closeDone: make(chan struct{}),
 	}
 	go o.run()
 	return o, nil
@@ -103,21 +127,23 @@ func (o *vnodeObserver) Close() error {
 	o.mu.Lock()
 	if o.closed {
 		o.mu.Unlock()
+		<-o.closeDone
 		return nil
 	}
 	o.closed = true
-	trigger := unix.Kevent_t{}
-	unix.SetKevent(&trigger, vnodeObserverShutdownIdent, unix.EVFILT_USER, 0)
-	trigger.Fflags = unix.NOTE_TRIGGER
-	_, triggerErr := unix.Kevent(o.kq, []unix.Kevent_t{trigger}, nil, nil)
 	o.mu.Unlock()
+	defer close(o.closeDone)
 
-	// The user event interrupts run()'s blocked Kevent deterministically. Only
-	// if triggering somehow failed do we fall back to closing the kqueue to
-	// unblock run(); either way we wait for run() to return before closing the
-	// descriptors it reads, so no in-flight event fires after shutdown.
-	if triggerErr != nil {
-		_ = unix.Close(o.kq)
+	// Wake run()'s blocked Kevent through the self-pipe, retrying interrupted
+	// writes. EAGAIN means the pipe already holds an unread wake byte, so the
+	// wake is guaranteed either way; a pipe write to a descriptor we own has
+	// no other failure mode while the read end is open. Wait for run() to
+	// return before closing the descriptors it reads, so no in-flight event
+	// fires after shutdown.
+	for {
+		if _, err := unix.Write(o.wakeW, []byte{0}); err != unix.EINTR {
+			break
+		}
 	}
 	<-o.done
 
@@ -128,9 +154,8 @@ func (o *vnodeObserver) Close() error {
 		delete(o.fds, path)
 		delete(o.paths, fd)
 	}
-	if triggerErr != nil {
-		return nil // the kqueue was already closed as the wake fallback
-	}
+	_ = unix.Close(o.wakeR)
+	_ = unix.Close(o.wakeW)
 	if err := unix.Close(o.kq); err != nil {
 		return fmt.Errorf("closing ancestor kqueue: %w", err)
 	}
@@ -157,7 +182,8 @@ func (o *vnodeObserver) run() {
 		shutdown := false
 		vnodeEvents := false
 		for i := range n {
-			if events[i].Filter == unix.EVFILT_USER {
+			if events[i].Filter == unix.EVFILT_READ &&
+				int(events[i].Ident) == o.wakeR {
 				shutdown = true
 			} else {
 				vnodeEvents = true
