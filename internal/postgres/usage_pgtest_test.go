@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/export"
 )
 
 func prepareUsageSchema(
@@ -1051,7 +1052,7 @@ func TestPushFallsBackToBuiltinPricingWhenLocalTableEmpty(t *testing.T) {
 		"fallback pricing not synced")
 }
 
-func TestStoreGetSessionUsage_CopilotAICreditsComputed(t *testing.T) {
+func TestStoreGetSessionUsage_CopilotExplicitCost(t *testing.T) {
 	_, store := prepareUsageSchema(t, "agentsview_copilot_credits_test")
 
 	ctx := context.Background()
@@ -1078,7 +1079,6 @@ func TestStoreGetSessionUsage_CopilotAICreditsComputed(t *testing.T) {
 	require.NotNil(t, u, "usage is nil")
 	assert.True(t, u.HasCost, "HasCost")
 	assert.Equal(t, 0.10, u.CostUSD, "CostUSD")
-	assert.Equal(t, 10.0, u.AICredits, "AICredits")
 }
 
 func TestStoreGetSessionUsage_CopilotReportedCost(t *testing.T) {
@@ -1110,7 +1110,6 @@ func TestStoreGetSessionUsage_CopilotReportedCost(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, usage)
 	assert.InDelta(t, 0.0275, usage.CostUSD, 1e-12)
-	assert.InDelta(t, 2.75, usage.AICredits, 1e-12)
 	require.Len(t, usage.Breakdown, 2)
 	assert.NotEqual(t, usage.CostUSD, usage.Breakdown[1].CostUSD)
 
@@ -1122,10 +1121,14 @@ func TestStoreGetSessionUsage_CopilotReportedCost(t *testing.T) {
 	assert.Zero(t, daily.Daily[0].TotalCost)
 	assert.InDelta(t, 0.0275, daily.Daily[1].TotalCost, 1e-12)
 	assert.InDelta(t, 0.0275, daily.Totals.TotalCost, 1e-12)
-	assert.InDelta(t, 2.75, daily.Totals.CopilotAICredits, 1e-12)
+	require.NotNil(t, daily.Pricing)
+	assert.Equal(t, export.CostSourceMixed, daily.Pricing.CostSource,
+		"authoritative reported cost must surface in pricing provenance")
+	assert.Equal(t, export.CostSourceMixed,
+		daily.Pricing.Models["gpt-4"].CostSource)
 }
 
-func TestStoreGetSessionUsage_CopilotNoAICreditsUnpriced(t *testing.T) {
+func TestStoreGetSessionUsage_CopilotUnpricedNoCost(t *testing.T) {
 	_, store := prepareUsageSchema(t, "agentsview_copilot_unpriced_test")
 
 	ctx := context.Background()
@@ -1151,5 +1154,5 @@ func TestStoreGetSessionUsage_CopilotNoAICreditsUnpriced(t *testing.T) {
 	require.NoError(t, err, "GetSessionUsage")
 	require.NotNil(t, u, "usage is nil")
 	assert.False(t, u.HasCost, "HasCost should be false")
-	assert.Equal(t, 0.0, u.AICredits, "AICredits should be 0 when unpriced")
+	assert.Zero(t, u.CostUSD, "CostUSD should be 0 when unpriced")
 }
